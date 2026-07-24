@@ -1,6 +1,3 @@
-# Runs on every push to main/dev and every pull request to main.
-# Both checks must pass before a PR can be merged.
-
 name: CI
 
 on:
@@ -11,7 +8,7 @@ on:
 
 jobs:
 
-  # ── Code quality checks ──────────────────────────────────────────────
+  # Code quality checks
   lint:
     name: Lint and type check
     runs-on: ubuntu-latest
@@ -33,10 +30,8 @@ jobs:
 
       - name: Run all pre-commit hooks
         run: pre-commit run --all-files
-        # This runs black, ruff, mypy, and all file hygiene checks.
-        # If any fail, the job fails and the PR cannot be merged.
 
-  # ── Tests ────────────────────────────────────────────────────────────
+  # Unit tests
   test:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -47,24 +42,29 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ hashFiles('pyproject.toml') }}
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Debug - list files in root directory
+        run: |
+          echo "Current working directory: $(pwd)"
+          echo "Files in root directory:"
+          ls -la
+          echo "Checking for pyproject.toml:"
+          if [ -f "pyproject.toml" ]; then
+            echo "✅ pyproject.toml found!"
+            head -20 pyproject.toml
+          else
+            echo "❌ pyproject.toml NOT FOUND!"
+            exit 1
+          fi
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
-        # Installs the project in editable mode with dev dependencies.
-        # Does NOT install hyperon or GPU JAX — CI runs CPU only.
+        run: |
+          pip install -v -e .[dev]
 
       - name: Run unit tests
         run: pytest tests/unit/ -v --tb=short
-        # -v: verbose output, shows each test name
-        # --tb=short: shorter traceback on failures
 
       - name: Run grammar integration tests
         run: pytest tests/unit/test_atomese.py -v
-        # These do not need any running services.
-        # Integration tests that need MORK/parser are skipped in CI
-        # (they require running services which CI does not have).

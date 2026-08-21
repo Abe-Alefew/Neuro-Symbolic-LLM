@@ -190,7 +190,8 @@ class TestMemory:
     def test_memory_status_reports(self, pythia_fixture):
         _, sub = pythia_fixture
         status = sub.memory_status()
-        assert status.available is False  # CPU backend: diagnostic only
+        assert status.available is True
+        assert status.platform == "gpu"
 
     def test_run_with_memory_guard(self, pythia_fixture):
         _, sub = pythia_fixture

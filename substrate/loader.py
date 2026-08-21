@@ -54,13 +54,18 @@ def _nested_from_dotted(mapping: Mapping[str, Any]) -> Any:
 
 def state_dict_to_jax_pytree(state_dict: Mapping[str, Any]) -> Any:
     """Convert a torch/HF state dict (or plain numpy mapping) into a JAX
-    parameter PyTree matching the Flax model conventions."""
+    parameter PyTree matching the Flax model conventions.
+
+    All leaves are cast to float32: some checkpoints (e.g. Pythia) ship
+    float16 weights, and computing LayerNorm statistics or attention in
+    half precision diverges from the reference fp32 forward pass.
+    """
 
     def _to_jax(value: Any) -> jax.Array:
         if isinstance(value, jax.Array):
-            return value
+            return value.astype(jnp.float32)
         arr = value.detach().cpu().numpy() if hasattr(value, "detach") else value
-        return jnp.asarray(arr)
+        return jnp.asarray(arr, dtype=jnp.float32)
 
     jax_dict = {k: _to_jax(v) for k, v in state_dict.items()}
     return _nested_from_dotted(jax_dict)

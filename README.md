@@ -27,7 +27,11 @@ device-memory monitoring with a 50% headroom safety rule.
    - [`tests/unit/test_substrate_memory.py`](#testsunittest_substrate_memorypy)
    - [`pyproject.toml`](#pyprojecttoml)
    - [`.gitignore`](#gitignore)
+   - [`scripts/prepare_data.py`](#scriptsprepare_datapy)
+   - [`scripts/run_real_text_demo.py`](#scriptsrun_real_text_demopy)
 4. [How to Run](#how-to-run)
+   - [Prepare the real-text data folder](#prepare-the-real-text-data-folder)
+   - [Run the real-text end-to-end demo](#run-the-real-text-end-to-end-demo)
    - [Run the tests](#run-the-tests)
    - [Run lint / format / type checks](#run-lint--format--type-checks)
    - [Run pre-commit (same as CI)](#run-pre-commit-same-as-ci)
@@ -343,10 +347,48 @@ headroom computation, warning thresholds around 50%, batch-size halving with
 
 ### `.gitignore`
 
-(Pre-existing file; modified.) Added `__pycache__/`, `*.pyc` and
-`*.egg-info/` so build artifacts (e.g. `neuro_symbolic_llm.egg-info/` created
-by editable installs) never enter git — they previously caused CI
-end-of-file-fixer failures.
+(Pre-existing file; modified.) Added `__pycache__/`, `*.pyc`,
+`*.egg-info/` and `data/` so build artifacts and the (regenerable, >500 KB)
+real-text data folder never enter git.
+
+### `scripts/prepare_data.py`
+
+Builds the local `data/` folder used by the real-text demo. Run once while
+online; afterwards everything works offline:
+
+```
+data/
+├── shakespeare.txt      full tinyshakespeare corpus (~1.1 MB, 40 000 lines)
+├── wiki.txt             real Wikipedia text (wikitext-2 train sample, ~400 KB)
+├── tokenizer_gpt2/      GPT-2 tokenizer saved with save_pretrained
+└── tokenizer_pythia/    Pythia/GPT-NeoX tokenizer saved with save_pretrained
+```
+
+Idempotent: existing files are skipped, so re-running only fills gaps.
+
+### `scripts/run_real_text_demo.py`
+
+End-to-end manual test with REAL data and REAL pretrained checkpoints:
+
+1. loads real text (`--text` file, else `data/shakespeare.txt`, else
+   `data/wiki.txt`, else downloads tinyshakespeare),
+2. tokenizes it with the model's real HuggingFace tokenizer,
+3. runs the frozen JAX forward pass intercepting every requested layer
+   (default: ALL layers),
+4. proves per layer that the hook received the hidden state and returned it
+   unchanged (`+0.0` identity), and that the cache kept the pre-modification
+   state,
+5. compares wrapper logits against the untouched HuggingFace torch model,
+6. prints readable top next-token predictions,
+7. optionally applies a steering hook (`--steer`) and reports KL drift,
+8. reports device memory status + the 50% headroom rule,
+9. verifies parameters were never modified (`verify_frozen()`).
+
+> **Known limitation:** on real Pythia/GPT-NeoX checkpoints the attention
+> block still diverges slightly from torch (LayerNorm bias, exact-erf GELU
+> and fp32 casting are already fixed and verified; attention is being
+> investigated). GPT-2 matches to KL ~2e-8. Unit tests pass for both
+> families on reference configs.
 
 ---
 
@@ -354,6 +396,50 @@ end-of-file-fixer failures.
 
 All commands assume you are in the repository root with the virtual
 environment activated.
+
+### Prepare the real-text data folder
+
+```powershell
+python scripts/prepare_data.py
+```
+
+Downloads Shakespeare + Wikipedia text and saves both tokenizers into
+`data/`. One-time; afterwards fully offline.
+
+### Run the real-text end-to-end demo
+
+```powershell
+# GPT-2 on Shakespeare, all 12 layers intercepted (default)
+python scripts/run_real_text_demo.py --max-tokens 96
+
+# Pythia-70m with steering at every layer
+python scripts/run_real_text_demo.py --model EleutherAI/pythia-70m --steer 2.0
+
+# Your own text file, specific layers only
+python scripts/run_real_text_demo.py --text my_file.txt --layers 0,5,11
+```
+
+Sample output (GPT-2, trimmed):
+
+```
+Text source : file data/shakespeare.txt
+Tokens      : 96
+Detected    : family=gpt2 layers=12 hidden=768 vocab=50257
+Intercepting: [0, 1, ..., 11]
+
+layer  0: in==out: True | cache matches: True | mean=-0.0102 std=1.8916 ...
+...
+layer 11: in==out: True | cache matches: True | mean=-0.0599 std=19.2439 ...
+HOOK PROOF  : every intercepted layer received its hidden state, applied
+              +0.0 and returned it unchanged: True
+
+max |torch - jax| logit diff : 1.411e-03
+KL(torch || jax wrapper)     : 2.139e-08
+
+baseline: ' him' | ' C' | ' you' | ' the' | ' this'
+
+params_unchanged : True
+```
 
 ### Run the tests
 

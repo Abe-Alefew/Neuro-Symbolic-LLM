@@ -42,13 +42,19 @@ def _mlp(
     proj_w: jax.Array,
     proj_b: jax.Array,
     linear_transpose: bool = True,
+    gelu_approximate: bool = True,
 ) -> jax.Array:
+    # GPT-2 uses "gelu_new" (tanh approximation); GPT-NeoX/Pythia uses the
+    # exact erf-based gelu. Using the wrong one diverges on real checkpoints.
+    def act(x: jax.Array) -> jax.Array:
+        return jax.nn.gelu(x, approximate=gelu_approximate)
+
     if linear_transpose:
         # standard nn.Linear layout: weight is [output, input]
-        intermediate = jax.nn.gelu(hidden @ fc_w.T + fc_b)
+        intermediate = act(hidden @ fc_w.T + fc_b)
         return intermediate @ proj_w.T + proj_b
     # GPT-2 Conv1D layout: weight is [input, output], forward is x @ w
-    intermediate = jax.nn.gelu(hidden @ fc_w + fc_b)
+    intermediate = act(hidden @ fc_w + fc_b)
     return intermediate @ proj_w + proj_b
 
 
@@ -206,26 +212,36 @@ def neox_block(
     ln_in = layer["input_layernorm"]
     ln_post = layer["post_attention_layernorm"]
 
-    attn_in = layer_norm(hidden, ln_in["weight"], None, arch.layer_norm_eps)
+    # NOTE: GPT-NeoX LayerNorms have affine weight AND bias; real checkpoints
+    # carry trained non-zero biases, so they must never be dropped.
+    attn_in = layer_norm(
+        hidden, ln_in["weight"], ln_in.get("bias"), arch.layer_norm_eps
+    )
     attn_out = neox_attention(attn_in, layer["attention"], position_ids, arch)
     if arch.use_parallel_residual:
-        mlp_in = layer_norm(hidden, ln_post["weight"], None, arch.layer_norm_eps)
+        mlp_in = layer_norm(
+            hidden, ln_post["weight"], ln_post.get("bias"), arch.layer_norm_eps
+        )
         mlp_out = _mlp(
             mlp_in,
             layer["mlp"]["dense_h_to_4h"]["weight"],
             layer["mlp"]["dense_h_to_4h"]["bias"],
             layer["mlp"]["dense_4h_to_h"]["weight"],
             layer["mlp"]["dense_4h_to_h"]["bias"],
+            gelu_approximate=False,
         )
         return hidden + attn_out + mlp_out
     hidden = hidden + attn_out
-    mlp_in = layer_norm(hidden, ln_post["weight"], None, arch.layer_norm_eps)
+    mlp_in = layer_norm(
+        hidden, ln_post["weight"], ln_post.get("bias"), arch.layer_norm_eps
+    )
     mlp_out = _mlp(
         mlp_in,
         layer["mlp"]["dense_h_to_4h"]["weight"],
         layer["mlp"]["dense_h_to_4h"]["bias"],
         layer["mlp"]["dense_4h_to_h"]["weight"],
         layer["mlp"]["dense_4h_to_h"]["bias"],
+        gelu_approximate=False,
     )
     return hidden + mlp_out
 
@@ -235,7 +251,12 @@ def neox_lm_head(
 ) -> jax.Array:
     gpt_neox = params["gpt_neox"]
     final_norm = gpt_neox["final_layer_norm"]
-    hidden = layer_norm(hidden, final_norm["weight"], None, arch.layer_norm_eps)
+    hidden = layer_norm(
+        hidden,
+        final_norm["weight"],
+        final_norm.get("bias"),
+        arch.layer_norm_eps,
+    )
     if "lm_head" in params and "weight" in params["lm_head"]:
         head_w = params["lm_head"]["weight"]
     elif "embed_out" in gpt_neox and "weight" in gpt_neox["embed_out"]:

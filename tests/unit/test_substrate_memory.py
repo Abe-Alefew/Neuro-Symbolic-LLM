@@ -1,7 +1,12 @@
-"""GPU memory monitoring and the 50% headroom safety rule."""
+"""GPU memory monitoring and the 50% headroom safety rule.
+
+Tests that require a real accelerator are skipped automatically on CPU-only
+environments (e.g. CI) instead of failing.
+"""
 
 from __future__ import annotations
 
+import jax
 import pytest
 
 from substrate import (
@@ -10,6 +15,18 @@ from substrate import (
     compute_memory_headroom,
     get_memory_status,
     maybe_reduce_batch_size,
+)
+
+
+def _has_gpu() -> bool:
+    try:
+        return any(d.platform == "gpu" for d in jax.devices())
+    except Exception:  # pragma: no cover - platform dependent
+        return False
+
+
+_requires_gpu = pytest.mark.skipif(
+    not _has_gpu(), reason="no GPU/accelerator visible to JAX on this machine"
 )
 
 
@@ -33,6 +50,7 @@ class TestGetMemoryStatus:
         status = get_memory_status()
         assert isinstance(status, MemoryStatus)
 
+    @_requires_gpu
     def test_gpu_memory_is_available(self):
         status = get_memory_status()
         assert status.available is True
@@ -41,6 +59,7 @@ class TestGetMemoryStatus:
         assert status.available_bytes >= 0
         assert status.allocated_bytes >= 0
 
+    @_requires_gpu
     def test_gpu_headroom_is_reported(self):
         status = get_memory_status()
         headroom = compute_memory_headroom(status)

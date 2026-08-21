@@ -190,8 +190,14 @@ class TestMemory:
     def test_memory_status_reports(self, pythia_fixture):
         _, sub = pythia_fixture
         status = sub.memory_status()
-        assert status.available is True
-        assert status.platform == "gpu"
+        if any(d.platform == "gpu" for d in jax.devices()):
+            # Accelerator visible: real memory statistics must be reported.
+            assert status.available is True
+            assert status.platform == "gpu"
+        else:
+            # CPU backend: diagnostic-only status, must not crash.
+            assert status.available is False
+            assert status.diagnostic
 
     def test_run_with_memory_guard(self, pythia_fixture):
         _, sub = pythia_fixture

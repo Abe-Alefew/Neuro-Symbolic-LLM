@@ -8,13 +8,15 @@ compared against the untouched torch forward pass.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
 
 from substrate import FrozenJAXSubstrate, state_dict_to_jax_pytree
 
-GPT2_CFG = {
+GPT2_CFG: dict[str, Any] = {
     "n_layer": 12,
     "n_head": 4,
     "n_embd": 32,
@@ -27,7 +29,7 @@ GPT2_CFG = {
     "attn_pdrop": 0.0,
 }
 
-NEOX_CFG = {
+NEOX_CFG: dict[str, Any] = {
     "vocab_size": 64,
     "hidden_size": 32,
     "num_hidden_layers": 12,

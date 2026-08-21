@@ -336,8 +336,10 @@ headroom computation, warning thresholds around 50%, batch-size halving with
 - Added `"substrate*"` to `[tool.setuptools.packages.find]` include list so
   `pip install -e .` picks up the new package.
 - Tool config used by CI lives here: ruff (E/W/F/I/N/UP/B/C4/SIM, line 88),
-  black (line 88), mypy (`python_version = "3.10"`,
-  `ignore_missing_imports = true`), pytest (`testpaths = ["tests"]`).
+  black (line 88), mypy (`python_version = "3.12"` with
+  `follow_imports = "skip"` overrides for jax/flax/numpy so their PEP 695
+  stubs parse on any environment, `ignore_missing_imports = true`), pytest
+  (`testpaths = ["tests"]`).
 
 ### `.gitignore`
 
@@ -388,17 +390,14 @@ python -m black substrate/ tests/
 
 # Type check
 python -m mypy substrate/
+python -m mypy tests/
 ```
 
-> **Note:** if your installed numpy ships stubs that require Python ≥ 3.12
-> while the repo pins `python_version = "3.10"` for mypy, use:
->
-> ```powershell
-> python -m mypy substrate/ --python-version 3.12 --no-incremental --follow-imports=skip
-> ```
->
-> CI (which uses mypy 1.9.0 in its own isolated env) runs plain `mypy` and
-> passes.
+The mypy configuration targets Python 3.12 parsing (`python_version = "3.12"`
+in `pyproject.toml`) because modern JAX/NumPy/Flax ship PEP 695 stubs that
+older parse targets reject, and treats those libraries as opaque via
+`follow_imports = "skip"` overrides. The package itself remains compatible
+with Python 3.10+ at runtime.
 
 ### Run pre-commit (same as CI)
 

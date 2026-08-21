@@ -1,0 +1,36 @@
+Metadata-Version: 2.4
+Name: neuro-symbolic-llm
+Version: 0.1.0
+Summary: PC residual with symbolic head on frozen LLM
+Requires-Python: >=3.10
+Requires-Dist: fabricpc @ git+https://github.com/trueagi-io/FabricPC.git@v0.3.0
+Requires-Dist: jax>=0.4.30
+Requires-Dist: jaxlib>=0.4.30
+Requires-Dist: optax>=0.2.0
+Requires-Dist: orbax-checkpoint>=0.5.0
+Requires-Dist: torch>=2.2.0
+Requires-Dist: transformers>=4.40.0
+Requires-Dist: datasets>=2.19.0
+Requires-Dist: fastapi>=0.110.0
+Requires-Dist: uvicorn[standard]>=0.29.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: pydantic>=2.6.0
+Requires-Dist: hnswlib>=0.8.0
+Requires-Dist: redis>=5.0.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: wandb>=0.17.0
+Provides-Extra: gpu
+Requires-Dist: jax[cuda12]>=0.4.30; extra == "gpu"
+Provides-Extra: hyperon
+Requires-Dist: hyperon>=0.2.0; extra == "hyperon"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: ruff>=0.4.1; extra == "dev"
+Requires-Dist: black>=24.3.0; extra == "dev"
+Requires-Dist: mypy>=1.9.0; extra == "dev"
+Requires-Dist: pre-commit>=3.7.0; extra == "dev"
+Requires-Dist: types-pyyaml; extra == "dev"
+Requires-Dist: types-redis; extra == "dev"

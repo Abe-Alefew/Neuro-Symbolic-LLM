@@ -1,0 +1,54 @@
+# Pre-commit hooks run automatically before every git commit.
+# If any hook fails, the commit is blocked and the error is shown.
+#
+# Setup (run once after cloning):
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually on all files:
+#   pre-commit run --all-files
+
+repos:
+  # General file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+        exclude: ^\.pre-commit-config\.yaml$
+      - id: no-commit-to-branch
+        args: ["--branch", "main", "--branch", "dev"]
+      - id: check-added-large-files
+        args: ["--maxkb", "500"]
+      - id: debug-statements
+      - id: check-ast
+
+  # Black: code formatter
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+        language_version: python3.11
+
+  # Ruff: linter + import sorter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Mypy: type checker
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.9.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - types-pyyaml
+          - types-redis
+          - pydantic>=2.6.0

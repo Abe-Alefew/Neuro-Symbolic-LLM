@@ -85,11 +85,11 @@ def get_memory_status(device: jax.Device | None = None) -> MemoryStatus:
 def compute_memory_headroom(status: MemoryStatus) -> float | None:
     """Return the available-memory headroom ratio in [0, 1], or None when the
     platform does not expose memory statistics."""
-    if (
-        not status.available
-        or status.total_bytes in (None, 0)
-        or status.available_bytes is None
-    ):
+    if not status.available:
+        return None
+    if status.total_bytes is None or status.available_bytes is None:
+        return None
+    if status.total_bytes == 0:
         return None
     return status.available_bytes / status.total_bytes
 

@@ -6,7 +6,7 @@ parameter names (nested), so weights convert without renaming.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import jax
@@ -81,6 +81,7 @@ def _hf_model_class(model_family: str):
 def load_substrate_from_hf(
     model_id: str,
     intercept_layers: list[int] | None = None,
+    modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
 ) -> FrozenJAXSubstrate:
     """Download/load a HuggingFace GPT-2 or Pythia/GPT-NeoX checkpoint and
     wrap it in a ``FrozenJAXSubstrate``.
@@ -102,7 +103,10 @@ def load_substrate_from_hf(
     state_dict = torch_model.state_dict()
     params = state_dict_to_jax_pytree(state_dict)
     return FrozenJAXSubstrate(
-        params=params, config=config, intercept_layers=intercept_layers
+        params=params,
+        config=config,
+        intercept_layers=intercept_layers,
+        modify_hook=modify_hook,
     )
 
 
@@ -110,12 +114,16 @@ def build_substrate_from_state_dict(
     state_dict: Mapping[str, Any],
     config: Any = None,
     intercept_layers: list[int] | None = None,
+    modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
 ) -> FrozenJAXSubstrate:
     """Build a substrate directly from a state dict (HF naming) and an
     optional HF config object."""
     params = state_dict_to_jax_pytree(state_dict)
     return FrozenJAXSubstrate(
-        params=params, config=config, intercept_layers=intercept_layers
+        params=params,
+        config=config,
+        intercept_layers=intercept_layers,
+        modify_hook=modify_hook,
     )
 
 

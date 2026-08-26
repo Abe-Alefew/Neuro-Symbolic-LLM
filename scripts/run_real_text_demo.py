@@ -70,6 +70,7 @@ def section(title: str) -> None:
 
 def load_text(path: Path | None) -> str:
     """User-supplied file, else local data folder, else download, else fallback."""
+    text: str
     candidates: list[Path] = []
     if path is not None:
         candidates.append(path)
@@ -277,7 +278,12 @@ def main() -> int:
     status = get_memory_status()
     print(f"platform    : {status.platform}")
     print(f"available   : {status.available}")
-    if status.available:
+    if (
+        status.available
+        and status.total_bytes is not None
+        and status.allocated_bytes is not None
+        and status.available_bytes is not None
+    ):
         print(f"total       : {status.total_bytes / 1e9:.2f} GB")
         print(f"allocated   : {status.allocated_bytes / 1e9:.2f} GB")
         print(f"free        : {status.available_bytes / 1e9:.2f} GB")

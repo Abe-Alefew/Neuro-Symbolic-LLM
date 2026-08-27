@@ -56,7 +56,16 @@ def _get_path(params: Any, *parts: str) -> Any:
 def _config_value(config: Any, name: str, default: Any) -> Any:
     if config is None:
         return default
-    return getattr(config, name, default)
+    if hasattr(config, name):
+        return getattr(config, name)
+
+    # Hugging Face uses different names across model families and versions
+    aliases = {
+        "layer_norm_eps": "layer_norm_epsilon",
+        "rope_theta": "rotary_emb_base",
+    }
+    alias = aliases.get(name)
+    return getattr(config, alias, default) if alias is not None else default
 
 
 def detect_architecture(params: Any, config: Any = None) -> Architecture:

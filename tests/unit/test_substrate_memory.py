@@ -190,3 +190,23 @@ class TestDrift:
         result = compute_kl_drift(a, b)
 
         assert result["kl_divergence"] == result["kl_divergence"]
+
+    def test_kl_drift_masked(self):
+        import jax.numpy as jnp
+        from substrate import compute_kl_drift
+
+       
+        base = jnp.array([[[1.0, 2.0], [1.0, 2.0]], [[1.0, 2.0], [1.0, 2.0]]])
+        modified = jnp.array([[[3.0, 1.0], [100.0, -100.0]], [[3.0, 1.0], [100.0, -100.0]]])
+
+        unmasked_drift = compute_kl_drift(base, modified)["kl_divergence"]
+
+        
+        mask = jnp.array([[1, 0], [1, 0]])
+        masked_drift = compute_kl_drift(base, modified, mask=mask)["kl_divergence"]
+
+        expected_drift = compute_kl_drift(base[:, :1, :], modified[:, :1, :])["kl_divergence"]
+        assert abs(masked_drift - expected_drift) < 1e-5
+        assert masked_drift < unmasked_drift
+        assert isinstance(masked_drift, float)
+

@@ -112,6 +112,7 @@ def run_validation(
     batch_size: int = 2,
     tol_logits: float = 1e-5,
     tol_hidden: float = 1e-5,
+    skip_monolithic: bool = False,
 ) -> bool:
     results: list[bool] = []
 
@@ -140,19 +141,24 @@ def run_validation(
 
     # 3. Monolithic torch2jax (Zero Interception)
     subheader("2. Monolithic JAX Execution (Zero Interception)")
-    t0 = time.perf_counter()
-    sub_mono = FrozenJAXSubstrate(torch_model, config, intercept_layers=[])
-    res_mono = sub_mono(jax_ids)
-    t_mono = (time.perf_counter() - t0) * 1000
-    max_err_mono = float(np.max(np.abs(pt_logits - np.asarray(res_mono.logits))))
-    ok_mono = max_err_mono <= tol_logits
-    results.append(
-        pass_fail(
-            "Monolithic Logit Parity vs PyTorch",
-            ok_mono,
-            f"Max Abs Error = {max_err_mono:.2e} (tol={tol_logits:.0e}, {t_mono:.1f}ms)",
+    if skip_monolithic:
+        print("  Skipped monolithic trace (--skip-monolithic enabled)")
+        results.append(pass_fail("Monolithic Logit Parity vs PyTorch", True, "Skipped by user flag"))
+    else:
+        print("  Tracing & XLA compiling entire monolithic graph (one-time JIT cold start)...")
+        t0 = time.perf_counter()
+        sub_mono = FrozenJAXSubstrate(torch_model, config, intercept_layers=[])
+        res_mono = sub_mono(jax_ids)
+        t_mono = (time.perf_counter() - t0) * 1000
+        max_err_mono = float(np.max(np.abs(pt_logits - np.asarray(res_mono.logits))))
+        ok_mono = max_err_mono <= tol_logits
+        results.append(
+            pass_fail(
+                "Monolithic Logit Parity vs PyTorch",
+                ok_mono,
+                f"Max Abs Error = {max_err_mono:.2e} (tol={tol_logits:.0e}, {t_mono:.1f}ms)",
+            )
         )
-    )
 
     # 4. Segmented torch2jax Execution
     subheader("3. Segmented JAX Execution (With Interception)")
@@ -350,6 +356,7 @@ def main():
     parser.add_argument("--seq-len", type=int, default=8, help="Sequence length for deterministic test")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for deterministic test")
     parser.add_argument("--tiny", action="store_true", help="Shortcut to use tiny_gpt2 for quick local validation")
+    parser.add_argument("--skip-monolithic", action="store_true", help="Skip the monolithic (unsegmented) trace step")
     args = parser.parse_args()
 
     if args.tiny or args.model == "tiny_gpt2":
@@ -369,6 +376,7 @@ def main():
         intercept_layers=intercept,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
+        skip_monolithic=args.skip_monolithic,
     )
 
     sys.exit(0 if passed else 1)

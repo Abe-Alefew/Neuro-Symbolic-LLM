@@ -19,6 +19,7 @@ dependencies = [
 
     # Frozen base model (PyTorch, hidden state extraction only)
     "torch>=2.2.0",
+    "torch2jax>=0.4.0",
     "transformers>=4.40.0",
     "datasets>=2.19.0",
 

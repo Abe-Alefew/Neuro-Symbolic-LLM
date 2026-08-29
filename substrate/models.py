@@ -1,324 +1,468 @@
-"""Pure JAX forward implementations for GPT-2 and GPT-NeoX/Pythia.
+"""Segmented torch2jax execution engine for frozen LLM transformer blocks.
 
-The forward passes are written as pure functions over a Flax-convention
-parameter PyTree (a nested mapping of ``jax.Array`` leaves). Parameter names
-match HuggingFace checkpoint names so that weights can be converted without
-renaming. No parameters are mutated anywhere: ``hidden + 0.0`` style identity
-interception is fully JIT-trace-safe.
+Converts Hugging Face / PyTorch transformer segments into JAX-native computations
+using samuela/torch2jax while maintaining explicit JAX interception and modification.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
-
 import jax
 import jax.numpy as jnp
+import torch
+import torch.nn as nn
+from torch2jax import t2j_module
 
 from .architecture import Architecture
 
-# ── shared primitives ──────────────────────────────────────────────────────
+
+# ── Strict State-Dict Validation ─────────────────────────────────────────────
+
+def validate_segment_state_dict(
+    segment_name: str,
+    module: nn.Module,
+    supplied_sd: Mapping[str, Any],
+) -> None:
+    """Assert exact key equality between PyTorch module state_dict and JAX dictionary."""
+    expected_keys = set(module.state_dict().keys())
+    actual_keys = set(supplied_sd.keys())
+
+    missing = expected_keys - actual_keys
+    unexpected = actual_keys - expected_keys
+
+    if missing or unexpected:
+        error_msg = [f"State-dict mismatch for segment '{segment_name}':"]
+        if missing:
+            error_msg.append(f"  Missing keys ({len(missing)}): {sorted(missing)}")
+        if unexpected:
+            error_msg.append(f"  Unexpected keys ({len(unexpected)}): {sorted(unexpected)}")
+        raise KeyError("\n".join(error_msg))
 
 
-def layer_norm(
-    x: jax.Array,
-    weight: jax.Array,
-    bias: jax.Array | None,
-    eps: float,
-) -> jax.Array:
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    variance = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
-    x = (x - mean) * jax.lax.rsqrt(variance + eps)
-    x = x * weight
-    if bias is not None:
-        x = x + bias
-    return x
+# ── GPT-2 Contiguous Segment Wrappers ────────────────────────────────────────
+
+class GPT2InitialSegment(nn.Module):
+    """GPT-2 Segment 0: Embeddings + Blocks [0 .. end_layer]."""
+
+    def __init__(self, wte: nn.Embedding, wpe: nn.Embedding, blocks: Sequence[nn.Module]):
+        super().__init__()
+        self.wte = wte
+        self.wpe = wpe
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        h = self.wte(input_ids) + self.wpe(position_ids)
+        for block in self.blocks:
+            h = block(h)[0]
+        return h
 
 
-def _mlp(
-    hidden: jax.Array,
-    fc_w: jax.Array,
-    fc_b: jax.Array,
-    proj_w: jax.Array,
-    proj_b: jax.Array,
-    linear_transpose: bool = True,
-    gelu_approximate: bool = True,
-) -> jax.Array:
-    # GPT-2 uses "gelu_new" (tanh approximation); GPT-NeoX/Pythia uses the
-    # exact erf-based gelu. Using the wrong one diverges on real checkpoints.
-    def act(x: jax.Array) -> jax.Array:
-        return jax.nn.gelu(x, approximate=gelu_approximate)
+class GPT2MiddleSegment(nn.Module):
+    """GPT-2 Segment k: Blocks [start_layer .. end_layer]."""
 
-    if linear_transpose:
-        # standard nn.Linear layout: weight is [output, input]
-        intermediate = act(hidden @ fc_w.T + fc_b)
-        return intermediate @ proj_w.T + proj_b
-    # GPT-2 Conv1D layout: weight is [input, output], forward is x @ w
-    intermediate = act(hidden @ fc_w + fc_b)
-    return intermediate @ proj_w + proj_b
+    def __init__(self, blocks: Sequence[nn.Module]):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        h = hidden_state
+        for block in self.blocks:
+            h = block(h)[0]
+        return h
 
 
-def _causal_mask(seq_len: int) -> jax.Array:
-    return jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, None, :, :]
+class GPT2FinalSegment(nn.Module):
+    """GPT-2 Final Segment: Blocks [start_layer .. L-1] + ln_f + lm_head."""
+
+    def __init__(self, blocks: Sequence[nn.Module], ln_f: nn.LayerNorm, lm_head: nn.Linear):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+        self.ln_f = ln_f
+        self.lm_head = lm_head
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        h = hidden_state
+        for block in self.blocks:
+            h = block(h)[0]
+        h = self.ln_f(h)
+        return self.lm_head(h)
 
 
-# ── GPT-2 ──────────────────────────────────────────────────────────────────
+class GPT2MonolithicSegment(nn.Module):
+    """GPT-2 Monolithic Segment: Embeddings + All Blocks + ln_f + lm_head."""
+
+    def __init__(
+        self,
+        wte: nn.Embedding,
+        wpe: nn.Embedding,
+        blocks: Sequence[nn.Module],
+        ln_f: nn.LayerNorm,
+        lm_head: nn.Linear,
+    ):
+        super().__init__()
+        self.wte = wte
+        self.wpe = wpe
+        self.blocks = nn.ModuleList(blocks)
+        self.ln_f = ln_f
+        self.lm_head = lm_head
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        h = self.wte(input_ids) + self.wpe(position_ids)
+        for block in self.blocks:
+            h = block(h)[0]
+        h = self.ln_f(h)
+        return self.lm_head(h)
 
 
-def gpt2_embed(params: Mapping[str, Any], input_ids: jax.Array) -> jax.Array:
-    wte = params["wte"]["weight"]
-    wpe = params["wpe"]["weight"]
-    positions = jnp.arange(input_ids.shape[1])[None, :]
-    return wte[input_ids] + wpe[positions]
+# ── GPT-NeoX / Pythia Contiguous Segment Wrappers ────────────────────────────
+
+class NeoXInitialSegment(nn.Module):
+    """NeoX Segment 0: embed_in + global rotary_emb + Blocks [0 .. end_layer]."""
+
+    def __init__(self, embed_in: nn.Embedding, rotary_emb: nn.Module, layers: Sequence[nn.Module]):
+        super().__init__()
+        self.embed_in = embed_in
+        self.rotary_emb = rotary_emb
+        self.layers = nn.ModuleList(layers)
+
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        h = self.embed_in(input_ids)
+        cos, sin = self.rotary_emb(h, position_ids)
+        rotary_pos_emb = (cos, sin)
+
+        B, T = input_ids.shape
+        causal_mask = torch.triu(torch.full((T, T), float("-inf"), device=input_ids.device), diagonal=1)
+        attn_mask = causal_mask.view(1, 1, T, T).expand(B, 1, T, T)
+
+        for layer in self.layers:
+            h = layer(h, attention_mask=attn_mask, position_embeddings=rotary_pos_emb)[0]
+
+        return h, rotary_pos_emb
 
 
-def gpt2_attention(
-    hidden: jax.Array,
-    c_attn_w: jax.Array,
-    c_attn_b: jax.Array,
-    c_proj_w: jax.Array,
-    c_proj_b: jax.Array,
-    num_heads: int,
-) -> jax.Array:
-    batch, seq_len, _ = hidden.shape
-    head_dim = hidden.shape[-1] // num_heads
-    qkv = hidden @ c_attn_w + c_attn_b
-    qkv = qkv.reshape(batch, seq_len, 3, num_heads, head_dim)
-    qkv = qkv.transpose(2, 0, 3, 1, 4)  # [3, B, H, T, d]
-    q, k, v = qkv[0], qkv[1], qkv[2]
-    scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (head_dim**-0.5)
-    scores = jnp.where(_causal_mask(seq_len), scores, jnp.finfo(scores.dtype).min)
-    weights = jax.nn.softmax(scores, axis=-1)
-    out = jnp.einsum("bhts,bhsd->bhtd", weights, v)
-    out = out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
-    return out @ c_proj_w + c_proj_b
+class NeoXMiddleSegment(nn.Module):
+    """NeoX Segment k: Blocks [start_layer .. end_layer]."""
+
+    def __init__(self, layers: Sequence[nn.Module]):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, hidden_state: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, T, _ = hidden_state.shape
+        rotary_pos_emb = (cos, sin)
+        causal_mask = torch.triu(torch.full((T, T), float("-inf"), device=hidden_state.device), diagonal=1)
+        attn_mask = causal_mask.view(1, 1, T, T).expand(B, 1, T, T)
+
+        h = hidden_state
+        for layer in self.layers:
+            h = layer(h, attention_mask=attn_mask, position_embeddings=rotary_pos_emb)[0]
+        return h
 
 
-def gpt2_block(
-    params: Mapping[str, Any], idx: int, hidden: jax.Array, arch: Architecture
-) -> jax.Array:
-    layer = params["h"][idx]
-    ln_1 = layer["ln_1"]
-    normed = layer_norm(hidden, ln_1["weight"], ln_1["bias"], arch.layer_norm_eps)
-    attn = gpt2_attention(
-        normed,
-        layer["attn"]["c_attn"]["weight"],
-        layer["attn"]["c_attn"]["bias"],
-        layer["attn"]["c_proj"]["weight"],
-        layer["attn"]["c_proj"]["bias"],
-        arch.num_heads,
-    )
-    hidden = hidden + attn
-    ln_2 = layer["ln_2"]
-    normed = layer_norm(hidden, ln_2["weight"], ln_2["bias"], arch.layer_norm_eps)
-    mlp = _mlp(
-        normed,
-        layer["mlp"]["c_fc"]["weight"],
-        layer["mlp"]["c_fc"]["bias"],
-        layer["mlp"]["c_proj"]["weight"],
-        layer["mlp"]["c_proj"]["bias"],
-        linear_transpose=False,
-    )
-    return hidden + mlp
+class NeoXFinalSegment(nn.Module):
+    """NeoX Final Segment: Blocks [start_layer .. L-1] + final_layer_norm + embed_out."""
+
+    def __init__(self, layers: Sequence[nn.Module], final_layer_norm: nn.LayerNorm, embed_out: nn.Linear):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+        self.final_layer_norm = final_layer_norm
+        self.embed_out = embed_out
+
+    def forward(self, hidden_state: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, T, _ = hidden_state.shape
+        rotary_pos_emb = (cos, sin)
+        causal_mask = torch.triu(torch.full((T, T), float("-inf"), device=hidden_state.device), diagonal=1)
+        attn_mask = causal_mask.view(1, 1, T, T).expand(B, 1, T, T)
+
+        h = hidden_state
+        for layer in self.layers:
+            h = layer(h, attention_mask=attn_mask, position_embeddings=rotary_pos_emb)[0]
+        h = self.final_layer_norm(h)
+        return self.embed_out(h)
 
 
-def gpt2_lm_head(
-    params: Mapping[str, Any], hidden: jax.Array, arch: Architecture
-) -> jax.Array:
-    ln_f = params["ln_f"]
-    hidden = layer_norm(hidden, ln_f["weight"], ln_f["bias"], arch.layer_norm_eps)
-    if "lm_head" in params and "weight" in params["lm_head"]:
-        head_w = params["lm_head"]["weight"]
-    else:
-        head_w = params["wte"]["weight"]
-    return hidden @ head_w.T
+class NeoXMonolithicSegment(nn.Module):
+    """NeoX Monolithic Segment: embed_in + rotary_emb + All Layers + final_layer_norm + embed_out."""
+
+    def __init__(
+        self,
+        embed_in: nn.Embedding,
+        rotary_emb: nn.Module,
+        layers: Sequence[nn.Module],
+        final_layer_norm: nn.LayerNorm,
+        embed_out: nn.Linear,
+    ):
+        super().__init__()
+        self.embed_in = embed_in
+        self.rotary_emb = rotary_emb
+        self.layers = nn.ModuleList(layers)
+        self.final_layer_norm = final_layer_norm
+        self.embed_out = embed_out
+
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
+        h = self.embed_in(input_ids)
+        cos, sin = self.rotary_emb(h, position_ids)
+        rotary_pos_emb = (cos, sin)
+
+        B, T = input_ids.shape
+        causal_mask = torch.triu(torch.full((T, T), float("-inf"), device=input_ids.device), diagonal=1)
+        attn_mask = causal_mask.view(1, 1, T, T).expand(B, 1, T, T)
+
+        for layer in self.layers:
+            h = layer(h, attention_mask=attn_mask, position_embeddings=rotary_pos_emb)[0]
+        h = self.final_layer_norm(h)
+        return self.embed_out(h)
 
 
-# ── GPT-NeoX / Pythia ──────────────────────────────────────────────────────
+# ── Segmented Engine Class ───────────────────────────────────────────────────
 
+class SegmentedTorch2JaxEngine:
+    """Partitions PyTorch transformer into K+1 segments and converts them to JAX."""
 
-def neox_embed(params: Mapping[str, Any], input_ids: jax.Array) -> jax.Array:
-    return params["embed_in"]["weight"][input_ids]
+    def __init__(
+        self,
+        torch_model: nn.Module,
+        arch: Architecture | None = None,
+        intercept_layers: Sequence[int] | None = None,
+    ):
+        torch_model.eval()
+        if arch is None:
+            #auto-architecture detection 
+            from .loader import state_dict_to_jax_pytree
+            from .architecture import detect_architecture
+            params_pytree = state_dict_to_jax_pytree(torch_model.state_dict())
+            arch = detect_architecture(params_pytree, getattr(torch_model, "config", None))
 
+        self.arch = arch
+        self.family = arch.model_family
+        self.num_layers = arch.num_layers
 
-def _neox_rope(
-    q: jax.Array,
-    k: jax.Array,
-    position_ids: jax.Array,
-    arch: Architecture,
-) -> tuple[jax.Array, jax.Array]:
-    rotary_dim = int(arch.head_dim * arch.rotary_pct)
-    inv_freq = 1.0 / (
-        arch.rope_theta
-        ** (jnp.arange(0, rotary_dim, 2).astype(jnp.float32) / rotary_dim)
-    )
-    pos = position_ids.astype(jnp.float32)
-    freqs = pos[:, :, None] * inv_freq[None, None, :]  # [B, T, rotary_dim/2]
-    emb = jnp.concatenate([freqs, freqs], axis=-1)  # [B, T, rotary_dim]
-    cos = jnp.cos(emb)[:, None, :, :]  # [B, 1, T, rotary_dim]
-    sin = jnp.sin(emb)[:, None, :, :]
+        # Clean and sort interception points
+        self.intercept_layers = tuple(sorted(set(intercept_layers or ())))
+        for lyr in self.intercept_layers:
+            if lyr < 0 or lyr >= self.num_layers:
+                raise ValueError(f"Interception layer {lyr} out of bounds (0..{self.num_layers - 1})")
 
-    def _rotate(x: jax.Array) -> jax.Array:
-        rot = x[..., :rotary_dim]
-        rest = x[..., rotary_dim:]
-        half = rotary_dim // 2
-        x1 = rot[..., :half]
-        x2 = rot[..., half:]
-        rotated = jnp.concatenate([-x2, x1], axis=-1)
-        return jnp.concatenate([rot * cos + rotated * sin, rest], axis=-1)
+        # Build PyTorch segments
+        self.segments: list[nn.Module] = []
+        self.segment_names: list[str] = []
+        self._build_segments(torch_model)
 
-    return _rotate(q), _rotate(k)
+        # Convert each segment to JAX via torch2jax
+        self.t2j_segments = [t2j_module(seg) for seg in self.segments]
 
+    def _build_segments(self, torch_model: nn.Module) -> None:
+        if self.family == "gpt2":
+            self._build_gpt2_segments(torch_model)
+        elif self.family == "neox":
+            self._build_neox_segments(torch_model)
+        else:
+            raise ValueError(f"Unsupported model family: {self.family}")
 
-def neox_attention(
-    hidden: jax.Array,
-    params: Mapping[str, Any],
-    position_ids: jax.Array,
-    arch: Architecture,
-) -> jax.Array:
-    batch, seq_len, _ = hidden.shape
-    qkv_w = params["query_key_value"]["weight"]
-    qkv_b = params["query_key_value"]["bias"]
-    dense_w = params["dense"]["weight"]
-    dense_b = params["dense"]["bias"]
-    head_dim = arch.head_dim
+    def _unwrap_model(self, model: nn.Module) -> nn.Module:
+        curr = model
+        while True:
+            if hasattr(curr, "module") and isinstance(getattr(curr, "module"), nn.Module):
+                curr = getattr(curr, "module")
+            elif hasattr(curr, "base_model") and isinstance(getattr(curr, "base_model"), nn.Module):
+                curr = getattr(curr, "base_model")
+            else:
+                break
+        return curr
 
-    qkv = hidden @ qkv_w.T + qkv_b  # [B, T, 3D]
-    qkv = qkv.reshape(batch, seq_len, arch.num_heads, 3 * head_dim).transpose(
-        0, 2, 1, 3
-    )
-    q, k, v = (
-        qkv[..., :head_dim],
-        qkv[..., head_dim : 2 * head_dim],
-        qkv[..., 2 * head_dim :],
-    )
-    q, k = _neox_rope(q, k, position_ids, arch)
-    scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (head_dim**-0.5)
-    scores = jnp.where(_causal_mask(seq_len), scores, jnp.finfo(scores.dtype).min)
-    weights = jax.nn.softmax(scores, axis=-1)
-    out = jnp.einsum("bhts,bhsd->bhtd", weights, v)
-    out = out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
-    return out @ dense_w.T + dense_b
+    def _build_gpt2_segments(self, model: nn.Module) -> None:
+        model = self._unwrap_model(model)
+        transformer = getattr(model, "transformer", None)
+        if transformer is None:
+            transformer = model
 
+        # Ensure blocks are located
+        if not hasattr(transformer, "h") or transformer.h is None:
+            if hasattr(model, "h") and model.h is not None:
+                transformer = model
+            else:
+                raise AttributeError(
+                    f"Could not locate transformer blocks in {type(model).__name__}. "
+                    "Expected 'transformer.h' or 'h' containing a sequence of transformer blocks."
+                )
 
-def neox_block(
-    params: Mapping[str, Any],
-    idx: int,
-    hidden: jax.Array,
-    position_ids: jax.Array,
-    arch: Architecture,
-) -> jax.Array:
-    layer = params["layers"][idx]
-    ln_in = layer["input_layernorm"]
-    ln_post = layer["post_attention_layernorm"]
+        blocks = list(transformer.h)
+        wte = getattr(transformer, "wte", None) or getattr(model, "wte", None)
+        wpe = getattr(transformer, "wpe", None) or getattr(model, "wpe", None)
+        ln_f = getattr(transformer, "ln_f", None) or getattr(model, "ln_f", None)
 
-    # NOTE: GPT-NeoX LayerNorms have affine weight AND bias; real checkpoints
-    # carry trained non-zero biases, so they must never be dropped.
-    attn_in = layer_norm(
-        hidden, ln_in["weight"], ln_in.get("bias"), arch.layer_norm_eps
-    )
-    attn_out = neox_attention(attn_in, layer["attention"], position_ids, arch)
-    if arch.use_parallel_residual:
-        mlp_in = layer_norm(
-            hidden, ln_post["weight"], ln_post.get("bias"), arch.layer_norm_eps
-        )
-        mlp_out = _mlp(
-            mlp_in,
-            layer["mlp"]["dense_h_to_4h"]["weight"],
-            layer["mlp"]["dense_h_to_4h"]["bias"],
-            layer["mlp"]["dense_4h_to_h"]["weight"],
-            layer["mlp"]["dense_4h_to_h"]["bias"],
-            gelu_approximate=False,
-        )
-        return hidden + attn_out + mlp_out
-    hidden = hidden + attn_out
-    mlp_in = layer_norm(
-        hidden, ln_post["weight"], ln_post.get("bias"), arch.layer_norm_eps
-    )
-    mlp_out = _mlp(
-        mlp_in,
-        layer["mlp"]["dense_h_to_4h"]["weight"],
-        layer["mlp"]["dense_h_to_4h"]["bias"],
-        layer["mlp"]["dense_4h_to_h"]["weight"],
-        layer["mlp"]["dense_4h_to_h"]["bias"],
-        gelu_approximate=False,
-    )
-    return hidden + mlp_out
+        if wte is None or wpe is None or ln_f is None:
+            raise AttributeError(
+                f"Missing components in GPT-2 model {type(model).__name__}: "
+                f"wte={wte is not None}, wpe={wpe is not None}, ln_f={ln_f is not None}"
+            )
 
+        lm_head = getattr(model, "lm_head", None) or getattr(transformer, "lm_head", None)
+        if lm_head is None:
+            lm_head = nn.Linear(wte.weight.shape[1], wte.weight.shape[0], bias=False)
+            lm_head.weight = wte.weight
 
-def neox_lm_head(
-    params: Mapping[str, Any], hidden: jax.Array, arch: Architecture
-) -> jax.Array:
-    gpt_neox = params["gpt_neox"]
-    final_norm = gpt_neox["final_layer_norm"]
-    hidden = layer_norm(
-        hidden,
-        final_norm["weight"],
-        final_norm.get("bias"),
-        arch.layer_norm_eps,
-    )
-    if "lm_head" in params and "weight" in params["lm_head"]:
-        head_w = params["lm_head"]["weight"]
-    elif "embed_out" in gpt_neox and "weight" in gpt_neox["embed_out"]:
-        head_w = gpt_neox["embed_out"]["weight"]
-    else:
-        head_w = gpt_neox["embed_in"]["weight"]
-    return hidden @ head_w.T
+        if len(self.intercept_layers) == 0:
+            self.segments.append(GPT2MonolithicSegment(wte, wpe, blocks, ln_f, lm_head))
+            self.segment_names = ["monolithic_gpt2"]
+            return
 
+        # Segment 0: Embeddings + Blocks [0 .. intercept_layers[0]]
+        first_cut = self.intercept_layers[0]
+        self.segments.append(GPT2InitialSegment(wte, wpe, blocks[: first_cut + 1]))
+        self.segment_names.append(f"seg0_emb_to_block{first_cut}")
 
-# ── generic driver ─────────────────────────────────────────────────────────
+        # Middle Segments: Blocks (intercept_layers[i-1] .. intercept_layers[i]]
+        for i in range(1, len(self.intercept_layers)):
+            p_cut, c_cut = self.intercept_layers[i - 1], self.intercept_layers[i]
+            self.segments.append(GPT2MiddleSegment(blocks[p_cut + 1 : c_cut + 1]))
+            self.segment_names.append(f"seg{i}_block{p_cut + 1}_to_block{c_cut}")
 
+        # Final Segment: Blocks (intercept_layers[-1] .. L-1] + ln_f + lm_head
+        last_cut = self.intercept_layers[-1]
+        self.segments.append(GPT2FinalSegment(blocks[last_cut + 1 :], ln_f, lm_head))
+        self.segment_names.append(f"seg{len(self.intercept_layers)}_block{last_cut + 1}_to_head")
 
-def run_embeddings(
-    params: Mapping[str, Any], arch: Architecture, input_ids: jax.Array
-) -> jax.Array:
-    if arch.model_family == "gpt2":
-        return gpt2_embed(params["transformer"], input_ids)
-    if arch.model_family == "neox":
-        return neox_embed(params["gpt_neox"], input_ids)
-    raise ValueError(f"Unsupported model family: {arch.model_family}")
+    def _build_neox_segments(self, model: nn.Module) -> None:
+        model = self._unwrap_model(model)
+        neox = getattr(model, "gpt_neox", None)
+        if neox is None:
+            neox = model
 
+        if not hasattr(neox, "layers") or neox.layers is None:
+            if hasattr(model, "layers") and model.layers is not None:
+                neox = model
+            else:
+                raise AttributeError(
+                    f"Could not locate transformer layers in {type(model).__name__}. "
+                    "Expected 'gpt_neox.layers' or 'layers' containing a sequence of transformer layers."
+                )
 
-def _run_block(
-    params: Mapping[str, Any],
-    arch: Architecture,
-    idx: int,
-    hidden: jax.Array,
-    position_ids: jax.Array,
-) -> jax.Array:
-    if arch.model_family == "gpt2":
-        return gpt2_block(params["transformer"], idx, hidden, arch)
-    if arch.model_family == "neox":
-        return neox_block(params["gpt_neox"], idx, hidden, position_ids, arch)
-    raise ValueError(f"Unsupported model family: {arch.model_family}")
+        layers = list(neox.layers)
+        embed_in = getattr(neox, "embed_in", None) or getattr(model, "embed_in", None)
+        rotary_emb = getattr(neox, "rotary_emb", None) or getattr(model, "rotary_emb", None)
+        final_norm = getattr(neox, "final_layer_norm", None) or getattr(model, "final_layer_norm", None)
 
+        if embed_in is None or rotary_emb is None or final_norm is None:
+            raise AttributeError(
+                f"Missing components in NeoX model {type(model).__name__}: "
+                f"embed_in={embed_in is not None}, rotary_emb={rotary_emb is not None}, "
+                f"final_layer_norm={final_norm is not None}"
+            )
 
-def run_transformer_blocks(
-    params: Mapping[str, Any],
-    arch: Architecture,
-    hidden: jax.Array,
-    intercept_layers: Sequence[int],
-    hook: Callable[[jax.Array, int], jax.Array],
-    position_ids: jax.Array,
-) -> tuple[jax.Array, dict[int, jax.Array]]:
-    """Run the transformer blocks sequentially, caching and optionally
-    modifying hidden states at the requested zero-based layer indices."""
-    intercept_set = set(intercept_layers)
-    intermediates: dict[int, jax.Array] = {}
-    for idx in range(arch.num_layers):
-        hidden = _run_block(params, arch, idx, hidden, position_ids)
-        if idx in intercept_set:
-            cached = hidden
-            hidden = hook(cached, idx)
-            intermediates[idx] = cached
-    return hidden, intermediates
+        embed_out = getattr(model, "embed_out", None) or getattr(model, "lm_head", None) or getattr(neox, "embed_out", None)
+        if embed_out is None:
+            raise KeyError("No output projection found (expected embed_out or lm_head).")
 
+        if len(self.intercept_layers) == 0:
+            self.segments.append(
+                NeoXMonolithicSegment(embed_in, rotary_emb, layers, final_norm, embed_out)
+            )
+            self.segment_names = ["monolithic_neox"]
+            return
 
-def run_lm_head(
-    params: Mapping[str, Any], arch: Architecture, hidden: jax.Array
-) -> jax.Array:
-    if arch.model_family == "gpt2":
-        return gpt2_lm_head(params["transformer"], hidden, arch)
-    if arch.model_family == "neox":
-        return neox_lm_head(params, hidden, arch)
-    raise ValueError(f"Unsupported model family: {arch.model_family}")
+        # Segment 0
+        first_cut = self.intercept_layers[0]
+        self.segments.append(NeoXInitialSegment(embed_in, rotary_emb, layers[: first_cut + 1]))
+        self.segment_names.append(f"neox_seg0_to_block{first_cut}")
+
+        # Middle Segments
+        for i in range(1, len(self.intercept_layers)):
+            p_cut, c_cut = self.intercept_layers[i - 1], self.intercept_layers[i]
+            self.segments.append(NeoXMiddleSegment(layers[p_cut + 1 : c_cut + 1]))
+            self.segment_names.append(f"neox_seg{i}_block{p_cut + 1}_to_block{c_cut}")
+
+        # Final Segment
+        last_cut = self.intercept_layers[-1]
+        self.segments.append(NeoXFinalSegment(layers[last_cut + 1 :], final_norm, embed_out))
+        self.segment_names.append(f"neox_seg{len(self.intercept_layers)}_block{last_cut + 1}_to_head")
+
+    def extract_and_validate_params(self) -> dict[str, dict[str, jax.Array]]:
+        """Extract state_dicts as float32 JAX arrays and validate exact key parity."""
+        params: dict[str, dict[str, jax.Array]] = {}
+        for name, seg in zip(self.segment_names, self.segments):
+            sd = seg.state_dict()
+            jax_sd = {
+                k: jnp.asarray(v.detach().cpu().numpy(), dtype=jnp.float32)
+                for k, v in sd.items()
+            }
+            validate_segment_state_dict(name, seg, jax_sd)
+            params[name] = jax_sd
+        return params
+
+    def run_forward(
+        self,
+        params: Mapping[str, Any],
+        input_ids: jax.Array,
+        position_ids: jax.Array | None = None,
+        modify_fn: Callable[[jax.Array, int], jax.Array] | None = None,
+    ) -> tuple[jax.Array, dict[int, jax.Array]]:
+        """Executes the segmented pipeline in JAX, intercepting at layer boundaries."""
+        B, T = input_ids.shape
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(jnp.arange(T, dtype=jnp.int32), (B, T))
+
+        intermediates: dict[int, jax.Array] = {}
+
+        if self.family == "gpt2":
+            seg0_sd = params[self.segment_names[0]]
+
+            # Zero-interception: run monolithic segment directly to logits
+            if len(self.intercept_layers) == 0:
+                logits = self.t2j_segments[0](input_ids, position_ids, state_dict=seg0_sd)
+                return logits, {}
+
+            # 1. Segment 0
+            h = self.t2j_segments[0](input_ids, position_ids, state_dict=seg0_sd)
+            first_layer = self.intercept_layers[0]
+            intermediates[first_layer] = h
+            if modify_fn is not None:
+                h = modify_fn(h, first_layer)
+
+            # 2. Middle Segments
+            for i in range(1, len(self.intercept_layers)):
+                seg_sd = params[self.segment_names[i]]
+                h = self.t2j_segments[i](h, state_dict=seg_sd)
+                layer_idx = self.intercept_layers[i]
+                intermediates[layer_idx] = h
+                if modify_fn is not None:
+                    h = modify_fn(h, layer_idx)
+
+            # 3. Final Segment
+            final_sd = params[self.segment_names[-1]]
+            logits = self.t2j_segments[-1](h, state_dict=final_sd)
+            return logits, intermediates
+
+        else:  # neox
+            seg0_sd = params[self.segment_names[0]]
+
+            # Zero-interception: run monolithic segment directly to logits
+            if len(self.intercept_layers) == 0:
+                logits = self.t2j_segments[0](input_ids, position_ids, state_dict=seg0_sd)
+                return logits, {}
+
+            # 1. Segment 0 (returns hidden state + rotary embeddings)
+            h, (cos, sin) = self.t2j_segments[0](input_ids, position_ids, state_dict=seg0_sd)
+            first_layer = self.intercept_layers[0]
+            intermediates[first_layer] = h
+            if modify_fn is not None:
+                h = modify_fn(h, first_layer)
+
+            # 2. Middle Segments
+            for i in range(1, len(self.intercept_layers)):
+                seg_sd = params[self.segment_names[i]]
+                h = self.t2j_segments[i](h, cos, sin, state_dict=seg_sd)
+                layer_idx = self.intercept_layers[i]
+                intermediates[layer_idx] = h
+                if modify_fn is not None:
+                    h = modify_fn(h, layer_idx)
+
+            # 3. Final Segment
+            final_sd = params[self.segment_names[-1]]
+            logits = self.t2j_segments[-1](h, cos, sin, state_dict=final_sd)
+            return logits, intermediates

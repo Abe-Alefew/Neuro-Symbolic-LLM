@@ -36,13 +36,29 @@ def _top_keys(params: Any) -> set[str]:
     return set()
 
 
-def _family_from_keys(keys: set[str]) -> str | None:
+def _family_from_keys(keys: set[str], params: Any = None) -> str | None:
     # Family is determined by the presence of the family container keys;
     # other top-level keys (e.g. a shared 'lm_head') may be present in both.
-    if "transformer" in keys:
+    if "transformer" in keys or any(k.startswith("transformer.") for k in keys):
         return "gpt2"
-    if "gpt_neox" in keys:
+    if "gpt_neox" in keys or any(k.startswith("gpt_neox.") for k in keys):
         return "neox"
+
+    # Segmented parameter dict inspection
+    if isinstance(params, Mapping):
+        if any("gpt2" in k for k in keys):
+            return "gpt2"
+        if any("neox" in k for k in keys):
+            return "neox"
+
+        for seg in params.values():
+            if isinstance(seg, Mapping):
+                seg_keys = set(seg.keys())
+                if "wte.weight" in seg_keys or "transformer.wte.weight" in seg_keys:
+                    return "gpt2"
+                if "embed_in.weight" in seg_keys or "gpt_neox.embed_in.weight" in seg_keys:
+                    return "neox"
+
     return None
 
 
@@ -56,16 +72,41 @@ def _get_path(params: Any, *parts: str) -> Any:
 def _config_value(config: Any, name: str, default: Any) -> Any:
     if config is None:
         return default
-    if hasattr(config, name):
-        return getattr(config, name)
 
-    # Hugging Face uses different names across model families and versions
     aliases = {
         "layer_norm_eps": "layer_norm_epsilon",
         "rope_theta": "rotary_emb_base",
     }
     alias = aliases.get(name)
-    return getattr(config, alias, default) if alias is not None else default
+
+    # 1. If config is a Mapping (dict)
+    if isinstance(config, Mapping):
+        if name in config:
+            return config[name]
+        if alias is not None and alias in config:
+            return config[alias]
+        return default
+
+    # 2. If config is an object with attributes (HF PretrainedConfig)
+    if hasattr(config, name):
+        return getattr(config, name)
+    if alias is not None and hasattr(config, alias):
+        return getattr(config, alias)
+    return default
+
+
+def _count_segmented_layers(params: Mapping[str, Any], block_prefix: str) -> int:
+    total = 0
+    for seg in params.values():
+        if isinstance(seg, Mapping):
+            indices = {
+                int(k.split(".")[1])
+                for k in seg.keys()
+                if k.startswith(f"{block_prefix}.") and len(k.split(".")) > 1 and k.split(".")[1].isdigit()
+            }
+            if indices:
+                total += max(indices) + 1
+    return total
 
 
 def detect_architecture(params: Any, config: Any = None) -> Architecture:
@@ -75,7 +116,7 @@ def detect_architecture(params: Any, config: Any = None) -> Architecture:
     Raises ``ValueError`` for unsupported parameter layouts.
     """
     keys = _top_keys(params)
-    family = _family_from_keys(keys)
+    family = _family_from_keys(keys, params)
     if family is None:
         raise ValueError(
             "Unsupported model architecture. Expected GPT-2 (params with "
@@ -83,30 +124,68 @@ def detect_architecture(params: Any, config: Any = None) -> Architecture:
             f"'gpt_neox'/'embed_out' keys). Found top-level keys: {sorted(keys)}"
         )
 
+    is_segmented = isinstance(params, Mapping) and "transformer" not in keys and "gpt_neox" not in keys
+
     if family == "gpt2":
-        wte_weight = _get_path(params, "transformer", "wte", "weight")
-        wpe_weight = _get_path(params, "transformer", "wpe", "weight")
-        blocks = _get_path(params, "transformer", "h")
-        vocab_size = wte_weight.shape[0]
-        hidden_size = wte_weight.shape[1]
-        max_positions = wpe_weight.shape[0]
+        if is_segmented:
+            seg0 = next(
+                v for v in params.values()
+                if isinstance(v, Mapping) and ("wte.weight" in v or "transformer.wte.weight" in v)
+            )
+            wte_weight = seg0.get("wte.weight", seg0.get("transformer.wte.weight"))
+            wpe_weight = seg0.get("wpe.weight", seg0.get("transformer.wpe.weight"))
+            vocab_size = wte_weight.shape[0]
+            hidden_size = wte_weight.shape[1]
+            max_positions = (
+                wpe_weight.shape[0]
+                if wpe_weight is not None
+                else int(_config_value(config, "max_position_embeddings", _config_value(config, "n_positions", 0))) or None
+            )
+            discovered_layers = _count_segmented_layers(params, "blocks")
+            num_layers = int(_config_value(config, "n_layer", discovered_layers)) or discovered_layers
+        else:
+            wte_weight = _get_path(params, "transformer", "wte", "weight")
+            wpe_weight = _get_path(params, "transformer", "wpe", "weight")
+            blocks = _get_path(params, "transformer", "h")
+            if not isinstance(blocks, Mapping) and not isinstance(blocks, Sequence):
+                raise ValueError(
+                    f"Cannot discover transformer blocks: unexpected {type(blocks)}"
+                )
+            num_layers = len(blocks)
+            vocab_size = wte_weight.shape[0]
+            hidden_size = wte_weight.shape[1]
+            max_positions = wpe_weight.shape[0]
+
         num_heads = int(_config_value(config, "n_head", max(1, hidden_size // 64)))
+
     else:  # neox
-        embed_weight = _get_path(params, "gpt_neox", "embed_in", "weight")
-        blocks = _get_path(params, "gpt_neox", "layers")
-        vocab_size = embed_weight.shape[0]
-        hidden_size = embed_weight.shape[1]
-        max_positions = int(_config_value(config, "max_position_embeddings", 0)) or None
+        if is_segmented:
+            seg0 = next(
+                v for v in params.values()
+                if isinstance(v, Mapping) and ("embed_in.weight" in v or "gpt_neox.embed_in.weight" in v)
+            )
+            embed_weight = seg0.get("embed_in.weight", seg0.get("gpt_neox.embed_in.weight"))
+            vocab_size = embed_weight.shape[0]
+            hidden_size = embed_weight.shape[1]
+            max_positions = int(_config_value(config, "max_position_embeddings", 0)) or None
+            discovered_layers = _count_segmented_layers(params, "layers")
+            num_layers = int(_config_value(config, "num_hidden_layers", discovered_layers)) or discovered_layers
+        else:
+            embed_weight = _get_path(params, "gpt_neox", "embed_in", "weight")
+            blocks = _get_path(params, "gpt_neox", "layers")
+            if not isinstance(blocks, Mapping) and not isinstance(blocks, Sequence):
+                raise ValueError(
+                    f"Cannot discover transformer blocks: unexpected {type(blocks)}"
+                )
+            num_layers = len(blocks)
+            vocab_size = embed_weight.shape[0]
+            hidden_size = embed_weight.shape[1]
+            max_positions = int(_config_value(config, "max_position_embeddings", 0)) or None
+
         num_heads = int(
             _config_value(config, "num_attention_heads", max(1, hidden_size // 64))
         )
 
-    if not isinstance(blocks, Mapping) and not isinstance(blocks, Sequence):
-        raise ValueError(
-            f"Cannot discover transformer blocks: unexpected {type(blocks)}"
-        )
-
-    num_layers = len(blocks)
     head_dim = hidden_size // num_heads
     if head_dim * num_heads != hidden_size:
         raise ValueError(

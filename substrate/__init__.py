@@ -26,6 +26,11 @@ from .memory import (
     maybe_reduce_batch_size,
 )
 from .substrate import ForwardResult, FrozenJAXSubstrate
+from .adapters import (
+    init_residual_adapter,
+    apply_residual_adapter,
+    make_training_step,
+)
 
 __all__ = [
     "Architecture",
@@ -43,6 +48,9 @@ __all__ = [
     "maybe_reduce_batch_size",
     "state_dict_to_jax_pytree",
     "validate_interception_layers",
+    "init_residual_adapter",
+    "apply_residual_adapter",
+    "make_training_step",
 ]
 
 __version__ = "0.1.0"

@@ -105,10 +105,8 @@ def load_substrate_from_hf(
 
     torch_model = AutoModelForCausalLM.from_pretrained(model_id)
     torch_model.eval()
-    state_dict = torch_model.state_dict()
-    params = state_dict_to_jax_pytree(state_dict)
     return FrozenJAXSubstrate(
-        params=params,
+        torch_model=torch_model,
         config=config,
         intercept_layers=intercept_layers,
         modify_hook=modify_hook,

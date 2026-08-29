@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 import jax
 import jax.numpy as jnp
 import optax
+
+TrainingStepFn = Callable[
+    [dict[str, jax.Array], Any, dict[str, dict[str, jax.Array]], jax.Array, jax.Array],
+    tuple[jax.Array, dict[str, jax.Array], Any],
+]
 
 
 def init_residual_adapter(dim: int, key: jax.Array) -> dict[str, jax.Array]:
@@ -36,7 +41,7 @@ def apply_residual_adapter(
 def make_training_step(
     engine: Any,
     optimizer: optax.GradientTransformation,
-) -> Callable:
+) -> TrainingStepFn:
     """Constructs a JIT-compiled training step optimizing residual parameters phi."""
 
     @jax.jit
@@ -47,7 +52,7 @@ def make_training_step(
         input_ids: jax.Array,
         targets: jax.Array,
     ) -> tuple[jax.Array, dict[str, jax.Array], Any]:
-        def loss_fn(p):
+        def loss_fn(p: dict[str, jax.Array]) -> jax.Array:
             logits, _ = engine.run_forward(
                 params=theta0,
                 input_ids=input_ids,
@@ -67,4 +72,4 @@ def make_training_step(
         new_phi = optax.apply_updates(phi, updates)
         return loss, new_phi, new_opt_state
 
-    return train_step
+    return cast(TrainingStepFn, train_step)

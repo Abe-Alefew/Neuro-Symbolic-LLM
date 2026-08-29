@@ -71,6 +71,8 @@ def create_tiny_gpt2():
         n_head=4,
         n_layer=4,
         n_positions=32,
+        bos_token_id=None,
+        eos_token_id=None,
         use_cache=False,
     )
     model = GPT2LMHeadModel(cfg).eval()
@@ -88,6 +90,8 @@ def create_tiny_pythia():
         rotary_pct=0.25,
         use_parallel_residual=True,
         tie_word_embeddings=False,
+        bos_token_id=None,
+        eos_token_id=None,
         use_cache=False,
     )
     model = GPTNeoXForCausalLM(cfg).eval()

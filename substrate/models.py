@@ -12,9 +12,53 @@ import jax
 import jax.numpy as jnp
 import torch
 import torch.nn as nn
-from torch2jax import t2j_module
+from torch2jax import t2j_module, Torchish, HANDLED_FUNCTIONS
 
 from .architecture import Architecture
+
+
+# ── Torchish Compatibility Patches for Hugging Face GPT-2/NeoX ───────────────
+
+def _coerce(x: Any) -> Any:
+    return x.value if isinstance(x, Torchish) else x
+
+# 1. Patch Torchish.size to support x.size(dim) as well as x.size()
+def _torchish_size(self: Torchish, *args: Any) -> Any:
+    if len(args) == 1 and isinstance(args[0], int):
+        return self.shape[args[0]]
+    elif len(args) == 0:
+        return self.shape
+    raise TypeError(f"Torchish.size takes 0 or 1 arguments, got {len(args)}")
+
+Torchish.size = _torchish_size  # type: ignore[assignment]
+
+# 2. Patch Torchish.split and torch.split
+def _torchish_split(self: Torchish, split_size_or_sections: int | Sequence[int], dim: int = 0) -> tuple[Torchish, ...]:
+    val = self.value
+    axis_len = val.shape[dim]
+    if isinstance(split_size_or_sections, int):
+        split_size = split_size_or_sections
+        indices = list(range(split_size, axis_len, split_size))
+        splits = jnp.split(val, indices, axis=dim)
+    else:
+        sections = list(split_size_or_sections)
+        import numpy as np
+        indices = list(np.cumsum(sections)[:-1])
+        splits = jnp.split(val, indices, axis=dim)
+    return tuple(Torchish(s) for s in splits)
+
+Torchish.split = _torchish_split  # type: ignore[assignment]
+HANDLED_FUNCTIONS[torch.split] = lambda tensor, split_size_or_sections, dim=0: _torchish_split(  # type: ignore[assignment]
+    tensor if isinstance(tensor, Torchish) else Torchish(tensor), split_size_or_sections, dim=dim
+)
+
+# 3. Patch torch.addmm for Conv1D / Linear projections
+if torch.addmm not in HANDLED_FUNCTIONS:
+    def _addmm(input_tensor: Any, mat1: Any, mat2: Any, beta: Any = 1, alpha: Any = 1, out: Any = None) -> Torchish:
+        res = beta * _coerce(input_tensor) + alpha * (_coerce(mat1) @ _coerce(mat2))
+        return Torchish(res)
+
+    HANDLED_FUNCTIONS[torch.addmm] = _addmm  # type: ignore[assignment]
 
 
 # ── Strict State-Dict Validation ─────────────────────────────────────────────

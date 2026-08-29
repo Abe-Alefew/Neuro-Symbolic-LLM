@@ -266,13 +266,23 @@ class SegmentedTorch2JaxEngine:
 
     def _unwrap_model(self, model: nn.Module) -> nn.Module:
         curr = model
+
         while True:
-            if hasattr(curr, "module") and isinstance(getattr(curr, "module"), nn.Module):
-                curr = getattr(curr, "module")
-            elif hasattr(curr, "base_model") and isinstance(getattr(curr, "base_model"), nn.Module):
-                curr = getattr(curr, "base_model")
-            else:
-                break
+            if isinstance(
+                curr,
+                (nn.DataParallel, nn.parallel.DistributedDataParallel),
+            ):
+                curr = curr.module
+                continue
+
+            # Only use this if your supported model wrappers require it.
+            base_model = getattr(curr, "base_model", None)
+            if isinstance(base_model, nn.Module) and base_model is not curr:
+                curr = base_model
+                continue
+
+            break
+
         return curr
 
     def _build_gpt2_segments(self, model: nn.Module) -> None:

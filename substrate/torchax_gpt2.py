@@ -36,7 +36,6 @@ import torch
 import torchax
 from torch.func import functional_call
 
-from .provenance import CheckpointProvenance, resolve_checkpoint_provenance
 
 _SUPPORTED_MODEL_TYPES = {"gpt2"}
 
@@ -57,7 +56,7 @@ def _ensure_torchax_enabled() -> None:
 def load_torchax_gpt2(
     model_id: str,
     revision: str | None = None,
-) -> tuple[torch.nn.Module, dict[str, torch.Tensor], CheckpointProvenance]:
+) -> tuple[torch.nn.Module, dict[str, torch.Tensor]]:
     """Load a real HF GPT-2 checkpoint, moved onto TorchAX's JAX-backed
     device, with its parameters frozen and exposed as an explicit dict.
 
@@ -89,17 +88,16 @@ def load_torchax_gpt2(
 
     from transformers import AutoConfig, AutoModelForCausalLM  # local import: heavy dep
 
-    provenance = resolve_checkpoint_provenance(model_id, revision)
-    pinned_revision = provenance.resolved_sha or provenance.requested_revision
+    
 
-    config = AutoConfig.from_pretrained(model_id, revision=pinned_revision)
+    config = AutoConfig.from_pretrained(model_id, revision= None)
     if config.model_type not in _SUPPORTED_MODEL_TYPES:
         raise ValueError(
             f"Unsupported model architecture {config.model_type!r} for model "
             f"{model_id!r}. Supported: {sorted(_SUPPORTED_MODEL_TYPES)}."
         )
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, revision=pinned_revision)
+    model = AutoModelForCausalLM.from_pretrained(model_id, revision= None)
     model.eval()
     model = model.to("jax")
 
@@ -107,7 +105,7 @@ def load_torchax_gpt2(
     for p in params.values():
         p.requires_grad_(False)
 
-    return model, params, provenance
+    return model, params
 
 
 def functional_gpt2(
@@ -158,10 +156,10 @@ def check_numerical_fidelity(
 
     _ensure_torchax_enabled()
 
-    provenance = resolve_checkpoint_provenance(model_id, revision)
-    pinned_revision = provenance.resolved_sha or provenance.requested_revision
-    config = AutoConfig.from_pretrained(model_id, revision=pinned_revision)
-    model_plain = AutoModelForCausalLM.from_pretrained(model_id, revision=pinned_revision)
+
+
+    config = AutoConfig.from_pretrained(model_id, revision= None)
+    model_plain = AutoModelForCausalLM.from_pretrained(model_id, revision=None)
     model_plain.eval()
 
     torch.manual_seed(0)
@@ -185,5 +183,4 @@ def check_numerical_fidelity(
         "mean_abs_diff": float(diff.mean()),
         "allclose": bool(torch.allclose(ref_logits, jax_logits, atol=atol)),
         "atol": atol,
-        "provenance": provenance.as_dict(),
     }

@@ -19,9 +19,9 @@ dependencies = [
 
     # Frozen base model (PyTorch, hidden state extraction only)
     "torch>=2.2.0",
+    "torchax==0.0.13",
     "transformers>=4.40.0",
     "datasets>=2.19.0",
-
     # MORK service
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",

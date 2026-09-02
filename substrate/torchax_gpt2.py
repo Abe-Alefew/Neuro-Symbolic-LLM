@@ -1,56 +1,14 @@
-"""Official HF GPT-2, running correctly under TorchAX, with parameters
-exposed as an explicit functional argument.
-
-This module is deliberately narrow in scope: get the real, unmodified
-`transformers.GPT2LMHeadModel` executing on JAX (via TorchAX's op dispatch)
-with verified numerical fidelity, and expose it in a form Person 2's
-interception work can build on. It does not do any interception itself --
-that is `Block 0-6 -> INTERCEPT -> Block 7-11 -> LM head` from the shared
-architecture diagram, and lives elsewhere.
-
-Design note on the interface, worth keeping explicit: `functional_gpt2`
-takes the *model object* as its first argument, not just its params. That
-is deliberate. Hooks registered on the model's submodules (e.g.
-`model.transformer.h[6].register_forward_hook(...)`) fire correctly even
-when the model is subsequently invoked through `torch.func.functional_call`
--- verified directly, not assumed -- which is what lets Person 2 intercept
-mid-forward-pass without this module needing to know anything about where
-the interception happens. The seam is the hook mechanism, not a parameter
-this function has to expose.
-
-Everything here is verified against a locally-constructed random-init
-GPT2Config, since this sandbox has no route to huggingface.co (only
-pypi.org/github.com are reachable). The one thing that genuinely needs
-re-confirming against a real downloaded checkpoint, in an environment that
-can reach the Hub, is `load_torchax_gpt2` itself -- the dispatch-fidelity
-and freeze mechanics below do not depend on which weight values are loaded,
-only on TorchAX's op dispatch behaving consistently, which is what was
-actually tested.
-"""
 
 from __future__ import annotations
 
 from typing import Any
 
 import torch
-import torchax
 from torch.func import functional_call
 
+from substrate.torchax_backend import enable_torchax, to_torchax_device
 
 _SUPPORTED_MODEL_TYPES = {"gpt2"}
-
-_torchax_enabled = False
-
-
-def _ensure_torchax_enabled() -> None:
-    """TorchAX's global op interception is a one-time process-wide switch.
-    Idempotent on purpose: every entry point in this module calls this
-    rather than assuming some other code path already did.
-    """
-    global _torchax_enabled
-    if not _torchax_enabled:
-        torchax.enable_globally()
-        _torchax_enabled = True
 
 
 def load_torchax_gpt2(
@@ -84,22 +42,23 @@ def load_torchax_gpt2(
             docstring in substrate.architecture for why family-specific
             behavior should stay isolated rather than creep in here).
     """
-    _ensure_torchax_enabled()
+    enable_torchax()
 
     from transformers import AutoConfig, AutoModelForCausalLM  # local import: heavy dep
 
-    
+    #provenance = resolve_checkpoint_provenance(model_id, revision)
+    #pinned_revision = provenance.resolved_sha or provenance.requested_revision
 
-    config = AutoConfig.from_pretrained(model_id, revision= None)
+    config = AutoConfig.from_pretrained(model_id, revision=revision)
     if config.model_type not in _SUPPORTED_MODEL_TYPES:
         raise ValueError(
             f"Unsupported model architecture {config.model_type!r} for model "
             f"{model_id!r}. Supported: {sorted(_SUPPORTED_MODEL_TYPES)}."
         )
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, revision= None)
+    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision)
     model.eval()
-    model = model.to("jax")
+    model = to_torchax_device(model)
 
     params = dict(model.named_parameters())
     for p in params.values():
@@ -154,12 +113,12 @@ def check_numerical_fidelity(
 
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    _ensure_torchax_enabled()
+    enable_torchax()
 
-
-
-    config = AutoConfig.from_pretrained(model_id, revision= None)
-    model_plain = AutoModelForCausalLM.from_pretrained(model_id, revision=None)
+    #provenance = resolve_checkpoint_provenance(model_id, revision)
+    #pinned_revision = provenance.resolved_sha or provenance.requested_revision
+    config = AutoConfig.from_pretrained(model_id, revision= revision)
+    model_plain = AutoModelForCausalLM.from_pretrained(model_id, revision=revision)
     model_plain.eval()
 
     torch.manual_seed(0)
@@ -168,7 +127,7 @@ def check_numerical_fidelity(
     with torch.no_grad():
         ref_logits = model_plain(input_ids=ids).logits
 
-    model_jax = copy.deepcopy(model_plain).to("jax")
+    model_jax = to_torchax_device(copy.deepcopy(model_plain))
     params = dict(model_jax.named_parameters())
     for p in params.values():
         p.requires_grad_(False)

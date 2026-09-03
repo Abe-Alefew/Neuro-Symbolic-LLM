@@ -1,10 +1,9 @@
-"""Frozen LLM substrate: a reusable JAX wrapper around pretrained causal LMs.
+"""Frozen LLM substrate using monolithic TorchAX execution.
 
-The base model parameters are completely frozen: they are stored as an
-immutable Flax parameter PyTree, gradient flow is stopped with
-``jax.lax.stop_gradient`` before any forward computation, and every forward is
-a pure function of ``(params, input_ids)``. The wrapper only performs forward
-computation and hidden-state interception.
+The base model parameters theta_0 are strictly frozen (requires_grad=False).
+Forward passes execute the monolithic model on TorchAX with per-layer
+hidden-state interception via forward hooks, returning JAX-compatible
+logits and intermediate states.
 """
 
 from __future__ import annotations
@@ -15,13 +14,17 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import torch
 from flax.core import freeze, unfreeze
 
 from .architecture import (
     Architecture,
     detect_architecture,
+    detect_architecture_from_config,
     validate_interception_layers,
 )
+from .interception import identity_modify, run_with_hooks
+from .loader import load_hf_model
 from .memory import (
     MemoryStatus,
     check_memory_headroom,
@@ -29,6 +32,13 @@ from .memory import (
     maybe_reduce_batch_size,
 )
 from .models import run_embeddings, run_lm_head, run_transformer_blocks
+from .torchax_backend import (
+    enable_torchax,
+    from_jax_array,
+    is_on_torchax_device,
+    to_jax_array,
+    to_torchax_device,
+)
 
 
 @dataclass(frozen=True)
@@ -62,50 +72,92 @@ jax.tree_util.register_dataclass(
 )
 
 
-class FrozenJAXSubstrate:
-    """Reusable frozen substrate around a pretrained GPT-2 or Pythia/GPT-NeoX
-    causal LM.
+class FrozenSubstrate:
+    """Top-level frozen LLM substrate using monolithic TorchAX execution.
 
-    Args:
-        params: Flax-convention parameter PyTree (nested mappings of arrays)
-            with HuggingFace-compatible names. Created by
-            ``state_dict_to_jax_pytree`` / ``load_substrate_from_hf``.
-        config: optional HuggingFace config object used for hyperparameters
-            such as head count, rope theta and layernorm epsilon. The layer
-            count and hidden size are always auto-detected from ``params``.
-        intercept_layers: zero-based layer indices at which hidden states are
-            cached and passed through :meth:`intercept_and_modify`.
-        modify_hook: optional ``(hidden_state, layer_idx) -> hidden_state``
-            callable overriding the default identity interception. Must be
-            JIT-trace-safe (pure array math only).
-        min_memory_headroom: headroom ratio below which a warning is emitted.
+    PyTorch model / Hugging Face checkpoint
+              │
+              ▼
+           TorchAX
+              │
+              ▼
+         JAX-backed execution
+
+    The base model parameters theta_0 are strictly frozen (requires_grad=False).
+    Forward passes execute the monolithic model on TorchAX with per-layer
+    hidden-state interception via forward hooks, returning JAX-compatible
+    logits and intermediate states.
     """
 
     def __init__(
         self,
-        params: Any,
+        model_id_or_model: str | torch.nn.Module | Mapping[str, Any],
         config: Any = None,
         intercept_layers: Sequence[int] | None = None,
         modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
         min_memory_headroom: float = 0.5,
     ) -> None:
-        if not isinstance(params, Mapping):
-            raise TypeError("params must be a mapping (nested param PyTree)")
+        self._min_memory_headroom = float(min_memory_headroom)
+        self._modify_hook = modify_hook
+        self._call_count = 0
 
-        self._architecture = detect_architecture(params, config)
+        # Legacy JAX param PyTree support for backward compatibility with older test fixtures
+        if isinstance(model_id_or_model, Mapping):
+            self._legacy_mode = True
+            self._model = None
+            self._architecture = detect_architecture(model_id_or_model, config)
+            self._intercept_layers = validate_interception_layers(
+                intercept_layers, self._architecture.num_layers
+            )
+            self._params = freeze(model_id_or_model)
+            self._pristine = freeze(model_id_or_model)
+            return
+
+        self._legacy_mode = False
+
+        # 1. Load or accept PyTorch model
+        if isinstance(model_id_or_model, str):
+            model, loaded_config = load_hf_model(model_id_or_model)
+            config = config or loaded_config
+        elif isinstance(model_id_or_model, torch.nn.Module):
+            model = model_id_or_model
+            config = config or getattr(model, "config", None)
+        else:
+            raise TypeError(
+                f"Expected model_id (str), torch.nn.Module, or param Mapping, "
+                f"got {type(model_id_or_model)}"
+            )
+
+        # 2. Initialize TorchAX & move to JAX device
+        enable_torchax()
+        model = to_torchax_device(model)
+        model.eval()
+        self._model = model
+
+        # 3. Detect architecture
+        if config is not None:
+            self._architecture = detect_architecture_from_config(config)
+        elif hasattr(model, "config") and model.config is not None:
+            self._architecture = detect_architecture_from_config(model.config)
+        else:
+            raise ValueError(
+                "Model configuration must be provided or available on model.config."
+            )
+
+        # 4. Extract and freeze parameter dictionary
+        self._params: dict[str, torch.Tensor] = dict(model.named_parameters())
+        for p in self._params.values():
+            p.requires_grad_(False)
+
+        # 5. Validate interception layers
         self._intercept_layers = validate_interception_layers(
             intercept_layers, self._architecture.num_layers
         )
-        self._min_memory_headroom = float(min_memory_headroom)
-        self._modify_hook = modify_hook
-        # Params are stored as an immutable Flax FrozenDict. JAX arrays are
-        # immutable, so this reference snapshot also captures the values; no
-        # 2x copy is kept (memory-conscious).
-        self._params = freeze(params)
-        self._pristine = freeze(params)
-        self._call_count = 0
 
-    # ── public API ──────────────────────────────────────────────────────────
+        # 6. Store pristine parameter snapshot for immutability verification
+        self._pristine = {k: v.detach().clone() for k, v in self._params.items()}
+
+    # ── public properties ───────────────────────────────────────────────────
 
     @property
     def architecture(self) -> Architecture:
@@ -117,59 +169,160 @@ class FrozenJAXSubstrate:
 
     @property
     def params(self) -> Any:
-        return unfreeze(self._params)
+        if self._legacy_mode:
+            return unfreeze(self._params)
+        return self._params
 
     def get_params(self) -> Any:
-        return unfreeze(self._params)
+        if self._legacy_mode:
+            return unfreeze(self._params)
+        return self._params
 
-    def __call__(self, input_ids: jax.Array) -> ForwardResult:
-        """Run the frozen substrate forward pass (JAX/JIT compatible)."""
-        if input_ids.ndim != 2:
-            raise ValueError(
-                f"input_ids must be a 2D array of shape [batch, seq_len], "
-                f"got shape {tuple(input_ids.shape)}"
-            )
-        if input_ids.shape[1] < 1:
-            raise ValueError("input_ids must contain at least one token position")
+    # ── forward execution ───────────────────────────────────────────────────
 
-        params = jax.tree.map(jax.lax.stop_gradient, self._params)
-        hook = self._modify_hook or self.intercept_and_modify
-        logits, intermediates = self._run_forward(
-            params, self._architecture, self._intercept_layers, hook, input_ids
+    def __call__(self, input_ids: jax.Array | torch.Tensor) -> ForwardResult:
+        """Run the frozen substrate forward pass."""
+        return self.run_with_interception(
+            input_ids=input_ids,
+            modify_fn=self._modify_hook,
+            intercept_layers=self._intercept_layers,
         )
+
+    def run_with_interception(
+        self,
+        input_ids: jax.Array | torch.Tensor,
+        modify_fn: Callable[..., Any] | None = None,
+        intercept_layers: Sequence[int] | None = None,
+    ) -> ForwardResult:
+        """Explicit interception API with custom hook and layers."""
+        hook = modify_fn or self._modify_hook or identity_modify
+        layers = (
+            validate_interception_layers(
+                intercept_layers, self._architecture.num_layers
+            )
+            if intercept_layers is not None
+            else self._intercept_layers
+        )
+
+        # Handle legacy pure-JAX execution
+        if self._legacy_mode:
+            if not isinstance(input_ids, jax.Array):
+                raise TypeError(
+                    f"Legacy mode expects jax.Array input_ids, got {type(input_ids)}"
+                )
+            if input_ids.ndim != 2:
+                raise ValueError(
+                    f"input_ids must be a 2D array of shape [batch, seq_len], "
+                    f"got shape {tuple(input_ids.shape)}"
+                )
+            if input_ids.shape[1] < 1:
+                raise ValueError("input_ids must contain at least one token position")
+            params = jax.tree.map(jax.lax.stop_gradient, self._params)
+            logits, intermediates = self._run_forward_legacy(
+                params, self._architecture, layers, hook, input_ids
+            )
+            self._call_count += 1
+            return ForwardResult(logits=logits, intermediates=intermediates)
+
+        # Monolithic TorchAX execution
+        if isinstance(input_ids, jax.Array):
+            if input_ids.ndim != 2:
+                raise ValueError(
+                    f"input_ids must be a 2D array of shape [batch, seq_len], "
+                    f"got shape {tuple(input_ids.shape)}"
+                )
+            if input_ids.shape[1] < 1:
+                raise ValueError("input_ids must contain at least one token position")
+            input_ids_torch = from_jax_array(input_ids)
+        elif isinstance(input_ids, torch.Tensor):
+            if input_ids.ndim != 2:
+                raise ValueError(
+                    f"input_ids must be a 2D tensor of shape [batch, seq_len], "
+                    f"got shape {tuple(input_ids.shape)}"
+                )
+            if input_ids.shape[1] < 1:
+                raise ValueError("input_ids must contain at least one token position")
+            input_ids_torch = input_ids
+        else:
+            raise TypeError(
+                f"input_ids must be jax.Array or torch.Tensor, got {type(input_ids)}"
+            )
+
+        if not is_on_torchax_device(input_ids_torch):
+            input_ids_torch = to_torchax_device(input_ids_torch)
+
+        output, intermediates = run_with_hooks(
+            model=self._model,
+            params=self._params,
+            input_ids=input_ids_torch,
+            arch=self._architecture,
+            intercept_layers=layers,
+            modify_fn=hook,
+            to_jax=True,
+        )
+
+        logits_raw = output.logits if hasattr(output, "logits") else output
+        logits_jax = to_jax_array(logits_raw)
         self._call_count += 1
-        return ForwardResult(logits=logits, intermediates=intermediates)
+        return ForwardResult(logits=logits_jax, intermediates=intermediates)
 
-    # ── interception hook ───────────────────────────────────────────────────
+    # ── loss computation ────────────────────────────────────────────────────
 
-    def intercept_and_modify(
-        self, hidden_state: jax.Array, layer_idx: int
-    ) -> jax.Array:
-        """Default modification hook: an identity operation.
+    @staticmethod
+    def compute_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
+        """Standard causal LM cross-entropy loss with shifted labels.
 
-        Intentionally written as ``hidden_state + 0.0`` so it is JIT-trace-safe,
-        does not convert tensors to NumPy, and preserves the numerical hidden
-        state. Override in a subclass for custom steering.
+        Args:
+            logits: Predicted unnormalized logits of shape [batch, seq_len, vocab_size].
+            labels: Target token IDs of shape [batch, seq_len]. Tokens with label -100
+                are ignored in the loss calculation.
+
+        Returns:
+            Scalar jax.Array representing the mean cross-entropy loss.
         """
-        return hidden_state + 0.0
+        shift_logits = logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+
+        log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+        mask = shift_labels != -100
+        safe_labels = jnp.where(mask, shift_labels, 0)
+
+        gathered_log_probs = jnp.take_along_axis(
+            log_probs, safe_labels[..., None], axis=-1
+        ).squeeze(-1)
+
+        loss = -jnp.sum(gathered_log_probs * mask) / jnp.maximum(1.0, jnp.sum(mask))
+        return loss
 
     # ── freezing guarantees ─────────────────────────────────────────────────
 
     def params_unchanged(self) -> bool:
-        """True when the params are still the same immutable JAX arrays that
-        were captured at construction time. JAX arrays cannot be mutated in
-        place, so this verifies that no replacement or reassignment ever
-        happened."""
-        identical = jax.tree.map(lambda a, b: a is b, self._pristine, self._params)
-        return all(jax.tree.leaves(identical))
+        """Verify that base model parameters theta_0 have not been modified."""
+        if self._legacy_mode:
+            identical = jax.tree.map(lambda a, b: a is b, self._pristine, self._params)
+            return all(jax.tree.leaves(identical))
+
+        for k, pristine_val in self._pristine.items():
+            current_val = self._params.get(k)
+            if current_val is None:
+                return False
+            if current_val.requires_grad:
+                return False
+            if not torch.equal(pristine_val, current_val):
+                return False
+        return True
 
     def verify_frozen(self) -> dict[str, Any]:
-        """Run the original-vs-wrapper param identity check and return a
-        report. Base parameters must never be modified."""
+        """Run original-vs-wrapper parameter verification and return a report."""
         unchanged = self.params_unchanged()
+        param_count = (
+            len(jax.tree.leaves(self._params))
+            if self._legacy_mode
+            else len(self._params)
+        )
         return {
             "params_unchanged": unchanged,
-            "param_leaves": len(jax.tree.leaves(self._params)),
+            "param_leaves": param_count,
             "architecture": {
                 "model_family": self._architecture.model_family,
                 "num_layers": self._architecture.num_layers,
@@ -192,13 +345,7 @@ class FrozenJAXSubstrate:
         min_headroom: float | None = None,
         auto_reduce_batch_size: bool = False,
     ) -> tuple[ForwardResult, dict[str, Any]]:
-        """Forward pass plus the memory headroom safety rule.
-
-        When ``auto_reduce_batch_size`` is False (the default) an unsafe
-        headroom only produces warnings and the configuration is untouched.
-        When True, the batch is halved until the headroom rule is satisfied
-        and the reduction is reported — never silently.
-        """
+        """Forward pass plus the memory headroom safety rule."""
         headroom = (
             min_headroom if min_headroom is not None else self._min_memory_headroom
         )
@@ -216,10 +363,10 @@ class FrozenJAXSubstrate:
         }
         return result, report
 
-    # ── forward internals (pure, JIT-safe) ──────────────────────────────────
+    # ── forward internals (pure, JIT-safe legacy fallback) ──────────────────
 
     @staticmethod
-    def _run_forward(
+    def _run_forward_legacy(
         params: Any,
         arch: Architecture,
         intercept_layers: tuple[int, ...],
@@ -236,8 +383,12 @@ class FrozenJAXSubstrate:
 
     def __repr__(self) -> str:
         return (
-            f"FrozenJAXSubstrate(model_family={self._architecture.model_family!r}, "
+            f"FrozenSubstrate(model_family={self._architecture.model_family!r}, "
             f"num_layers={self._architecture.num_layers}, "
             f"hidden_size={self._architecture.hidden_size}, "
             f"intercept_layers={list(self._intercept_layers)})"
         )
+
+
+# Backward compatibility alias
+FrozenJAXSubstrate = FrozenSubstrate

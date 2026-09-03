@@ -19,8 +19,16 @@ from .architecture import (
     validate_interception_layers,
 )
 from .drift import compute_kl_drift
+from .interception import (
+    InterceptionContext,
+    ModifyFn,
+    identity_modify,
+    run_with_hooks,
+    run_with_interception,
+)
 from .loader import (
     build_substrate_from_state_dict,
+    load_hf_model,
     load_substrate_from_hf,
     state_dict_to_jax_pytree,
 )
@@ -31,13 +39,26 @@ from .memory import (
     get_memory_status,
     maybe_reduce_batch_size,
 )
-from .substrate import ForwardResult, FrozenJAXSubstrate
+from .substrate import ForwardResult, FrozenJAXSubstrate, FrozenSubstrate
+from .torchax_backend import (
+    enable_torchax,
+    from_jax_array,
+    initialize_torchax,
+    is_on_torchax_device,
+    is_torchax_enabled,
+    model_to_jax,
+    to_jax_array,
+    to_torchax_device,
+)
 
 __all__ = [
     "Architecture",
     "ForwardResult",
     "FrozenJAXSubstrate",
+    "FrozenSubstrate",
+    "InterceptionContext",
     "MemoryStatus",
+    "ModifyFn",
     "build_substrate_from_state_dict",
     "check_memory_headroom",
     "compute_kl_drift",
@@ -46,14 +67,26 @@ __all__ = [
     "detect_architecture_from_config",
     "discover_layers",
     "discover_layers_from_config",
+    "enable_torchax",
+    "from_jax_array",
     "get_block_accessor",
     "get_embedding_module",
     "get_head_modules",
     "get_memory_status",
     "get_position_embedding_module",
+    "identity_modify",
+    "initialize_torchax",
+    "is_on_torchax_device",
+    "is_torchax_enabled",
+    "load_hf_model",
     "load_substrate_from_hf",
     "maybe_reduce_batch_size",
+    "model_to_jax",
+    "run_with_hooks",
+    "run_with_interception",
     "state_dict_to_jax_pytree",
+    "to_jax_array",
+    "to_torchax_device",
     "validate_interception_layers",
 ]
 

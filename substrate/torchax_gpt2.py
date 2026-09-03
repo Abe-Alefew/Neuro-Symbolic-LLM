@@ -21,8 +21,6 @@ def load_torchax_gpt2(
     enable_torchax()
 
     from transformers import AutoConfig, AutoModelForCausalLM  # local import: heavy dep
-
-
     config = AutoConfig.from_pretrained(model_id, revision=revision)
     if config.model_type not in _SUPPORTED_MODEL_TYPES:
         raise ValueError(

@@ -57,6 +57,11 @@ def to_torchax_device(obj: T) -> T:
     return obj.to("jax")
 
 
+# Functional aliases matching substrate specifications
+initialize_torchax = enable_torchax
+model_to_jax = to_torchax_device
+
+
 def is_on_torchax_device(tensor: torch.Tensor) -> bool:
     """Whether `tensor` is already on TorchAX's 'jax' device."""
     return str(tensor.device).startswith("jax")

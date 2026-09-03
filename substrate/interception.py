@@ -1,0 +1,227 @@
+"""Hidden-state interception for frozen LLM substrates.
+
+Provides mechanisms for intercepting, caching, and modifying transformer
+hidden states at designated layers during forward execution:
+
+1. Hook-based interception (`InterceptionContext`, `run_with_hooks`):
+   Registers forward hooks on the model's transformer blocks so that
+   torch.func.functional_call executes with pristine state caching and
+   in-flight hidden state replacement.
+
+2. Functional loop interception (`run_with_interception`):
+   Iterates through explicit block segment functions, caching pristine
+   states and passing modified states downstream.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Any
+
+from .architecture import Architecture, get_block_accessor, validate_interception_layers
+
+if TYPE_CHECKING:
+    import torch
+
+
+# ModifyFn contract: (hidden_state, layer_idx) -> modified_hidden_state
+ModifyFn = Callable[[Any, int], Any]
+
+
+def identity_modify(hidden: Any, layer_idx: int) -> Any:
+    """Default identity modification (no-op)."""
+    return hidden
+
+
+def _extract_hidden(output: Any) -> tuple[Any, bool, tuple[Any, ...]]:
+    """Extract hidden state tensor from a block output (which may be a tuple)."""
+    if isinstance(output, tuple):
+        return output[0], True, output[1:]
+    return output, False, ()
+
+
+def _wrap_hidden(hidden: Any, is_tuple: bool, rest: tuple[Any, ...]) -> Any:
+    """Reconstruct block output format matching original return type."""
+    if is_tuple:
+        return (hidden, *rest)
+    return hidden
+
+
+class InterceptionContext(AbstractContextManager["InterceptionContext"]):
+    """Context manager for registering forward hooks on transformer blocks.
+
+    Guarantees that hooks are cleanly removed upon exit (even on exception),
+    leaving the model completely unmodified.
+
+    Attributes:
+        intermediates: dict mapping layer_idx -> pristine hidden state h_l^0
+            captured BEFORE modify_fn is applied.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        arch: Architecture | None = None,
+        intercept_layers: Sequence[int] | None = None,
+        modify_fn: ModifyFn | None = None,
+        clone_intermediates: bool = True,
+    ):
+        self.model = model
+        if arch is None:
+            if getattr(model, "config", None) is not None:
+                from .architecture import detect_architecture_from_config
+
+                arch = detect_architecture_from_config(model.config)
+            else:
+                raise ValueError(
+                    "arch must be provided when model does not have a config attribute."
+                )
+        self.arch = arch
+        self.intercept_layers = validate_interception_layers(
+            intercept_layers, arch.num_layers
+        )
+        self.modify_fn = modify_fn or identity_modify
+        self.clone_intermediates = clone_intermediates
+        self.intermediates: dict[int, Any] = {}
+        self._handles: list[Any] = []
+
+    def __enter__(self) -> InterceptionContext:
+        self.intermediates.clear()
+        self._handles.clear()
+
+        if not self.intercept_layers:
+            return self
+
+        accessor = get_block_accessor(self.model, self.arch)
+
+        for layer_idx in self.intercept_layers:
+            block = accessor(layer_idx)
+            handle = block.register_forward_hook(self._make_hook(layer_idx))
+            self._handles.append(handle)
+
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.remove_hooks()
+
+    def remove_hooks(self) -> None:
+        """Remove all registered forward hooks."""
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def _make_hook(self, layer_idx: int) -> Callable[..., Any]:
+        def hook(module: Any, args: Any, output: Any) -> Any:
+            h, is_tuple, rest = _extract_hidden(output)
+
+            # 1. Cache pristine h_l^0 (pre-modification state)
+            if self.clone_intermediates and hasattr(h, "clone"):
+                self.intermediates[layer_idx] = h.clone()
+            else:
+                self.intermediates[layer_idx] = h
+
+            # 2. Apply modify_fn to pristine state
+            h_modified = self.modify_fn(h, layer_idx)
+
+            # 3. Return modified state to flow into downstream blocks
+            return _wrap_hidden(h_modified, is_tuple, rest)
+
+        return hook
+
+
+def run_with_hooks(
+    model: torch.nn.Module,
+    params: dict[str, torch.Tensor],
+    input_ids: torch.Tensor,
+    arch: Architecture | None = None,
+    intercept_layers: Sequence[int] | None = None,
+    modify_fn: ModifyFn | None = None,
+    to_jax: bool = False,
+) -> tuple[Any, dict[int, Any]]:
+    """Execute model with hook-based hidden-state interception.
+
+    Args:
+        model: Live PyTorch model on TorchAX device.
+        params: Explicit parameter dictionary (requires_grad=False).
+        input_ids: Input token IDs on TorchAX device.
+        arch: Model architecture metadata (auto-detected from model.config if None).
+        intercept_layers: Zero-based layer indices to intercept.
+        modify_fn: (h_pristine, layer_idx) -> h_modified.
+        to_jax: If True, convert intermediates to raw jax.Array via to_jax_array.
+
+    Returns:
+        (model_output, intermediates) where intermediates maps layer_idx -> pristine h.
+    """
+    from torch.func import functional_call
+
+    with InterceptionContext(
+        model=model,
+        arch=arch,
+        intercept_layers=intercept_layers,
+        modify_fn=modify_fn,
+    ) as ctx:
+        output = functional_call(model, params, (input_ids,))
+        intermediates = dict(ctx.intermediates)
+
+    if to_jax:
+        from .torchax_backend import to_jax_array
+
+        intermediates = {k: to_jax_array(v) for k, v in intermediates.items()}
+
+    return output, intermediates
+
+
+def run_with_interception(
+    embed_fn: Callable[..., Any],
+    block_fns: list[Callable[..., Any]],
+    head_fn: Callable[..., Any],
+    params: Any,
+    input_ids: Any,
+    intercept_layers: Sequence[int] | None = None,
+    modify_fn: ModifyFn = identity_modify,
+) -> tuple[Any, dict[int, Any]]:
+    """Execute model with explicit functional loop interception.
+
+    For each block index in intercept_layers:
+        1. Run block to produce h_l^0 (pristine hidden state)
+        2. Cache h_l^0 in intermediates
+        3. Pass h_l^0 through modify_fn to get h_modified
+        4. Pass h_modified as input to the next block
+
+    Args:
+        embed_fn: (params, input_ids) -> hidden [B, S, D]
+        block_fns: list of [(params, hidden, ...) -> hidden [B, S, D]]
+        head_fn: (params, hidden) -> logits [B, S, V]
+        params: Frozen parameter tree
+        input_ids: Token IDs
+        intercept_layers: Layer indices to intercept
+        modify_fn: (hidden_state, layer_idx) -> modified_hidden_state
+
+    Returns:
+        (logits, intermediates) where intermediates maps layer_idx -> pristine h
+    """
+    valid_layers = validate_interception_layers(intercept_layers, len(block_fns))
+    intercept_set = set(valid_layers)
+    intermediates: dict[int, Any] = {}
+
+    hidden = embed_fn(params, input_ids)
+
+    for idx, block_fn in enumerate(block_fns):
+        hidden = block_fn(params, hidden)
+        if idx in intercept_set:
+            cached = hidden
+            hidden = modify_fn(cached, idx)
+            intermediates[idx] = cached
+
+    logits = head_fn(params, hidden)
+    return logits, intermediates
+
+
+__all__ = [
+    "InterceptionContext",
+    "ModifyFn",
+    "identity_modify",
+    "run_with_hooks",
+    "run_with_interception",
+]

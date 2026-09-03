@@ -102,6 +102,27 @@ class TestFrozenSubstrateForward:
         with pytest.raises(ValueError, match="at least one"):
             sub(jnp.zeros((2, 0), dtype=jnp.int32))
 
+    def test_tokenize_helper(self):
+        from types import SimpleNamespace
+
+        # Mock tokenizer returning PyTorch tensor
+        mock_tok = SimpleNamespace(
+            __call__=lambda text, return_tensors="pt", **kw: {
+                "input_ids": torch.tensor([[10, 20, 30]])
+            }
+        )
+        model = _tiny_gpt2_model()
+        sub = FrozenSubstrate(model, tokenizer=mock_tok)
+
+        assert sub.tokenizer is mock_tok
+        ids_jax = sub.tokenize("test prompt", return_tensors="jax")
+        assert isinstance(ids_jax, jax.Array)
+        assert ids_jax.shape == (1, 3)
+
+        ids_pt = sub.tokenize("test prompt", return_tensors="pt")
+        assert isinstance(ids_pt, torch.Tensor)
+        assert ids_pt.shape == (1, 3)
+
 
 class TestInterceptionAndSteering:
     def test_steering_hook_modifies_output(self):

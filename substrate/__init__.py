@@ -28,7 +28,6 @@ from .interception import (
 )
 from .loader import (
     build_substrate_from_state_dict,
-    load_hf_model,
     load_substrate_from_hf,
     state_dict_to_jax_pytree,
 )
@@ -50,6 +49,12 @@ from .torchax_backend import (
     to_jax_array,
     to_torchax_device,
 )
+from .torchax_gpt2 import (
+    check_numerical_fidelity,
+    functional_gpt2,
+    load_tokenizer,
+    load_torchax_gpt2,
+)
 
 __all__ = [
     "Architecture",
@@ -61,6 +66,7 @@ __all__ = [
     "ModifyFn",
     "build_substrate_from_state_dict",
     "check_memory_headroom",
+    "check_numerical_fidelity",
     "compute_kl_drift",
     "compute_memory_headroom",
     "detect_architecture",
@@ -69,6 +75,7 @@ __all__ = [
     "discover_layers_from_config",
     "enable_torchax",
     "from_jax_array",
+    "functional_gpt2",
     "get_block_accessor",
     "get_embedding_module",
     "get_head_modules",
@@ -78,8 +85,9 @@ __all__ = [
     "initialize_torchax",
     "is_on_torchax_device",
     "is_torchax_enabled",
-    "load_hf_model",
     "load_substrate_from_hf",
+    "load_tokenizer",
+    "load_torchax_gpt2",
     "maybe_reduce_batch_size",
     "model_to_jax",
     "run_with_hooks",

@@ -83,27 +83,6 @@ def _hf_model_class(model_family: str):
     raise ValueError(f"Unsupported model family: {model_family}")
 
 
-def load_hf_model(
-    model_id: str,
-    revision: str | None = None,
-) -> tuple[Any, Any]:
-    """Load a HuggingFace causal LM model and its config in eval mode.
-
-    Args:
-        model_id: HuggingFace model identifier or local checkpoint path.
-        revision: Optional git revision / branch / commit hash.
-
-    Returns:
-        (model, config) where model is in eval() mode.
-    """
-    from transformers import AutoConfig, AutoModelForCausalLM  # local import: heavy dep
-
-    config = AutoConfig.from_pretrained(model_id, revision=revision)
-    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision)
-    model.eval()
-    return model, config
-
-
 def load_substrate_from_hf(
     model_id: str,
     intercept_layers: list[int] | None = None,

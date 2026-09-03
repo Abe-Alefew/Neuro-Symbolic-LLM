@@ -24,7 +24,7 @@ from .architecture import (
     validate_interception_layers,
 )
 from .interception import identity_modify, run_with_hooks
-from .loader import load_hf_model
+from .torchax_gpt2 import load_tokenizer, load_torchax_gpt2
 from .memory import (
     MemoryStatus,
     check_memory_headroom,
@@ -96,10 +96,12 @@ class FrozenSubstrate:
         intercept_layers: Sequence[int] | None = None,
         modify_hook: Callable[[jax.Array, int], jax.Array] | None = None,
         min_memory_headroom: float = 0.5,
+        tokenizer: Any = None,
     ) -> None:
         self._min_memory_headroom = float(min_memory_headroom)
         self._modify_hook = modify_hook
         self._call_count = 0
+        self._tokenizer = tokenizer
 
         # Legacy JAX param PyTree support for backward compatibility with older test fixtures
         if isinstance(model_id_or_model, Mapping):
@@ -115,26 +117,34 @@ class FrozenSubstrate:
 
         self._legacy_mode = False
 
-        # 1. Load or accept PyTorch model
+        # 1. Load or accept PyTorch model and tokenizer
         if isinstance(model_id_or_model, str):
-            model, loaded_config = load_hf_model(model_id_or_model)
-            config = config or loaded_config
+            model, params = load_torchax_gpt2(model_id_or_model)
+            config = config or getattr(model, "config", None)
+            if self._tokenizer is None:
+                try:
+                    self._tokenizer = load_tokenizer(model_id_or_model)
+                except Exception:
+                    self._tokenizer = None
         elif isinstance(model_id_or_model, torch.nn.Module):
             model = model_id_or_model
             config = config or getattr(model, "config", None)
+            enable_torchax()
+            model = to_torchax_device(model)
+            model.eval()
+            params = dict(model.named_parameters())
+            for p in params.values():
+                p.requires_grad_(False)
         else:
             raise TypeError(
                 f"Expected model_id (str), torch.nn.Module, or param Mapping, "
                 f"got {type(model_id_or_model)}"
             )
 
-        # 2. Initialize TorchAX & move to JAX device
-        enable_torchax()
-        model = to_torchax_device(model)
-        model.eval()
         self._model = model
+        self._params: dict[str, torch.Tensor] = params
 
-        # 3. Detect architecture
+        # 2. Detect architecture
         if config is not None:
             self._architecture = detect_architecture_from_config(config)
         elif hasattr(model, "config") and model.config is not None:
@@ -144,12 +154,7 @@ class FrozenSubstrate:
                 "Model configuration must be provided or available on model.config."
             )
 
-        # 4. Extract and freeze parameter dictionary
-        self._params: dict[str, torch.Tensor] = dict(model.named_parameters())
-        for p in self._params.values():
-            p.requires_grad_(False)
-
-        # 5. Validate interception layers
+        # 3. Validate interception layers
         self._intercept_layers = validate_interception_layers(
             intercept_layers, self._architecture.num_layers
         )
@@ -177,6 +182,37 @@ class FrozenSubstrate:
         if self._legacy_mode:
             return unfreeze(self._params)
         return self._params
+
+    @property
+    def tokenizer(self) -> Any:
+        """Tokenizer associated with this substrate (if loaded or provided)."""
+        return self._tokenizer
+
+    def tokenize(
+        self,
+        text: str | list[str],
+        return_tensors: str = "jax",
+        **kwargs: Any,
+    ) -> jax.Array | torch.Tensor:
+        """Tokenize input text directly into device-ready token IDs using torchax_backend.
+
+        Args:
+            text: Input text string or list of text strings.
+            return_tensors: "jax" (default) or "pt".
+            **kwargs: Additional kwargs passed to the Hugging Face tokenizer.
+
+        Returns:
+            2D array/tensor of token IDs ready for forward execution.
+        """
+        if self._tokenizer is None:
+            raise ValueError(
+                "Tokenizer is not initialized. Initialize FrozenSubstrate with a model ID string or provide a tokenizer."
+            )
+        tokens = self._tokenizer(text, return_tensors="pt", **kwargs)
+        ids_torch = to_torchax_device(tokens["input_ids"])
+        if return_tensors == "jax":
+            return to_jax_array(ids_torch)
+        return ids_torch
 
     # ── forward execution ───────────────────────────────────────────────────
 

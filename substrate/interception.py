@@ -19,8 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from .architecture import Architecture, get_block_accessor, validate_interception_layers
 
-if TYPE_CHECKING:
-    import torch
+import torch
 
 
 # ModifyFn contract: (hidden_state, layer_idx) -> modified_hidden_state 

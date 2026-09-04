@@ -20,7 +20,11 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
-from substrate import FrozenJAXSubstrate, state_dict_to_jax_pytree
+from substrate import (
+    FrozenJAXSubstrate,
+    FrozenSubstrate,
+    state_dict_to_jax_pytree,
+)
 
 GPT2_CFG: dict[str, Any] = {
     "n_layer": 12,
@@ -70,13 +74,12 @@ def _config(family: str):
 
 
 def make_substrate(family: str, intercept_layers=None, modify_hook=None, seed: int = 0):
-    """Build the torch reference model plus a FrozenJAXSubstrate wrapper."""
+    """Build the torch reference model plus a FrozenSubstrate wrapper using TorchAX."""
     model = _torch_model(family, seed=seed)
     model.eval()
-    params = state_dict_to_jax_pytree(model.state_dict())
-    substrate = FrozenJAXSubstrate(
-        params,
-        _config(family),
+    substrate = FrozenSubstrate(
+        model,
+        config=_config(family),
         intercept_layers=intercept_layers,
         modify_hook=modify_hook,
     )
@@ -85,7 +88,15 @@ def make_substrate(family: str, intercept_layers=None, modify_hook=None, seed: i
 
 def torch_logits(model, ids):
     with torch.no_grad():
-        return model(ids).logits.numpy()
+        param = next(model.parameters(), None)
+        if param is not None and isinstance(ids, torch.Tensor) and ids.device != param.device:
+            ids = ids.to(param.device)
+        elif param is not None and not isinstance(ids, torch.Tensor):
+            ids = torch.as_tensor(ids, device=param.device)
+        out = model(ids).logits
+        if hasattr(out, "cpu"):
+            out = out.cpu()
+        return np.asarray(out)
 
 
 def make_input_ids():

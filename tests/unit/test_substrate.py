@@ -132,9 +132,10 @@ class TestInterceptionAndSteering:
         # 1. Baseline unsteered run
         baseline = sub(input_ids)
 
-        # 2. Steered run: add perturbation at layer 2
+        # 2. Steered run: add dimension-varying perturbation at layer 2
         def steer(h: jax.Array, layer_idx: int) -> jax.Array:
-            return h + 10.0
+            delta = jnp.linspace(1.0, 5.0, h.shape[-1])
+            return h + delta
 
         steered = sub.run_with_interception(
             input_ids=input_ids,

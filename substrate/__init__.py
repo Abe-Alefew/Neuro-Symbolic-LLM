@@ -34,10 +34,9 @@ from .memory import (
 from .torchax_backend import (
     enable_torchax,
     from_jax_array,
-    initialize_torchax,
+    
     is_on_torchax_device,
     is_torchax_enabled,
-    model_to_jax,
     to_jax_array,
     to_torchax_device,
 )
@@ -81,10 +80,10 @@ __all__ = [
     "to_torchax_device",
     "validate_interception_layers",
     "enable_torchax",
-    "initialize_torchax",
+    
     "is_on_torchax_device",
     "is_torchax_enabled",
-    "model_to_jax",
+    
     "functional_model",
 ]
 

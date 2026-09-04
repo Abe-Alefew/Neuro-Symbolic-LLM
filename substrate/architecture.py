@@ -123,6 +123,77 @@ def _config_value(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
+def detect_architecture(params: Any, config: Any = None) -> Architecture:
+    """Inspect parameter tree or config to auto-detect the architecture.
+
+    Raises ``ValueError`` for unsupported parameter layouts or configs.
+    """
+    if config is not None and not isinstance(params, Mapping):
+        return detect_architecture_from_config(config)
+
+    keys = _top_keys(params)
+    family = _family_from_keys(keys)
+    if family is None:
+        if config is not None:
+            return detect_architecture_from_config(config)
+        raise ValueError(
+            "Unsupported model architecture. Expected GPT-2 (params with "
+            f"'transformer'/'lm_head' keys) or GPT-NeoX/Pythia (params with "
+            f"'gpt_neox'/'embed_out' keys). Found top-level keys: {sorted(keys)}"
+        )
+
+    if family == "gpt2":
+        wte_weight = _get_path(params, "transformer", "wte", "weight")
+        wpe_weight = _get_path(params, "transformer", "wpe", "weight")
+        blocks = _get_path(params, "transformer", "h")
+        vocab_size = wte_weight.shape[0]
+        hidden_size = wte_weight.shape[1]
+        max_positions = wpe_weight.shape[0]
+        num_heads = int(_config_value(config, "n_head", max(1, hidden_size // 64)))
+    else:  # neox
+        embed_weight = _get_path(params, "gpt_neox", "embed_in", "weight")
+        blocks = _get_path(params, "gpt_neox", "layers")
+        vocab_size = embed_weight.shape[0]
+        hidden_size = embed_weight.shape[1]
+        max_positions = int(_config_value(config, "max_position_embeddings", 0)) or None
+        num_heads = int(
+            _config_value(config, "num_attention_heads", max(1, hidden_size // 64))
+        )
+
+    if not isinstance(blocks, Mapping) and not isinstance(blocks, Sequence):
+        raise ValueError(
+            f"Cannot discover transformer blocks: unexpected {type(blocks)}"
+        )
+
+    num_layers = len(blocks)
+    head_dim = hidden_size // num_heads
+    if head_dim * num_heads != hidden_size:
+        raise ValueError(
+            f"hidden_size={hidden_size} is not divisible by num_heads={num_heads}"
+        )
+
+    return Architecture(
+        model_family=family,
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        vocab_size=vocab_size,
+        max_position_embeddings=max_positions,
+        layer_norm_eps=float(_config_value(config, "layer_norm_eps", 1e-5)),
+        rope_theta=_extract_rope_params(config)[0],
+        rotary_pct=_extract_rope_params(config)[1],
+        use_parallel_residual=bool(
+            _config_value(config, "use_parallel_residual", False)
+        ),
+    )
+
+
+def discover_layers(params: Any, config: Any = None) -> int:
+    """Return the number of transformer blocks discovered from the params."""
+    return detect_architecture(params, config).num_layers
+
+
 def detect_architecture_from_config(config:Any) -> Architecture:
     """Detect architecture directly from an HF config object or dictionary.
 

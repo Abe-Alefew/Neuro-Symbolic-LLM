@@ -48,13 +48,14 @@ from .torchax_models import (
     load_torchax_model,
 )
 
-from .substrate import ForwardResult, FrozenJAXSubstrate
+from .substrate import ForwardResult, FrozenJAXSubstrate, FrozenSubstrate
 
 
 __all__ = [
     "Architecture",
     "ForwardResult",
     "FrozenJAXSubstrate",
+    "FrozenSubstrate",
     "MemoryStatus",
     "build_substrate_from_state_dict",
     "check_memory_headroom",

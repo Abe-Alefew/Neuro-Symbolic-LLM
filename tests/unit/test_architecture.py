@@ -118,6 +118,20 @@ class TestDetectArchitectureFromConfig:
         assert arch.hidden_size == 256
         assert arch.head_dim == 64
 
+    def test_conftest_gpt2_config(self, real_gpt2_config: GPT2Config):
+        arch = detect_architecture_from_config(real_gpt2_config)
+        assert arch.model_family == "gpt2"
+        assert arch.num_layers == real_gpt2_config.n_layer
+        assert arch.hidden_size == real_gpt2_config.n_embd
+        assert arch.num_heads == real_gpt2_config.n_head
+
+    def test_conftest_pythia_config(self, real_pythia_config: GPTNeoXConfig):
+        arch = detect_architecture_from_config(real_pythia_config)
+        assert arch.model_family == "neox"
+        assert arch.num_layers == real_pythia_config.num_hidden_layers
+        assert arch.hidden_size == real_pythia_config.hidden_size
+        assert arch.num_heads == real_pythia_config.num_attention_heads
+
     def test_unsupported_model_type_raises(self):
         class LlamaLikeConfig(PretrainedConfig):
             model_type = "llama"
@@ -146,44 +160,18 @@ class TestDiscoverLayersFromConfig:
         cfg = GPT2Config(n_layer=24, n_embd=1024, n_head=16)
         assert discover_layers_from_config(cfg) == 24
 
+    def test_discover_layers_from_conftest_gpt2(self, real_gpt2_config: GPT2Config):
+        assert discover_layers_from_config(real_gpt2_config) == real_gpt2_config.n_layer
 
-# ── Real Model Factory Functions ─────────────────────────────────────────────
-
-def _real_gpt2_model() -> GPT2LMHeadModel:
-    """Instantiate a real HuggingFace GPT-2 model with compact dimensions."""
-    cfg = GPT2Config(
-        n_layer=4,
-        n_head=2,
-        n_embd=64,
-        vocab_size=100,
-        n_positions=128,
-    )
-    model = GPT2LMHeadModel(cfg)
-    model.eval()
-    return model
+    def test_discover_layers_from_conftest_pythia(self, real_pythia_config: GPTNeoXConfig):
+        assert discover_layers_from_config(real_pythia_config) == real_pythia_config.num_hidden_layers
 
 
-def _real_neox_model() -> GPTNeoXForCausalLM:
-    """Instantiate a real HuggingFace Pythia/GPT-NeoX model with compact dimensions."""
-    cfg = GPTNeoXConfig(
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        hidden_size=64,
-        intermediate_size=128,
-        vocab_size=100,
-        max_position_embeddings=128,
-        use_parallel_residual=True,
-    )
-    model = GPTNeoXForCausalLM(cfg)
-    model.eval()
-    return model
-
-
-# ── Accessor Tests with Real Models ──────────────────────────────────────────
+# ── Accessor Tests with Real Models from conftest ────────────────────────────
 
 class TestAccessors:
-    def test_gpt2_accessors(self):
-        model = _real_gpt2_model()
+    def test_gpt2_accessors(self, real_gpt2_model: GPT2LMHeadModel):
+        model = real_gpt2_model
         arch = detect_architecture_from_config(model.config)
 
         # Block accessor
@@ -204,8 +192,8 @@ class TestAccessors:
         assert head_mods[0] is model.transformer.ln_f
         assert head_mods[1] is model.lm_head
 
-    def test_neox_accessors(self):
-        model = _real_neox_model()
+    def test_neox_accessors(self, real_pythia_model: GPTNeoXForCausalLM):
+        model = real_pythia_model
         arch = detect_architecture_from_config(model.config)
 
         # Block accessor
@@ -224,8 +212,8 @@ class TestAccessors:
         assert head_mods[0] is model.gpt_neox.final_layer_norm
         assert head_mods[1] is model.lm_head
 
-    def test_wrapped_model_accessor(self):
-        inner = _real_gpt2_model()
+    def test_wrapped_model_accessor(self, real_gpt2_model: GPT2LMHeadModel):
+        inner = real_gpt2_model
 
         class WrappedModel(torch.nn.Module):
             def __init__(self, mod: torch.nn.Module):

@@ -222,7 +222,7 @@ class TestAccessors:
         head_mods = get_head_modules(model, arch)
         assert len(head_mods) == 2
         assert head_mods[0] is model.gpt_neox.final_layer_norm
-        assert head_mods[1] is model.embed_out
+        assert head_mods[1] is model.lm_head
 
     def test_wrapped_model_accessor(self):
         inner = _real_gpt2_model()

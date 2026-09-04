@@ -78,10 +78,36 @@ def _family_from_config(config:Any) -> str | None:
     if (
         _config_value(config, "use_parallel_residual", None) is not None
         or _config_value(config, "rotary_pct", None) is not None
+        or _config_value(config, "rope_parameters", None) is not None
     ):
         return "neox"
 
     return None
+
+
+def _extract_rope_params(config: Any) -> tuple[float, float]:
+    """Extract rope_theta and rotary_pct respecting HF's rope_parameters schema."""
+    rope_params = _config_value(config, "rope_parameters", None)
+    if not isinstance(rope_params, Mapping):
+        rope_params = {}
+
+    theta_val = _config_value(
+        config,
+        "rope_theta",
+        _config_value(config, "rotary_emb_base", rope_params.get("base", 10000.0)),
+    )
+    rope_theta = float(theta_val if theta_val is not None else 10000.0)
+
+    pct_val = _config_value(
+        config,
+        "rotary_pct",
+        rope_params.get("partial_rotary_factor", 1.0),
+    )
+    rotary_pct = float(pct_val if pct_val is not None else 1.0)
+
+    return rope_theta, rotary_pct
+
+
 def _get_path(params: Any, *parts: str) -> Any:
     node: Any = params
     for part in parts:
@@ -151,8 +177,8 @@ def detect_architecture(params: Any, config: Any = None) -> Architecture:
         vocab_size=vocab_size,
         max_position_embeddings=max_positions,
         layer_norm_eps=float(_config_value(config, "layer_norm_eps", 1e-5)),
-        rope_theta=float(_config_value(config, "rope_theta", 10000.0)),
-        rotary_pct=float(_config_value(config, "rotary_pct", 1.0)),
+        rope_theta=_extract_rope_params(config)[0],
+        rotary_pct=_extract_rope_params(config)[1],
         use_parallel_residual=bool(
             _config_value(config, "use_parallel_residual", False)
         ),
@@ -233,8 +259,7 @@ def detect_architecture_from_config(config:Any) -> Architecture:
                 _config_value(config, "layer_norm_epsilon", 1e-5),
             )
         )
-        rope_theta = float(_config_value(config, "rope_theta", 10000.0))
-        rotary_pct = float(_config_value(config, "rotary_pct", 1.0))
+        rope_theta, rotary_pct = _extract_rope_params(config)
         use_parallel_residual = bool(
             _config_value(config, "use_parallel_residual", True)
         )

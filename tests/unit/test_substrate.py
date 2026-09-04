@@ -103,14 +103,12 @@ class TestFrozenSubstrateForward:
             sub(jnp.zeros((2, 0), dtype=jnp.int32))
 
     def test_tokenize_helper(self):
-        from types import SimpleNamespace
-
         # Mock tokenizer returning PyTorch tensor
-        mock_tok = SimpleNamespace(
-            __call__=lambda text, return_tensors="pt", **kw: {
-                "input_ids": torch.tensor([[10, 20, 30]])
-            }
-        )
+        class MockTokenizer:
+            def __call__(self, text, return_tensors="pt", **kw):
+                return {"input_ids": torch.tensor([[10, 20, 30]])}
+
+        mock_tok = MockTokenizer()
         model = _tiny_gpt2_model()
         sub = FrozenSubstrate(model, tokenizer=mock_tok)
 
@@ -202,4 +200,6 @@ class TestMemoryStatus:
 
         status = sub.memory_status()
         assert status is not None
+        assert hasattr(status, "allocated_bytes")
         assert hasattr(status, "bytes_in_use")
+        assert hasattr(status, "available")

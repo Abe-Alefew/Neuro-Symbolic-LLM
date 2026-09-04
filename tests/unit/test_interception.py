@@ -115,6 +115,19 @@ class TestInterceptionContextLifecycle:
         with pytest.raises(ValueError, match="Invalid interception layer"):
             InterceptionContext(model, intercept_layers=[99])
 
+    def test_explicit_arch_passed(self, real_gpt2_model: GPT2LMHeadModel):
+        model = real_gpt2_model
+        arch = detect_architecture_from_config(model.config)
+        with InterceptionContext(model, arch=arch, intercept_layers=[1]) as ctx:
+            assert ctx.arch is arch
+            assert len(ctx._handles) == 1
+        assert len(model.transformer.h[1]._forward_hooks) == 0
+
+    def test_no_config_and_no_arch_raises(self):
+        dummy = torch.nn.Linear(10, 10)
+        with pytest.raises(ValueError, match="arch must be provided"):
+            InterceptionContext(dummy, intercept_layers=[0])
+
 
 class TestInterceptionForwardExecution:
     def test_gpt2_intercepts_pristine_hidden_states(
@@ -165,9 +178,9 @@ class TestInterceptionForwardExecution:
                 base_out = model(input_ids=ids)
                 base_h1 = ctx_base.intermediates[1].clone()
 
-        # 2. Run with modification: perturb layer 1 hidden state
+        # 2. Run with modification: perturb layer 1 hidden state with dimension-varying offset
         def perturb(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
-            return h + 50.0
+            return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
 
         with torch.no_grad():
             with InterceptionContext(
@@ -257,10 +270,10 @@ class TestMultipleInterceptions:
                 base_h0 = ctx_base.intermediates[0].clone()
                 base_h2 = ctx_base.intermediates[2].clone()
 
-        # 2. Modify layer 0 only
+        # 2. Modify layer 0 only with dimension-varying perturbation
         def mod_layer_0_only(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
             if layer_idx == 0:
-                return h + 50.0
+                return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
             return h
 
         with torch.no_grad():
@@ -279,9 +292,9 @@ class TestMultipleInterceptions:
         # 3. Modify both layer 0 and layer 2 with distinct operations
         def mod_both(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
             if layer_idx == 0:
-                return h + 50.0
+                return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
             elif layer_idx == 2:
-                return h * 0.5
+                return h * 0.0
             return h
 
         with torch.no_grad():

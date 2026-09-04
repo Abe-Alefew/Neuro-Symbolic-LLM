@@ -5,7 +5,6 @@ from .interception import (
     ModifyFn,
     identity_modify,
     run_with_hooks,
-    run_with_interception,
 )
 
 __all__ = [

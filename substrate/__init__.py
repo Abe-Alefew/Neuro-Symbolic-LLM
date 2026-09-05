@@ -19,6 +19,12 @@ from .architecture import (
     validate_interception_layers,
 )
 from .drift import compute_kl_drift
+from .interception import (
+    InterceptionContext,
+    ModifyFn,
+    identity_modify,
+    run_with_hooks,
+)
 from .loader import (
     build_substrate_from_state_dict,
     load_substrate_from_hf,
@@ -72,10 +78,14 @@ __all__ = [
     "get_head_modules",
     "get_position_embedding_module",
     "get_memory_status",
+    "identity_modify",
+    "InterceptionContext",
     "load_substrate_from_hf",
     "load_tokenizer",
     "load_torchax_model",
     "maybe_reduce_batch_size",
+    "ModifyFn",
+    "run_with_hooks",
     "state_dict_to_jax_pytree",
     "to_jax_array",
     "to_torchax_device",

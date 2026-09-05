@@ -23,13 +23,24 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import urllib.request
 from pathlib import Path
+
+# Ensure repo root is on sys.path even when run directly as a script
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+
+# Compatibility patch for torchax versions expecting FP4 dtype on PyTorch < 2.5
+if not hasattr(torch, "float4_e2m1fn_x2"):
+    torch.float4_e2m1fn_x2 = getattr(torch, "float8_e4m3fn", torch.uint8)
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from substrate import (

@@ -6,6 +6,12 @@ arbitrary per-layer hidden-state interception, activation caching, drift
 monitoring and device memory monitoring.
 """
 
+import torch
+
+# Compatibility patch for torchax versions expecting FP4 dtype on PyTorch < 2.5
+if not hasattr(torch, "float4_e2m1fn_x2"):
+    torch.float4_e2m1fn_x2 = getattr(torch, "float8_e4m3fn", torch.uint8)
+
 from .architecture import (
     Architecture,
     detect_architecture,

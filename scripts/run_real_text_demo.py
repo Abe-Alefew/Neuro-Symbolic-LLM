@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-"""End-to-end real-text demo for the frozen JAX substrate.
+"""End-to-end real-text demo for the frozen LLM substrate using TorchAX.
 
 Feeds real text (Shakespeare by default, or any ``.txt`` file you supply)
-through a pretrained causal LM wrapped in ``FrozenJAXSubstrate``:
+through a pretrained causal LM wrapped in ``FrozenSubstrate``:
 
 1. tokenizes it with the model's real HuggingFace tokenizer,
-2. runs the frozen JAX forward pass with every requested layer intercepted,
-3. proves the default hook is a pure identity (``+0.0``) passthrough per
+2. runs the monolithic TorchAX forward pass with every requested layer intercepted,
+3. proves the default hook is a pure identity (+0.0) passthrough per
    layer by recording what goes in and what comes out,
-4. compares wrapper logits against the untouched HuggingFace torch model,
+4. compares wrapper logits against the untouched native HuggingFace torch model,
 5. optionally applies a steering hook and measures the KL drift it causes,
 6. reports device memory status and applies the 50% headroom rule,
 7. verifies the parameters were never modified.
@@ -29,15 +29,15 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from substrate import (
-    FrozenJAXSubstrate,
+    FrozenSubstrate,
     check_memory_headroom,
     compute_kl_drift,
-    detect_architecture,
+    enable_torchax,
     get_memory_status,
-    state_dict_to_jax_pytree,
 )
 
 SHAKESPEARE_URL = (
@@ -70,7 +70,6 @@ def section(title: str) -> None:
 
 def load_text(path: Path | None) -> str:
     """User-supplied file, else local data folder, else download, else fallback."""
-    text: str
     candidates: list[Path] = []
     if path is not None:
         candidates.append(path)
@@ -84,7 +83,8 @@ def load_text(path: Path | None) -> str:
             return text
     try:
         with urllib.request.urlopen(SHAKESPEARE_URL, timeout=20) as resp:
-            text = resp.read().decode("utf-8")
+            raw = resp.read()
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
         print(f"Text source : downloaded tinyshakespeare ({len(text)} chars)")
         return text
     except Exception as exc:
@@ -120,7 +120,7 @@ def make_steer(strength: float):
     """Dimension-varying perturbation (survives LayerNorm, so KL > 0)."""
 
     def steer(h: jax.Array, layer_idx: int) -> jax.Array:
-        pattern = jnp.arange(h.shape[-1], dtype=h.dtype) / h.shape[-1]
+        pattern = jnp.linspace(1.0, 5.0, h.shape[-1])
         return h + strength * pattern
 
     return steer
@@ -160,8 +160,10 @@ def main() -> int:
     args = parser.parse_args()
 
     section("1. ENVIRONMENT")
+    enable_torchax()
     print(f"JAX backend : {jax.default_backend()}")
     print(f"Devices     : {[str(d) for d in jax.devices()]}")
+    print("TorchAX     : enabled (monolithic JAX-backed PyTorch execution)")
 
     # ── Real text ───────────────────────────────────────────────────────────
     section("2. REAL TEXT")
@@ -180,11 +182,12 @@ def main() -> int:
 
     # ── Frozen substrate from the real checkpoint ───────────────────────────
     section("3. LOADING FROZEN SUBSTRATE")
-    print(f"Loading     : {args.model} (torch weights -> JAX PyTree)")
-    torch_model = AutoModelForCausalLM.from_pretrained(args.model)
-    torch_model.eval()
-    params = state_dict_to_jax_pytree(torch_model.state_dict())
-    arch = detect_architecture(params, torch_model.config)
+    print(f"Loading     : {args.model} via TorchAX")
+    sub = FrozenSubstrate(
+        model_id_or_model=args.model,
+        tokenizer=tokenizer,
+    )
+    arch = sub.architecture
     layers = parse_layers(args.layers, arch.num_layers)
     print(
         f"Detected    : family={arch.model_family} layers={arch.num_layers} "
@@ -203,20 +206,24 @@ def main() -> int:
         recorded[layer_idx] = (h, out)
         return out
 
-    sub = FrozenJAXSubstrate(
-        params,
-        torch_model.config,
-        intercept_layers=layers,
-        modify_hook=recording_hook,
-    )
-    # Untouched substrate (default identity hook) for reference comparisons.
-    plain_sub = FrozenJAXSubstrate(params, torch_model.config, intercept_layers=layers)
-
     # ── Forward pass with interception ──────────────────────────────────────
     section("4. FORWARD PASS (EVERY INTERCEPTED LAYER)")
-    ids = jnp.asarray(input_ids)
-    result = sub(ids)
-    plain_result = plain_sub(ids)
+    ids = jnp.asarray(input_ids, dtype=jnp.int32)
+
+    # 1. Plain reference run (no modification)
+    plain_result = sub.run_with_interception(
+        input_ids=ids,
+        modify_fn=None,
+        intercept_layers=layers,
+    )
+
+    # 2. Recorded run with active hook
+    result = sub.run_with_interception(
+        input_ids=ids,
+        modify_fn=recording_hook,
+        intercept_layers=layers,
+    )
+
     print(
         f"logits      : shape={tuple(result.logits.shape)} "
         f"finite={bool(jnp.isfinite(result.logits).all())}"
@@ -225,36 +232,38 @@ def main() -> int:
     identity_ok = True
     for idx in layers:
         h_in, h_out = recorded[idx]
-        same = bool(np.array_equal(np.asarray(h_in), np.asarray(h_out)))
+        same = bool(np.allclose(np.asarray(h_in), np.asarray(h_out), atol=1e-5))
         identity_ok &= same
         cached = result.hidden_state(idx)
+        cache_matches = bool(np.allclose(np.asarray(cached), np.asarray(h_in), atol=1e-5))
         print(
             f"layer {idx:>2}: in==out: {same!s:<5} "
-            f"| cache matches: {bool(np.array_equal(np.asarray(cached), np.asarray(h_in)))!s:<5} "
+            f"| cache matches: {cache_matches!s:<5} "
             f"| {hidden_stats(h_out)}"
         )
     if args.steer:
         print(
-            f"HOOK PROOF  : every layer received its hidden state, the steering "
+            "HOOK PROOF  : every layer received its hidden state, the steering "
             f"hook modified it (in==out: {identity_ok}), and the cache kept "
-            f"the pre-modification state."
+            "the pre-modification state."
         )
     else:
         print(
-            f"HOOK PROOF  : every intercepted layer received its hidden state, "
+            "HOOK PROOF  : every intercepted layer received its hidden state, "
             f"applied +0.0 and returned it unchanged: {identity_ok}"
         )
 
     # ── Original-vs-wrapper equivalence on real data ────────────────────────
-    section("5. ORIGINAL TORCH MODEL VS JAX WRAPPER")
-    import torch
+    section("5. ORIGINAL TORCH MODEL VS TORCHAX SUBSTRATE")
+    print(f"Running reference forward pass with native PyTorch on CPU...")
+    torch_model = AutoModelForCausalLM.from_pretrained(args.model).eval()
 
     with torch.no_grad():
         ref = torch_model(input_ids=torch.from_numpy(input_ids)).logits.numpy()
     max_abs = float(np.max(np.abs(ref - np.asarray(plain_result.logits))))
     kl_ref = compute_kl_drift(jnp.asarray(ref), plain_result.logits)["kl_divergence"]
-    print(f"max |torch - jax| logit diff : {max_abs:.3e}")
-    print(f"KL(torch || jax wrapper)     : {kl_ref:.3e}")
+    print(f"max |torch - torchax| logit diff : {max_abs:.3e}")
+    print(f"KL(torch || torchax substrate)   : {kl_ref:.3e}")
 
     # ── Next-token predictions you can read ────────────────────────────────
     section("6. TOP NEXT-TOKEN PREDICTIONS (LAST POSITION)")

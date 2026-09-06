@@ -20,18 +20,16 @@ from flax.core import freeze, unfreeze
 from .architecture import (
     Architecture,
     detect_architecture,
-    detect_architecture_from_config,
     validate_interception_layers,
 )
 from .interception import identity_modify, run_with_hooks
-from .torchax_models import load_tokenizer, load_torchax_model
+from .loader import load_tokenizer, load_torchax_model
 from .memory import (
     MemoryStatus,
     check_memory_headroom,
     get_memory_status,
     maybe_reduce_batch_size,
 )
-from .models import run_embeddings, run_lm_head, run_transformer_blocks
 from .torchax_backend import (
     enable_torchax,
     from_jax_array,
@@ -126,6 +124,11 @@ class FrozenSubstrate:
 
         self._legacy_mode = False
 
+        # Handle positional params passed as second argument: Substrate(model, params)
+        if isinstance(config, Mapping) and params is None:
+            params = config
+            config = getattr(model_id_or_model, "config", None)
+
         # 1. Load or accept PyTorch model and tokenizer
         if isinstance(model_id_or_model, str):
             model, params = load_torchax_model(model_id_or_model)
@@ -141,7 +144,8 @@ class FrozenSubstrate:
             enable_torchax()
             model = to_torchax_device(model)
             model.eval()
-            params = dict(model.named_parameters())
+            if params is None:
+                params = dict(model.named_parameters())
             for p in params.values():
                 p.requires_grad_(False)
         else:
@@ -154,10 +158,12 @@ class FrozenSubstrate:
         self._params: dict[str, torch.Tensor] = params
 
         # 2. Detect architecture
-        if config is not None:
-            self._architecture = detect_architecture_from_config(config)
+        if params is not None and (config is None or not hasattr(config, "model_type")):
+            self._architecture = detect_architecture(params, config)
+        elif config is not None:
+            self._architecture = detect_architecture(config)
         elif hasattr(model, "config") and model.config is not None:
-            self._architecture = detect_architecture_from_config(model.config)
+            self._architecture = detect_architecture(model.config)
         else:
             raise ValueError(
                 "Model configuration must be provided or available on model.config."
@@ -418,13 +424,10 @@ class FrozenSubstrate:
         hook: Callable[[jax.Array, int], jax.Array],
         input_ids: jax.Array,
     ) -> tuple[jax.Array, dict[int, jax.Array]]:
-        hidden = run_embeddings(params, arch, input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(input_ids.shape[1]), input_ids.shape)
-        hidden, intermediates = run_transformer_blocks(
-            params, arch, hidden, intercept_layers, hook, position_ids
+        raise NotImplementedError(
+            "Legacy pure-JAX forward execution via models.py was removed in favor of "
+            "monolithic TorchAX execution. Use FrozenSubstrate with live models."
         )
-        logits = run_lm_head(params, arch, hidden)
-        return logits, intermediates
 
     def __repr__(self) -> str:
         return (
@@ -436,4 +439,4 @@ class FrozenSubstrate:
 
 
 # Backward compatibility alias
-FrozenJAXSubstrate = FrozenSubstrate
+Substrate = FrozenSubstrate

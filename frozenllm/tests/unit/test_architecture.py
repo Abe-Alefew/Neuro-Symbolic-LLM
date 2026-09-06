@@ -19,7 +19,9 @@ from transformers import (
 
 from substrate.architecture import (
     Architecture,
+    detect_architecture,
     detect_architecture_from_config,
+    discover_layers,
     discover_layers_from_config,
     get_block_accessor,
     get_embedding_module,
@@ -159,12 +161,20 @@ class TestDiscoverLayersFromConfig:
     def test_discover_layers(self):
         cfg = GPT2Config(n_layer=24, n_embd=1024, n_head=16)
         assert discover_layers_from_config(cfg) == 24
+        assert discover_layers(cfg) == 24
 
     def test_discover_layers_from_conftest_gpt2(self, real_gpt2_config: GPT2Config):
         assert discover_layers_from_config(real_gpt2_config) == real_gpt2_config.n_layer
+        assert discover_layers(real_gpt2_config) == real_gpt2_config.n_layer
 
     def test_discover_layers_from_conftest_pythia(self, real_pythia_config: GPTNeoXConfig):
         assert discover_layers_from_config(real_pythia_config) == real_pythia_config.num_hidden_layers
+        assert discover_layers(real_pythia_config) == real_pythia_config.num_hidden_layers
+
+    def test_unified_detect_architecture(self, real_gpt2_config: GPT2Config):
+        arch = detect_architecture(real_gpt2_config)
+        assert arch.model_family == "gpt2"
+        assert arch.num_layers == real_gpt2_config.n_layer
 
 
 # ── Accessor Tests with Real Models from conftest ────────────────────────────

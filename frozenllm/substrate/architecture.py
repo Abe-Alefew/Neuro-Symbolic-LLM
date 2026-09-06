@@ -123,14 +123,8 @@ def _config_value(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
-def detect_architecture(params: Any, config: Any = None) -> Architecture:
-    """Inspect parameter tree or config to auto-detect the architecture.
-
-    Raises ``ValueError`` for unsupported parameter layouts or configs.
-    """
-    if config is not None and not isinstance(params, Mapping):
-        return detect_architecture_from_config(config)
-
+def _detect_architecture_from_params(params: Any, config: Any = None) -> Architecture:
+    """Inspect parameter tree to auto-detect architecture."""
     keys = _top_keys(params)
     family = _family_from_keys(keys)
     if family is None:
@@ -189,16 +183,8 @@ def detect_architecture(params: Any, config: Any = None) -> Architecture:
     )
 
 
-def discover_layers(params: Any, config: Any = None) -> int:
-    """Return the number of transformer blocks discovered from the params."""
-    return detect_architecture(params, config).num_layers
-
-
-def detect_architecture_from_config(config:Any) -> Architecture:
+def detect_architecture_from_config(config: Any) -> Architecture:
     """Detect architecture directly from an HF config object or dictionary.
-
-    This is the primary detection path for the torchax architecture,
-    where the Hugging Face configuration is available directly.
 
     Args:
         config: HuggingFace PretrainedConfig, dict, or duck-typed config object.
@@ -315,9 +301,36 @@ def detect_architecture_from_config(config:Any) -> Architecture:
         use_parallel_residual=use_parallel_residual,
     )
 
-def discover_layers_from_config(config: Any) -> int:
-    """Return the number of transformer blocks discovered from the config."""
-    return detect_architecture_from_config(config).num_layers
+
+def detect_architecture(target: Any, config: Any = None) -> Architecture:
+    """Unified detector: auto-detects architecture from HF config, nn.Module, or parameter mapping.
+
+    Args:
+        target: HuggingFace PretrainedConfig, dict, torch.nn.Module, or parameter mapping.
+        config: Optional HuggingFace configuration when target is a parameter mapping or module.
+
+    Returns:
+        Architecture dataclass describing the model layout.
+
+    Raises:
+        ValueError: If architecture is unsupported or unrecognized.
+    """
+    if config is not None and not isinstance(target, Mapping):
+        return detect_architecture_from_config(config)
+    if hasattr(target, "config") and target.config is not None:
+        return detect_architecture_from_config(target.config)
+    if _family_from_config(target) is not None:
+        return detect_architecture_from_config(target)
+    return _detect_architecture_from_params(target, config=config)
+
+
+def discover_layers(target: Any, config: Any = None) -> int:
+    """Return the number of transformer blocks discovered from target (config, model, or params)."""
+    return detect_architecture(target, config).num_layers
+
+
+# Backward compatibility alias
+discover_layers_from_config = discover_layers
 
 
 

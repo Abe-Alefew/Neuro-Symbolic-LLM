@@ -71,11 +71,14 @@ jobs:
 
       - name: Run unit tests (if they exist)
         run: |
-          if [ -d "tests/unit" ] && [ "$(ls -A tests/unit 2>/dev/null)" ]; then
+          if [ -d "frozenllm/tests/unit" ] && [ "$(ls -A frozenllm/tests/unit 2>/dev/null)" ]; then
+            pytest frozenllm/tests/unit/ -v --tb=short
+          elif [ -d "tests/unit" ] && [ "$(ls -A tests/unit 2>/dev/null)" ]; then
             pytest tests/unit/ -v --tb=short
           else
             echo "No unit tests found. Skipping."
           fi
+
 
       - name: Run grammar integration tests (if they exist)
         run: |

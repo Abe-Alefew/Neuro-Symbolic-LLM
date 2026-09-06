@@ -68,9 +68,9 @@ class InterceptionContext(AbstractContextManager["InterceptionContext"]):
         self.model = model
         if arch is None:
             if getattr(model, "config", None) is not None:
-                from .architecture import detect_architecture_from_config
+                from .architecture import detect_architecture
 
-                arch = detect_architecture_from_config(model.config)
+                arch = detect_architecture(model)
             else:
                 raise ValueError(
                     "arch must be provided when model does not have a config attribute."

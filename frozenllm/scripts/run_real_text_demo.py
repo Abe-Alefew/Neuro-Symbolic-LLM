@@ -34,18 +34,18 @@ for _p in (REPO_ROOT, FROZENLLM_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-import torch
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 # Compatibility patch for torchax versions expecting FP4 dtype on PyTorch < 2.5
 if not hasattr(torch, "float4_e2m1fn_x2"):
     torch.float4_e2m1fn_x2 = getattr(torch, "float8_e4m3fn", torch.uint8)
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
-from substrate import (
+from substrate import (  # noqa: E402
     FrozenSubstrate,
     check_memory_headroom,
     compute_kl_drift,

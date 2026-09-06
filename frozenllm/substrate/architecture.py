@@ -62,7 +62,7 @@ def _family_from_config(config:Any) -> str | None:
             return "neox"
 
     architectures = _config_value(config, "architectures", None)
-    if architectures and isinstance(architectures, (list, tuple)):
+    if architectures and isinstance(architectures, list | tuple):
         for arch_name in architectures:
             if not isinstance(arch_name, str):
                 continue

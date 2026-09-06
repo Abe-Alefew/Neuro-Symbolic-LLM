@@ -137,10 +137,9 @@ class TestInterceptionContextLifecycle:
 
     def test_cleans_up_hooks_on_exception(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
-        with pytest.raises(RuntimeError, match="Simulated forward failure"):
-            with InterceptionContext(model, intercept_layers=[1]):
-                assert len(model.transformer.h[1]._forward_hooks) == 1
-                raise RuntimeError("Simulated forward failure")
+        with pytest.raises(RuntimeError, match="Simulated forward failure"), InterceptionContext(model, intercept_layers=[1]):
+            assert len(model.transformer.h[1]._forward_hooks) == 1
+            raise RuntimeError("Simulated forward failure")
 
         assert len(model.transformer.h[1]._forward_hooks) == 0
 
@@ -215,21 +214,19 @@ class TestInterceptionForwardExecution:
         ids = torch.randint(0, model.config.vocab_size, (2, 8))
 
         # 1. Run pristine baseline to record unmodified layer 1 output
-        with torch.no_grad():
-            with InterceptionContext(model, intercept_layers=[1]) as ctx_base:
-                base_out = model(input_ids=ids)
-                base_h1 = ctx_base.intermediates[1].clone()
+        with torch.no_grad(), InterceptionContext(model, intercept_layers=[1]) as ctx_base:
+            base_out = model(input_ids=ids)
+            base_h1 = ctx_base.intermediates[1].clone()
 
         # 2. Run with modification: perturb layer 1 hidden state with dimension-varying offset
         def perturb(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
             return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
 
-        with torch.no_grad():
-            with InterceptionContext(
-                model, intercept_layers=[1], modify_fn=perturb
-            ) as ctx_mod:
-                mod_out = model(input_ids=ids)
-                mod_cached_h1 = ctx_mod.intermediates[1]
+        with torch.no_grad(), InterceptionContext(
+            model, intercept_layers=[1], modify_fn=perturb
+        ) as ctx_mod:
+            mod_out = model(input_ids=ids)
+            mod_cached_h1 = ctx_mod.intermediates[1]
 
         # Intermediates MUST capture pristine pre-modification state
         assert torch.allclose(base_h1, mod_cached_h1, atol=1e-6)
@@ -306,11 +303,10 @@ class TestMultipleInterceptions:
         ids = torch.randint(0, model.config.vocab_size, (2, 8))
 
         # 1. Baseline unmodified run
-        with torch.no_grad():
-            with InterceptionContext(model, intercept_layers=[0, 2]) as ctx_base:
-                base_out = model(input_ids=ids)
-                base_h0 = ctx_base.intermediates[0].clone()
-                base_h2 = ctx_base.intermediates[2].clone()
+        with torch.no_grad(), InterceptionContext(model, intercept_layers=[0, 2]) as ctx_base:
+            base_out = model(input_ids=ids)
+            base_h0 = ctx_base.intermediates[0].clone()
+            base_h2 = ctx_base.intermediates[2].clone()
 
         # 2. Modify layer 0 only with dimension-varying perturbation
         def mod_layer_0_only(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -318,13 +314,12 @@ class TestMultipleInterceptions:
                 return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
             return h
 
-        with torch.no_grad():
-            with InterceptionContext(
-                model, intercept_layers=[0, 2], modify_fn=mod_layer_0_only
-            ) as ctx_l0:
-                l0_out = model(input_ids=ids)
-                l0_h0 = ctx_l0.intermediates[0]
-                l0_h2 = ctx_l0.intermediates[2]
+        with torch.no_grad(), InterceptionContext(
+            model, intercept_layers=[0, 2], modify_fn=mod_layer_0_only
+        ) as ctx_l0:
+            l0_out = model(input_ids=ids)
+            l0_h0 = ctx_l0.intermediates[0]
+            l0_h2 = ctx_l0.intermediates[2]
 
         # Pristine h0 MUST match baseline
         assert torch.allclose(base_h0, l0_h0, atol=1e-6)
@@ -339,13 +334,12 @@ class TestMultipleInterceptions:
                 return h * 0.0
             return h
 
-        with torch.no_grad():
-            with InterceptionContext(
-                model, intercept_layers=[0, 2], modify_fn=mod_both
-            ) as ctx_both:
-                both_out = model(input_ids=ids)
-                both_h0 = ctx_both.intermediates[0]
-                both_h2 = ctx_both.intermediates[2]
+        with torch.no_grad(), InterceptionContext(
+            model, intercept_layers=[0, 2], modify_fn=mod_both
+        ) as ctx_both:
+            both_out = model(input_ids=ids)
+            both_h0 = ctx_both.intermediates[0]
+            both_h2 = ctx_both.intermediates[2]
 
         # In the combined run:
         # both_h0 is pristine layer 0 (matches base_h0)
@@ -366,7 +360,7 @@ class TestMultipleInterceptions:
 
         with InterceptionContext(model, intercept_layers=[3, 0, 2]) as ctx:
             assert ctx.intercept_layers == (0, 2, 3)
-            out = model(input_ids=ids)
+            _out = model(input_ids=ids)
             assert sorted(ctx.intermediates.keys()) == [0, 2, 3]
 
     def test_all_layers_interception(
@@ -379,7 +373,7 @@ class TestMultipleInterceptions:
         all_layers = list(range(model.config.n_layer))
 
         with InterceptionContext(model, intercept_layers=all_layers) as ctx:
-            out = model(input_ids=ids)
+            _out = model(input_ids=ids)
             assert sorted(ctx.intermediates.keys()) == all_layers
             assert len(ctx.intermediates) == model.config.n_layer
             for idx in all_layers:

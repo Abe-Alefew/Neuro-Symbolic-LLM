@@ -11,7 +11,7 @@ from substrate.substrate import Substrate
 class DummyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = type("Config", (), {"n_layer": 1, "n_embd": 32})
+        self.config = None
 
 
 def _dummy_gpt2_params():

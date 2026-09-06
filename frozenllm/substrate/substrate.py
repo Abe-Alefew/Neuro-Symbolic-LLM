@@ -144,10 +144,7 @@ class FrozenSubstrate:
             enable_torchax()
             model = to_torchax_device(model)
             model.eval()
-            if params is None:
-                params = dict(model.named_parameters())
-            else:
-                params = dict(params)
+            params = dict(model.named_parameters()) if params is None else dict(params)
             for p in params.values():
                 p.requires_grad_(False)
         else:
@@ -157,7 +154,7 @@ class FrozenSubstrate:
             )
 
         self._model = model
-        self._params: dict[str, torch.Tensor] = dict(params)
+        self._params = dict(params)  
 
         # 2. Detect architecture
         if params is not None and (config is None or not hasattr(config, "model_type")):

@@ -63,7 +63,11 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: pip install -e .[dev]
+        run: |
+          pip install -e .[dev]
+          python -m pip install --upgrade pip
+          pip install "torch==2.6.0"
+
 
       - name: Run unit tests (if they exist)
         run: |

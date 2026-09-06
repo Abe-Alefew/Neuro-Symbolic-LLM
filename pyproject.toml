@@ -18,10 +18,10 @@ dependencies = [
     "orbax-checkpoint>=0.5.0",
 
     # Frozen base model (PyTorch, hidden state extraction only)
-    "torch>=2.2.0",
-    "torchax==0.0.13",
+    "torch==2.6.0",
     "transformers>=4.40.0",
     "datasets>=2.19.0",
+    "torchax==0.0.14.dev20260617",
 
     # MORK service
     "fastapi>=0.110.0",
@@ -99,7 +99,8 @@ select = [
 ]
 ignore = [
     "E501",  # line too long — black handles this
-    "B008",  # do not perform function calls in default arguments (FastAPI uses this)
+    "B008",  # do not perform function calls in default arguments (FastAPI uses this),
+    "N806", "N803"
 ]
 
 [tool.ruff.lint.isort]

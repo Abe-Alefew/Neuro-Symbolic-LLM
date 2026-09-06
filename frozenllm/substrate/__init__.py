@@ -43,33 +43,13 @@ from .memory import (
     get_memory_status,
     maybe_reduce_batch_size,
 )
-from .torchax_backend import (
-    enable_torchax,
-    from_jax_array,
-    
-    is_on_torchax_device,
-    is_torchax_enabled,
-    to_jax_array,
-    to_torchax_device,
-)
-
-from .torchax_models import (
-    check_numerical_fidelity,
-    functional_model,
-    load_tokenizer,
-    load_torchax_model,
-)
-
-from .substrate import ForwardResult, FrozenJAXSubstrate, FrozenSubstrate
-
+from .substrate import ForwardResult, Substrate
 
 __all__ = [
     "Architecture",
     "ForwardResult",
-    "FrozenJAXSubstrate",
-    "FrozenSubstrate",
     "MemoryStatus",
-    "build_substrate_from_state_dict",
+    "Substrate",
     "check_memory_headroom",
     "check_numerical_fidelity",
     "compute_kl_drift",

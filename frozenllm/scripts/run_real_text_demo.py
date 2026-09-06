@@ -14,10 +14,10 @@ through a pretrained causal LM wrapped in ``FrozenSubstrate``:
 7. verifies the parameters were never modified.
 
 Usage:
-    python scripts/run_real_text_demo.py
-    python scripts/run_real_text_demo.py --model EleutherAI/pythia-70m
-    python scripts/run_real_text_demo.py --text hamlet.txt --layers 0,5,11
-    python scripts/run_real_text_demo.py --steer 2.0
+    python frozenllm/scripts/run_real_text_demo.py
+    python frozenllm/scripts/run_real_text_demo.py --model EleutherAI/pythia-70m
+    python frozenllm/scripts/run_real_text_demo.py --text hamlet.txt --layers 0,5,11
+    python frozenllm/scripts/run_real_text_demo.py --steer 2.0
 """
 
 from __future__ import annotations
@@ -27,10 +27,12 @@ import sys
 import urllib.request
 from pathlib import Path
 
-# Ensure repo root is on sys.path even when run directly as a script
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# Ensure repo root and frozenllm are on sys.path even when run directly as a script
+FROZENLLM_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = FROZENLLM_DIR.parent
+for _p in (REPO_ROOT, FROZENLLM_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import jax
 import jax.numpy as jnp
@@ -85,8 +87,12 @@ def load_text(path: Path | None) -> str:
     if path is not None:
         candidates.append(path)
     else:
-        data_dir = Path(__file__).resolve().parent.parent / "data"
-        candidates += [data_dir / "shakespeare.txt", data_dir / "wiki.txt"]
+        candidates += [
+            REPO_ROOT / "data" / "shakespeare.txt",
+            REPO_ROOT / "data" / "wiki.txt",
+            FROZENLLM_DIR / "data" / "shakespeare.txt",
+            FROZENLLM_DIR / "data" / "wiki.txt",
+        ]
     for candidate in candidates:
         if candidate.is_file():
             text = candidate.read_text(encoding="utf-8")

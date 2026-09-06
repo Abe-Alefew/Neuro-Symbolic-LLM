@@ -30,6 +30,43 @@ from substrate.torchax_backend import enable_torchax
 enable_torchax()
 
 
+def _tiny_model() -> GPT2LMHeadModel:
+    cfg = GPT2Config(n_layer=4, n_head=2, n_embd=32, vocab_size=100, n_positions=16)
+    model = GPT2LMHeadModel(cfg)
+    model.eval()
+    return model
+
+
+def _tiny_neox_model() -> GPTNeoXForCausalLM:
+    cfg = GPTNeoXConfig(
+        vocab_size=100,
+        hidden_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        rotary_pct=1.0,
+        rope_theta=10000.0,
+        layer_norm_eps=1e-5,
+        use_parallel_residual=False,
+        attention_bias=True,
+        hidden_act="gelu",
+    )
+    model = GPTNeoXForCausalLM(cfg)
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def real_gpt2_model() -> GPT2LMHeadModel:
+    return _tiny_model()
+
+
+@pytest.fixture
+def real_pythia_model() -> GPTNeoXForCausalLM:
+    return _tiny_neox_model()
+
+
 class TestFrozenSubstrateInit:
     def test_initialization_with_gpt2_model(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model

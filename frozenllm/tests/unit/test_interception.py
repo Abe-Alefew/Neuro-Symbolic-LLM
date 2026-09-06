@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from transformers import GPT2LMHeadModel, GPTNeoXForCausalLM
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    GPTNeoXConfig,
+    GPTNeoXForCausalLM,
+)
 
-from substrate.architecture import Architecture, detect_architecture_from_config
+from substrate.architecture import Architecture, detect_architecture
 from substrate.interception import (
     InterceptionContext,
     _extract_hidden,
@@ -19,6 +24,43 @@ from substrate.interception import (
     identity_modify,
     run_with_hooks,
 )
+
+
+def _tiny_model() -> GPT2LMHeadModel:
+    cfg = GPT2Config(n_layer=4, n_head=2, n_embd=32, vocab_size=100, n_positions=16)
+    model = GPT2LMHeadModel(cfg)
+    model.eval()
+    return model
+
+
+def _tiny_neox_model() -> GPTNeoXForCausalLM:
+    cfg = GPTNeoXConfig(
+        vocab_size=100,
+        hidden_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        rotary_pct=1.0,
+        rope_theta=10000.0,
+        layer_norm_eps=1e-5,
+        use_parallel_residual=False,
+        attention_bias=True,
+        hidden_act="gelu",
+    )
+    model = GPTNeoXForCausalLM(cfg)
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def real_gpt2_model() -> GPT2LMHeadModel:
+    return _tiny_model()
+
+
+@pytest.fixture
+def real_pythia_model() -> GPTNeoXForCausalLM:
+    return _tiny_neox_model()
 
 
 class TestIdentityModify:
@@ -117,7 +159,7 @@ class TestInterceptionContextLifecycle:
 
     def test_explicit_arch_passed(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
-        arch = detect_architecture_from_config(model.config)
+        arch = detect_architecture(model.config)
         with InterceptionContext(model, arch=arch, intercept_layers=[1]) as ctx:
             assert ctx.arch is arch
             assert len(ctx._handles) == 1

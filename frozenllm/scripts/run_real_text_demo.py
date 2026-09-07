@@ -137,7 +137,7 @@ def make_steer(strength: float):
     """Dimension-varying perturbation (survives LayerNorm, so KL > 0)."""
 
     def steer(h: jax.Array, layer_idx: int) -> jax.Array:
-        pattern = jnp.linspace(1.0, 5.0, h.shape[-1])
+        pattern = jnp.arange(h.shape[-1], dtype=h.dtype) / h.shape[-1]
         return h + strength * pattern
 
     return steer

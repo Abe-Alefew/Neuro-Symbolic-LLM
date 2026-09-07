@@ -233,6 +233,10 @@ def main() -> int:
         modify_fn=None,
         intercept_layers=layers,
     )
+    # Materialise logits: to_jax_array uses a zero-copy view into the XLA
+    # output buffer.  A second forward pass may reuse that buffer, silently
+    # overwriting plain_result.logits.  Copying prevents aliasing.
+    plain_logits = jnp.array(plain_result.logits, copy=True)
 
     # 2. Recorded run with active hook
     result = sub.run_with_interception(
@@ -240,6 +244,7 @@ def main() -> int:
         modify_fn=recording_hook,
         intercept_layers=layers,
     )
+    steered_logits = jnp.array(result.logits, copy=True)
 
     print(
         f"logits      : shape={tuple(result.logits.shape)} "
@@ -275,27 +280,29 @@ def main() -> int:
     # ── Original-vs-wrapper equivalence on real data ────────────────────────
     section("5. ORIGINAL TORCH MODEL VS TORCHAX SUBSTRATE")
     print("Running reference forward pass with native PyTorch on CPU...")
-    torch_model = AutoModelForCausalLM.from_pretrained(args.model).eval()
+    torch_model = AutoModelForCausalLM.from_pretrained(
+        args.model, device_map="cpu"
+    ).eval()
 
     with torch.no_grad():
         ref = torch_model(input_ids=torch.from_numpy(input_ids)).logits.numpy()
-    max_abs = float(np.max(np.abs(ref - np.asarray(plain_result.logits))))
-    kl_ref = compute_kl_drift(jnp.asarray(ref), plain_result.logits)["kl_divergence"]
+    max_abs = float(np.max(np.abs(ref - np.asarray(plain_logits))))
+    kl_ref = compute_kl_drift(jnp.asarray(ref), plain_logits)["kl_divergence"]
     print(f"max |torch - torchax| logit diff : {max_abs:.3e}")
     print(f"KL(torch || torchax substrate)   : {kl_ref:.3e}")
 
     # ── Next-token predictions you can read ────────────────────────────────
     section("6. TOP NEXT-TOKEN PREDICTIONS (LAST POSITION)")
-    last_logits = np.asarray(plain_result.logits)[0, -1]
+    last_logits = np.asarray(plain_logits)[0, -1]
     top_ids = np.argsort(last_logits)[::-1][: args.topk]
     print("baseline: " + " | ".join(repr(tokenizer.decode([int(t)])) for t in top_ids))
 
     if args.steer:
         section("7. STEERED RUN AND KL DRIFT")
-        kl = compute_kl_drift(plain_result.logits, result.logits)["kl_divergence"]
+        kl = compute_kl_drift(plain_logits, steered_logits)["kl_divergence"]
         print(f"steer={args.steer} at layers {layers}")
         print(f"KL(baseline || steered)      : {kl:.4f}  (> 0 means steering worked)")
-        s_last = np.asarray(result.logits)[0, -1]
+        s_last = np.asarray(steered_logits)[0, -1]
         s_top = np.argsort(s_last)[::-1][: args.topk]
         print(
             "steered : " + " | ".join(repr(tokenizer.decode([int(t)])) for t in s_top)

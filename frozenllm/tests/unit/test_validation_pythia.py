@@ -178,9 +178,9 @@ def test_3_identity_interception(setup_validation_env):
 
     # Assert intercepted loss matches baseline
     sub_loss = float(FrozenSubstrate.compute_loss(res.logits, env["ids_jax"]))
-    assert abs(sub_loss - env["ref_loss"]) < 1e-3, (
-        f"Loss mismatch: {sub_loss} vs {env['ref_loss']}"
-    )
+    assert (
+        abs(sub_loss - env["ref_loss"]) < 1e-3
+    ), f"Loss mismatch: {sub_loss} vs {env['ref_loss']}"
 
 
 # ── Test 4: Hidden-State Transparency ────────────────────────────────────────
@@ -261,9 +261,9 @@ def test_6_non_identity_modification(setup_validation_env):
 
     # 1. Logits differ from baseline
     logit_diff = float(jnp.max(jnp.abs(steered_res.logits - baseline_res.logits)))
-    assert logit_diff > 0.05, (
-        f"Logits failed to diverge under steering (diff={logit_diff})!"
-    )
+    assert (
+        logit_diff > 0.05
+    ), f"Logits failed to diverge under steering (diff={logit_diff})!"
 
     # 2. Intermediates[l] == pristine block output (not modified)
     pristine_diff = float(
@@ -274,9 +274,9 @@ def test_6_non_identity_modification(setup_validation_env):
             )
         )
     )
-    assert pristine_diff < 1e-5, (
-        f"Pristine intermediate corrupted! Diff: {pristine_diff}"
-    )
+    assert (
+        pristine_diff < 1e-5
+    ), f"Pristine intermediate corrupted! Diff: {pristine_diff}"
 
     # 3. Downstream propagation confirmed by logit divergence
     assert bool(jnp.all(jnp.isfinite(steered_res.logits)))
@@ -315,9 +315,9 @@ def test_8_hidden_state_gradient_availability(setup_validation_env):
     steered_res = steered_sub(env["ids_jax"])
 
     diff = jnp.abs(steered_res.logits - baseline_res.logits)
-    assert float(jnp.max(diff)) > 0.05, (
-        "Downstream hidden-state modification produced zero perturbation!"
-    )
+    assert (
+        float(jnp.max(diff)) > 0.05
+    ), "Downstream hidden-state modification produced zero perturbation!"
 
 
 # ── Test 9: Loss Consistency ─────────────────────────────────────────────────

@@ -281,9 +281,9 @@ class TestInterceptionAndSteering:
 
 
 class TestCausalLossComputation:
-    def test_compute_loss_causal_shift(self, real_gpt2_config: GPT2Config):
+    def test_compute_loss_causal_shift(self):
+        vocab_size = 64
         batch, seq_len = 2, 6
-        vocab_size = real_gpt2_config.vocab_size
         # Deterministic logits
         logits = jnp.zeros((batch, seq_len, vocab_size))
         labels = jnp.zeros((batch, seq_len), dtype=jnp.int32)

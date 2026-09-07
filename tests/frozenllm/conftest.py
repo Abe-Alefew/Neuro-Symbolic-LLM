@@ -25,7 +25,7 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
-from substrate import FrozenSubstrate
+from frozenllm.substrate import FrozenSubstrate
 
 GPT2_CFG: dict[str, Any] = {
     "n_layer": 12,

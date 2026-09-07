@@ -9,7 +9,7 @@ import torchax
 from torch.func import functional_call
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from substrate.torchax_models import functional_model
+from frozenllm.substrate.torchax_models import functional_model
 
 torchax.enable_globally()
 

@@ -16,8 +16,8 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
-from substrate.architecture import detect_architecture
-from substrate.interception import (
+from frozenllm.substrate.architecture import detect_architecture
+from frozenllm.substrate.interception import (
     InterceptionContext,
     _extract_hidden,
     _wrap_hidden,

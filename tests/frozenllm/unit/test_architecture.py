@@ -17,7 +17,7 @@ from transformers import (
     PretrainedConfig,
 )
 
-from substrate.architecture import (
+from frozenllm.substrate.architecture import (
     detect_architecture,
     detect_architecture_from_config,
     discover_layers,

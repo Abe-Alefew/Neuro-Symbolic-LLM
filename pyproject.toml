@@ -141,8 +141,8 @@ follow_imports = "skip"
 
 # ── Pytest ─────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
-testpaths = ["tests", "frozenllm/tests" ]
-pythonpath = ["frozenllm"]
+testpaths = ["tests"]
+pythonpath = [".", "frozenllm"]
 asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",

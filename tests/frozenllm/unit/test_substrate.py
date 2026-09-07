@@ -24,8 +24,8 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
-from substrate.substrate import ForwardResult, FrozenSubstrate
-from substrate.torchax_backend import enable_torchax
+from frozenllm.substrate.substrate import ForwardResult, FrozenSubstrate
+from frozenllm.substrate.torchax_backend import enable_torchax
 
 enable_torchax()
 

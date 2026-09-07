@@ -25,11 +25,7 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
-from substrate import (
-    
-    FrozenSubstrate,
-    
-)
+from substrate import FrozenSubstrate
 
 GPT2_CFG: dict[str, Any] = {
     "n_layer": 12,
@@ -94,7 +90,11 @@ def make_substrate(family: str, intercept_layers=None, modify_hook=None, seed: i
 def torch_logits(model, ids):
     with torch.no_grad():
         param = next(model.parameters(), None)
-        if param is not None and isinstance(ids, torch.Tensor) and ids.device != param.device:
+        if (
+            param is not None
+            and isinstance(ids, torch.Tensor)
+            and ids.device != param.device
+        ):
             ids = ids.to(param.device)
         elif param is not None and not isinstance(ids, torch.Tensor):
             ids = torch.as_tensor(ids, device=param.device)
@@ -120,4 +120,3 @@ def pythia_reference():
     model = _torch_model("neox")
     model.eval()
     return model
-

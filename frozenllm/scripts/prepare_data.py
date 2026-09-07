@@ -93,8 +93,12 @@ def main() -> None:
     save_tokenizer("EleutherAI/pythia-70m", "tokenizer_pythia")
     print("\nAll data ready. Try:")
     print("  python frozenllm/scripts/run_real_text_demo.py")
-    print("  python frozenllm/scripts/run_real_text_demo.py --model EleutherAI/pythia-70m")
-    print("  python frozenllm/scripts/run_real_text_demo.py --text data/wiki.txt --steer 2.0")
+    print(
+        "  python frozenllm/scripts/run_real_text_demo.py --model EleutherAI/pythia-70m"
+    )
+    print(
+        "  python frozenllm/scripts/run_real_text_demo.py --text data/wiki.txt --steer 2.0"
+    )
 
 
 if __name__ == "__main__":

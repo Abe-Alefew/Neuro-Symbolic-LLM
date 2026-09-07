@@ -114,9 +114,7 @@ class TestFrozenSubstrateInit:
 
 
 class TestFrozenSubstrateForward:
-    def test_forward_produces_jax_logits_gpt2(
-        self, real_gpt2_model: GPT2LMHeadModel
-    ):
+    def test_forward_produces_jax_logits_gpt2(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
         sub = FrozenSubstrate(model, intercept_layers=[1])
 
@@ -189,9 +187,7 @@ class TestFrozenSubstrateForward:
 
 
 class TestInterceptionAndSteering:
-    def test_steering_hook_modifies_output_gpt2(
-        self, real_gpt2_model: GPT2LMHeadModel
-    ):
+    def test_steering_hook_modifies_output_gpt2(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
         sub = FrozenSubstrate(model, intercept_layers=[2])
 
@@ -266,9 +262,7 @@ class TestInterceptionAndSteering:
         for block in model.transformer.h:
             assert len(block._forward_hooks) == 0
 
-    def test_clean_hook_lifecycle_pythia(
-        self, real_pythia_model: GPTNeoXForCausalLM
-    ):
+    def test_clean_hook_lifecycle_pythia(self, real_pythia_model: GPTNeoXForCausalLM):
         model = real_pythia_model
         sub = FrozenSubstrate(model, intercept_layers=[0, 1])
 
@@ -308,9 +302,7 @@ class TestCausalLossComputation:
 
 
 class TestMemoryStatus:
-    def test_memory_status_returns_valid_object(
-        self, real_gpt2_model: GPT2LMHeadModel
-    ):
+    def test_memory_status_returns_valid_object(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
         sub = FrozenSubstrate(model)
 

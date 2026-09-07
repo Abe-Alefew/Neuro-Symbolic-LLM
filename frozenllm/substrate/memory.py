@@ -28,6 +28,7 @@ class MemoryStatus:
         """Convenience alias for allocated_bytes."""
         return self.allocated_bytes
 
+
 def get_memory_status(device: jax.Device | None = None) -> MemoryStatus:
     """Query total/allocated/available device memory when supported.
 

@@ -18,7 +18,6 @@ from transformers import (
 )
 
 from substrate.architecture import (
-    Architecture,
     detect_architecture,
     detect_architecture_from_config,
     discover_layers,
@@ -212,9 +211,16 @@ class TestDiscoverLayersFromConfig:
         assert discover_layers_from_config(real_gpt2_config) == real_gpt2_config.n_layer
         assert discover_layers(real_gpt2_config) == real_gpt2_config.n_layer
 
-    def test_discover_layers_from_conftest_pythia(self, real_pythia_config: GPTNeoXConfig):
-        assert discover_layers_from_config(real_pythia_config) == real_pythia_config.num_hidden_layers
-        assert discover_layers(real_pythia_config) == real_pythia_config.num_hidden_layers
+    def test_discover_layers_from_conftest_pythia(
+        self, real_pythia_config: GPTNeoXConfig
+    ):
+        assert (
+            discover_layers_from_config(real_pythia_config)
+            == real_pythia_config.num_hidden_layers
+        )
+        assert (
+            discover_layers(real_pythia_config) == real_pythia_config.num_hidden_layers
+        )
 
     def test_unified_detect_architecture(self, real_gpt2_config: GPT2Config):
         arch = detect_architecture(real_gpt2_config)
@@ -223,6 +229,7 @@ class TestDiscoverLayersFromConfig:
 
 
 # ── Accessor Tests with Real Models from conftest ────────────────────────────
+
 
 class TestAccessors:
     def test_gpt2_accessors(self, real_gpt2_model: GPT2LMHeadModel):
@@ -282,6 +289,7 @@ class TestAccessors:
 
 
 # ── Interception Layer Validation Tests ───────────────────────────────────────
+
 
 class TestValidateInterceptionLayers:
     def test_valid_layers(self):

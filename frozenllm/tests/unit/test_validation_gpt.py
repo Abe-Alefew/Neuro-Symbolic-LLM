@@ -13,16 +13,16 @@ Test 9  — JIT Compilation (Compiled forward pass & loss consistency)
 Test 10 — Repeated Execution (Determinism & parameter immutability across runs)
 """
 
-
 from __future__ import annotations
+
 from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
-
 
 from frozenllm.substrate import (
     ForwardResult,
@@ -31,6 +31,7 @@ from frozenllm.substrate import (
     enable_torchax,
     identity_modify,
 )
+
 
 def _tiny_model(seed: int = 42) -> tuple[GPT2Config, GPT2LMHeadModel]:
     cfg = GPT2Config(
@@ -52,11 +53,11 @@ enable_torchax()
 
 # ── Shared Test Fixture ──────────────────────────────────────────────────────
 
+
 def _create_validation_env() -> dict[str, Any]:
     """Create deterministic tiny GPT-2 models, configuration, inputs, and reference outputs."""
     cfg, ref_model = _tiny_model(seed=42)
     _, model = _tiny_model(seed=42)
-
 
     # Fixed input tokens [batch=2, seq_len=8]
     torch.manual_seed(42)
@@ -101,6 +102,7 @@ def setup_validation_env():
 
 # ── Test 1: Base PyTorch Reference ───────────────────────────────────────────
 
+
 def test_1_base_pytorch_reference(setup_validation_env):
     """Test 1: Run native PyTorch model and verify reference logits and hidden states."""
     env = setup_validation_env
@@ -128,6 +130,7 @@ def test_1_base_pytorch_reference(setup_validation_env):
 
 # ── Test 2: Functional Model Parity ──────────────────────────────────────────
 
+
 def test_2_functional_model_parity(setup_validation_env):
     """Test 2: FrozenSubstrate (NO interception) matches native PyTorch (atol=1e-3)."""
     env = setup_validation_env
@@ -147,6 +150,7 @@ def test_2_functional_model_parity(setup_validation_env):
 
 
 # ── Test 3: Identity Interception ────────────────────────────────────────────
+
 
 def test_3_identity_interception(setup_validation_env):
     """Test 3: Interception with identity modify_fn matches baseline logits and loss."""
@@ -170,10 +174,13 @@ def test_3_identity_interception(setup_validation_env):
 
     # Assert intercepted loss matches baseline
     sub_loss = float(FrozenSubstrate.compute_loss(res.logits, env["ids_jax"]))
-    assert abs(sub_loss - env["ref_loss"]) < 1e-3, f"Loss mismatch: {sub_loss} vs {env['ref_loss']}"
+    assert abs(sub_loss - env["ref_loss"]) < 1e-3, (
+        f"Loss mismatch: {sub_loss} vs {env['ref_loss']}"
+    )
 
 
 # ── Test 4: Hidden-State Transparency ────────────────────────────────────────
+
 
 def test_4_hidden_state_transparency(setup_validation_env):
     """Test 4: Intermediates[l] equals what block l actually produced."""
@@ -199,6 +206,7 @@ def test_4_hidden_state_transparency(setup_validation_env):
 
 
 # ── Test 5: Two Simultaneous Interception Points ─────────────────────────────
+
 
 def test_5_two_simultaneous_interception_points(setup_validation_env):
     """Test 5: Simultaneous interception at mid and late layers [1, 3]."""
@@ -226,6 +234,7 @@ def test_5_two_simultaneous_interception_points(setup_validation_env):
 
 # ── Test 6: Non-Identity Modification ────────────────────────────────────────
 
+
 def test_6_non_identity_modification(setup_validation_env):
     """Test 6: Steering modifies downstream logits while keeping intermediate pristine."""
     env = setup_validation_env
@@ -248,7 +257,9 @@ def test_6_non_identity_modification(setup_validation_env):
 
     # 1. Logits differ from baseline
     logit_diff = float(jnp.max(jnp.abs(steered_res.logits - baseline_res.logits)))
-    assert logit_diff > 0.05, f"Logits failed to diverge under steering (diff={logit_diff})!"
+    assert logit_diff > 0.05, (
+        f"Logits failed to diverge under steering (diff={logit_diff})!"
+    )
 
     # 2. Intermediates[l] == pristine block output (not modified)
     pristine_diff = float(
@@ -259,13 +270,16 @@ def test_6_non_identity_modification(setup_validation_env):
             )
         )
     )
-    assert pristine_diff < 1e-5, f"Pristine intermediate corrupted! Diff: {pristine_diff}"
+    assert pristine_diff < 1e-5, (
+        f"Pristine intermediate corrupted! Diff: {pristine_diff}"
+    )
 
     # 3. Downstream propagation confirmed by logit divergence
     assert bool(jnp.all(jnp.isfinite(steered_res.logits)))
 
 
 # ── Test 7: Frozen Parameter Gradient Invariant ──────────────────────────────
+
 
 def test_7_frozen_parameter_gradient_invariant(setup_validation_env):
     """Test 7: Base model parameters theta_0 strictly have requires_grad=False."""
@@ -278,6 +292,7 @@ def test_7_frozen_parameter_gradient_invariant(setup_validation_env):
 
 
 # ── Test 8: Hidden-State Gradient Availability ───────────────────────────────
+
 
 def test_8_hidden_state_gradient_availability(setup_validation_env):
     """Test 8: Proves hidden state modification propagates through downstream blocks."""
@@ -296,10 +311,13 @@ def test_8_hidden_state_gradient_availability(setup_validation_env):
     steered_res = steered_sub(env["ids_jax"])
 
     diff = jnp.abs(steered_res.logits - baseline_res.logits)
-    assert float(jnp.max(diff)) > 0.05, "Downstream hidden-state modification produced zero perturbation!"
+    assert float(jnp.max(diff)) > 0.05, (
+        "Downstream hidden-state modification produced zero perturbation!"
+    )
 
 
 # ── Test 9: Loss Consistency ─────────────────────────────────────────────────
+
 
 def test_9_loss_consistency(setup_validation_env):
     """Test 9: Forward loss computation is consistent, finite, and deterministic."""
@@ -316,8 +334,8 @@ def test_9_loss_consistency(setup_validation_env):
     assert abs(loss1 - loss2) < 1e-6, "Loss inconsistency between executions!"
 
 
-
 # ── Test 10: Repeated Execution ──────────────────────────────────────────────
+
 
 def test_10_repeated_execution(setup_validation_env):
     """Test 10: All logits identical and params_unchanged() == True across 10 runs."""

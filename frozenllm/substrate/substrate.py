@@ -154,7 +154,7 @@ class FrozenSubstrate:
             )
 
         self._model = model
-        self._params = dict(params)  
+        self._params = dict(params)
 
         # 2. Detect architecture
         if params is not None and (config is None or not hasattr(config, "model_type")):

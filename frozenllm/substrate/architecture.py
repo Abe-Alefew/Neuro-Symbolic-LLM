@@ -48,7 +48,8 @@ def _family_from_keys(keys: set[str]) -> str | None:
         return "neox"
     return None
 
-def _family_from_config(config:Any) -> str | None:
+
+def _family_from_config(config: Any) -> str | None:
     """Detect model family from an HF config object or mapping."""
     if config is None:
         return None
@@ -73,7 +74,10 @@ def _family_from_config(config:Any) -> str | None:
                 return "neox"
 
     # Key/attribute heuristics
-    if _config_value(config, "n_layer", None) is not None and _config_value(config, "n_embd", None) is not None:
+    if (
+        _config_value(config, "n_layer", None) is not None
+        and _config_value(config, "n_embd", None) is not None
+    ):
         return "gpt2"
     if (
         _config_value(config, "use_parallel_residual", None) is not None
@@ -215,7 +219,9 @@ def detect_architecture_from_config(config: Any) -> Architecture:
         )
         vocab_size = int(_config_value(config, "vocab_size", 50257))
         max_positions = _config_value(
-            config, "n_positions", _config_value(config, "max_position_embeddings", 1024)
+            config,
+            "n_positions",
+            _config_value(config, "max_position_embeddings", 1024),
         )
         layer_norm_eps = float(
             _config_value(
@@ -241,7 +247,9 @@ def detect_architecture_from_config(config: Any) -> Architecture:
         )
         vocab_size = int(_config_value(config, "vocab_size", 50304))
         max_positions = _config_value(
-            config, "max_position_embeddings", _config_value(config, "n_positions", 2048)
+            config,
+            "max_position_embeddings",
+            _config_value(config, "n_positions", 2048),
         )
         layer_norm_eps = float(
             _config_value(
@@ -333,7 +341,6 @@ def discover_layers(target: Any, config: Any = None) -> int:
 discover_layers_from_config = discover_layers
 
 
-
 def validate_interception_layers(
     intercept_layers: Sequence[int] | None, num_layers: int
 ) -> tuple[int, ...]:
@@ -370,6 +377,7 @@ def validate_interception_layers(
         seen.add(i)
 
     return tuple(sorted(layers))
+
 
 def _unwrap_model(model: Any) -> Any:
     """Unwrap wrapper layers (e.g. DistributedDataParallel) if present."""
@@ -420,9 +428,7 @@ def get_block_accessor(
         raise ValueError(f"Unsupported model family: {arch.model_family!r}")
 
 
-def get_embedding_module(
-    model: torch.nn.Module, arch: Architecture
-) -> torch.nn.Module:
+def get_embedding_module(model: torch.nn.Module, arch: Architecture) -> torch.nn.Module:
     """Return the primary token embedding submodule.
 
     For GPT-2: `model.transformer.wte`

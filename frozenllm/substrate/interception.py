@@ -15,14 +15,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
-
-from .architecture import Architecture, get_block_accessor, validate_interception_layers
+from typing import Any
 
 import torch
 
+from .architecture import Architecture, get_block_accessor, validate_interception_layers
 
-# ModifyFn contract: (hidden_state, layer_idx) -> modified_hidden_state 
+# ModifyFn contract: (hidden_state, layer_idx) -> modified_hidden_state
 ModifyFn = Callable[[Any, int], Any]
 
 
@@ -115,9 +114,12 @@ class InterceptionContext(AbstractContextManager["InterceptionContext"]):
             h, is_tuple, rest = _extract_hidden(output)
 
             # 1. Cache pristine h_l^0 (pre-modification state)
-            h_cached = h.clone() if (self.clone_intermediates and hasattr(h, "clone")) else h
+            h_cached = (
+                h.clone() if (self.clone_intermediates and hasattr(h, "clone")) else h
+            )
             if self.to_jax:
                 from .torchax_backend import to_jax_array
+
                 self.intermediates[layer_idx] = to_jax_array(h_cached)
                 h_input = to_jax_array(h)
             else:
@@ -130,14 +132,17 @@ class InterceptionContext(AbstractContextManager["InterceptionContext"]):
             # Convert back to torch/torchax tensor if a JAX array was returned
             if hasattr(h_mod, "__class__") and "jax" in str(type(h_mod)).lower():
                 from .torchax_backend import from_jax_array
+
                 h_modified = from_jax_array(h_mod)
             elif isinstance(h_mod, torch.Tensor):
                 h_modified = h_mod
             else:
                 try:
                     import jax
+
                     if isinstance(h_mod, jax.Array):
                         from .torchax_backend import from_jax_array
+
                         h_modified = from_jax_array(h_mod)
                     else:
                         h_modified = h_mod
@@ -186,8 +191,6 @@ def run_with_hooks(
         intermediates = dict(ctx.intermediates)
 
     return output, intermediates
-
-
 
 
 __all__ = [

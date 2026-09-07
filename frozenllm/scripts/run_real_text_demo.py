@@ -252,7 +252,9 @@ def main() -> int:
         same = bool(np.allclose(np.asarray(h_in), np.asarray(h_out), atol=1e-5))
         identity_ok &= same
         cached = result.hidden_state(idx)
-        cache_matches = bool(np.allclose(np.asarray(cached), np.asarray(h_in), atol=1e-5))
+        cache_matches = bool(
+            np.allclose(np.asarray(cached), np.asarray(h_in), atol=1e-5)
+        )
         print(
             f"layer {idx:>2}: in==out: {same!s:<5} "
             f"| cache matches: {cache_matches!s:<5} "
@@ -272,7 +274,7 @@ def main() -> int:
 
     # ── Original-vs-wrapper equivalence on real data ────────────────────────
     section("5. ORIGINAL TORCH MODEL VS TORCHAX SUBSTRATE")
-    print(f"Running reference forward pass with native PyTorch on CPU...")
+    print("Running reference forward pass with native PyTorch on CPU...")
     torch_model = AutoModelForCausalLM.from_pretrained(args.model).eval()
 
     with torch.no_grad():

@@ -16,7 +16,7 @@ from transformers import (
     GPTNeoXForCausalLM,
 )
 
-from substrate.architecture import Architecture, detect_architecture
+from substrate.architecture import detect_architecture
 from substrate.interception import (
     InterceptionContext,
     _extract_hidden,
@@ -137,7 +137,10 @@ class TestInterceptionContextLifecycle:
 
     def test_cleans_up_hooks_on_exception(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
-        with pytest.raises(RuntimeError, match="Simulated forward failure"), InterceptionContext(model, intercept_layers=[1]):
+        with (
+            pytest.raises(RuntimeError, match="Simulated forward failure"),
+            InterceptionContext(model, intercept_layers=[1]),
+        ):
             assert len(model.transformer.h[1]._forward_hooks) == 1
             raise RuntimeError("Simulated forward failure")
 
@@ -149,9 +152,7 @@ class TestInterceptionContextLifecycle:
             assert len(ctx._handles) == 0
             assert ctx.intercept_layers == ()
 
-    def test_invalid_interception_layers_raises(
-        self, real_gpt2_model: GPT2LMHeadModel
-    ):
+    def test_invalid_interception_layers_raises(self, real_gpt2_model: GPT2LMHeadModel):
         model = real_gpt2_model
         with pytest.raises(ValueError, match="Invalid interception layer"):
             InterceptionContext(model, intercept_layers=[99])
@@ -214,7 +215,10 @@ class TestInterceptionForwardExecution:
         ids = torch.randint(0, model.config.vocab_size, (2, 8))
 
         # 1. Run pristine baseline to record unmodified layer 1 output
-        with torch.no_grad(), InterceptionContext(model, intercept_layers=[1]) as ctx_base:
+        with (
+            torch.no_grad(),
+            InterceptionContext(model, intercept_layers=[1]) as ctx_base,
+        ):
             base_out = model(input_ids=ids)
             base_h1 = ctx_base.intermediates[1].clone()
 
@@ -222,9 +226,12 @@ class TestInterceptionForwardExecution:
         def perturb(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
             return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
 
-        with torch.no_grad(), InterceptionContext(
-            model, intercept_layers=[1], modify_fn=perturb
-        ) as ctx_mod:
+        with (
+            torch.no_grad(),
+            InterceptionContext(
+                model, intercept_layers=[1], modify_fn=perturb
+            ) as ctx_mod,
+        ):
             mod_out = model(input_ids=ids)
             mod_cached_h1 = ctx_mod.intermediates[1]
 
@@ -303,7 +310,10 @@ class TestMultipleInterceptions:
         ids = torch.randint(0, model.config.vocab_size, (2, 8))
 
         # 1. Baseline unmodified run
-        with torch.no_grad(), InterceptionContext(model, intercept_layers=[0, 2]) as ctx_base:
+        with (
+            torch.no_grad(),
+            InterceptionContext(model, intercept_layers=[0, 2]) as ctx_base,
+        ):
             base_out = model(input_ids=ids)
             base_h0 = ctx_base.intermediates[0].clone()
             base_h2 = ctx_base.intermediates[2].clone()
@@ -311,12 +321,17 @@ class TestMultipleInterceptions:
         # 2. Modify layer 0 only with dimension-varying perturbation
         def mod_layer_0_only(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
             if layer_idx == 0:
-                return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
+                return h + 0.5 * torch.arange(
+                    h.shape[-1], device=h.device, dtype=h.dtype
+                )
             return h
 
-        with torch.no_grad(), InterceptionContext(
-            model, intercept_layers=[0, 2], modify_fn=mod_layer_0_only
-        ) as ctx_l0:
+        with (
+            torch.no_grad(),
+            InterceptionContext(
+                model, intercept_layers=[0, 2], modify_fn=mod_layer_0_only
+            ) as ctx_l0,
+        ):
             l0_out = model(input_ids=ids)
             l0_h0 = ctx_l0.intermediates[0]
             l0_h2 = ctx_l0.intermediates[2]
@@ -329,14 +344,19 @@ class TestMultipleInterceptions:
         # 3. Modify both layer 0 and layer 2 with distinct operations
         def mod_both(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
             if layer_idx == 0:
-                return h + 0.5 * torch.arange(h.shape[-1], device=h.device, dtype=h.dtype)
+                return h + 0.5 * torch.arange(
+                    h.shape[-1], device=h.device, dtype=h.dtype
+                )
             elif layer_idx == 2:
                 return h * 0.0
             return h
 
-        with torch.no_grad(), InterceptionContext(
-            model, intercept_layers=[0, 2], modify_fn=mod_both
-        ) as ctx_both:
+        with (
+            torch.no_grad(),
+            InterceptionContext(
+                model, intercept_layers=[0, 2], modify_fn=mod_both
+            ) as ctx_both,
+        ):
             both_out = model(input_ids=ids)
             both_h0 = ctx_both.intermediates[0]
             both_h2 = ctx_both.intermediates[2]
@@ -350,9 +370,7 @@ class TestMultipleInterceptions:
         assert not torch.allclose(base_out.logits, l0_out.logits, atol=1e-2)
         assert not torch.allclose(l0_out.logits, both_out.logits, atol=1e-2)
 
-    def test_out_of_order_intercept_layers(
-        self, real_pythia_model: GPTNeoXForCausalLM
-    ):
+    def test_out_of_order_intercept_layers(self, real_pythia_model: GPTNeoXForCausalLM):
         """Verify intercept_layers passed unsorted are handled in forward order."""
         model = real_pythia_model
         torch.manual_seed(0)
@@ -363,9 +381,7 @@ class TestMultipleInterceptions:
             _out = model(input_ids=ids)
             assert sorted(ctx.intermediates.keys()) == [0, 2, 3]
 
-    def test_all_layers_interception(
-        self, real_gpt2_model: GPT2LMHeadModel
-    ):
+    def test_all_layers_interception(self, real_gpt2_model: GPT2LMHeadModel):
         """Verify intercepting every layer captures all transformer blocks."""
         model = real_gpt2_model
         torch.manual_seed(0)

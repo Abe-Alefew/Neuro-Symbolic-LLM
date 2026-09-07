@@ -177,10 +177,8 @@ def main() -> int:
     args = parser.parse_args()
 
     section("1. ENVIRONMENT")
-    enable_torchax()
     print(f"JAX backend : {jax.default_backend()}")
     print(f"Devices     : {[str(d) for d in jax.devices()]}")
-    print("TorchAX     : enabled (monolithic JAX-backed PyTorch execution)")
 
     # ── Real text ───────────────────────────────────────────────────────────
     section("2. REAL TEXT")
@@ -196,6 +194,20 @@ def main() -> int:
     assert round_trip == tokenizer.decode(
         encoded["input_ids"][0][: args.max_tokens].tolist()
     )
+
+    # Load native PyTorch reference model BEFORE enabling TorchAX dispatch,
+    # so it runs on vanilla CPU PyTorch (prevents nan from TorchAX interception).
+    print("Pre-loading native PyTorch reference model on CPU...")
+    torch_ref_model = AutoModelForCausalLM.from_pretrained(args.model).eval()
+    with torch.no_grad():
+        ref_logits_np = torch_ref_model(
+            input_ids=torch.from_numpy(input_ids)
+        ).logits.numpy()
+    del torch_ref_model  # free CPU memory before TorchAX model load
+
+    # Now enable TorchAX global dispatch
+    enable_torchax()
+    print("TorchAX     : enabled (monolithic JAX-backed PyTorch execution)")
 
     # ── Frozen substrate from the real checkpoint ───────────────────────────
     section("3. LOADING FROZEN SUBSTRATE")
@@ -235,8 +247,9 @@ def main() -> int:
     )
     # Materialise logits: to_jax_array uses a zero-copy view into the XLA
     # output buffer.  A second forward pass may reuse that buffer, silently
-    # overwriting plain_result.logits.  Copying prevents aliasing.
-    plain_logits = jnp.array(plain_result.logits, copy=True)
+    # overwriting plain_result.logits.  Roundtrip through numpy to guarantee
+    # an owned copy (jnp.array(copy=True) may be unsupported in older JAX).
+    plain_logits = jnp.asarray(np.array(plain_result.logits))
 
     # 2. Recorded run with active hook
     result = sub.run_with_interception(
@@ -244,7 +257,7 @@ def main() -> int:
         modify_fn=recording_hook,
         intercept_layers=layers,
     )
-    steered_logits = jnp.array(result.logits, copy=True)
+    steered_logits = jnp.asarray(np.array(result.logits))
 
     print(
         f"logits      : shape={tuple(result.logits.shape)} "
@@ -279,15 +292,9 @@ def main() -> int:
 
     # ── Original-vs-wrapper equivalence on real data ────────────────────────
     section("5. ORIGINAL TORCH MODEL VS TORCHAX SUBSTRATE")
-    print("Running reference forward pass with native PyTorch on CPU...")
-    torch_model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="cpu"
-    ).eval()
-
-    with torch.no_grad():
-        ref = torch_model(input_ids=torch.from_numpy(input_ids)).logits.numpy()
-    max_abs = float(np.max(np.abs(ref - np.asarray(plain_logits))))
-    kl_ref = compute_kl_drift(jnp.asarray(ref), plain_logits)["kl_divergence"]
+    print("Comparing against native PyTorch reference (pre-loaded on CPU)...")
+    max_abs = float(np.max(np.abs(ref_logits_np - np.asarray(plain_logits))))
+    kl_ref = compute_kl_drift(jnp.asarray(ref_logits_np), plain_logits)["kl_divergence"]
     print(f"max |torch - torchax| logit diff : {max_abs:.3e}")
     print(f"KL(torch || torchax substrate)   : {kl_ref:.3e}")
 

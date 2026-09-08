@@ -218,7 +218,7 @@ def main() -> int:
     # Load native PyTorch reference model BEFORE enabling TorchAX dispatch,
     # so it runs on vanilla CPU PyTorch (prevents nan from TorchAX interception).
     print(f"Pre-loading native PyTorch reference model on CPU ({args.dtype})...")
-    ref_kwargs: dict[str, Any] = {"torch_dtype": selected_dtype}
+    ref_kwargs: dict[str, Any] = {"dtype": selected_dtype}
     if args.attn_implementation:
         ref_kwargs["attn_implementation"] = args.attn_implementation
     try:
@@ -226,10 +226,17 @@ def main() -> int:
             args.model, **ref_kwargs
         ).eval()
     except TypeError:
-        ref_kwargs.pop("attn_implementation", None)
-        torch_ref_model = AutoModelForCausalLM.from_pretrained(
-            args.model, **ref_kwargs
-        ).eval()
+        ref_kwargs.pop("dtype", None)
+        ref_kwargs["torch_dtype"] = selected_dtype
+        try:
+            torch_ref_model = AutoModelForCausalLM.from_pretrained(
+                args.model, **ref_kwargs
+            ).eval()
+        except TypeError:
+            ref_kwargs.pop("attn_implementation", None)
+            torch_ref_model = AutoModelForCausalLM.from_pretrained(
+                args.model, **ref_kwargs
+            ).eval()
 
     with torch.no_grad():
         ref_logits_np = torch_ref_model(
@@ -249,7 +256,7 @@ def main() -> int:
     sub = FrozenSubstrate(
         model_id_or_model=args.model,
         tokenizer=tokenizer,
-        torch_dtype=selected_dtype,
+        dtype=selected_dtype,
         attn_implementation=args.attn_implementation,
     )
     arch = sub.architecture

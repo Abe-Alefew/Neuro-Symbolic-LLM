@@ -5,7 +5,6 @@ Forward passes execute the monolithic model on TorchAX with per-layer
 hidden-state interception via forward hooks, returning JAX-compatible
 logits and intermediate states.
 """
-
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
@@ -23,13 +22,14 @@ from frozenllm.substrate.architecture import (
     validate_interception_layers,
 )
 from frozenllm.substrate.interception import identity_modify, run_with_hooks
-from .loader import load_tokenizer, load_torchax_model
 from frozenllm.substrate.memory import (
     MemoryStatus,
     check_memory_headroom,
     get_memory_status,
     maybe_reduce_batch_size,
 )
+
+from .loader import load_tokenizer, load_torchax_model
 from .torchax_backend import (
     enable_torchax,
     from_jax_array,

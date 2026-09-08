@@ -3,8 +3,6 @@
 Tests that require a real accelerator are skipped automatically on CPU-only
 environments (e.g. CI) instead of failing.
 """
-
-
 from __future__ import annotations
 
 import jax

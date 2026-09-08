@@ -23,6 +23,7 @@ def check_numerical_fidelity(
     seq_len: int = 8,
     batch_size: int = 2,
     atol: float = 1e-4,
+    torch_dtype: torch.dtype | str = torch.float32,
 ) -> dict[str, Any]:
     """Compare the TorchAX-dispatched forward pass against a plain,
     non-TorchAX PyTorch forward pass on the same loaded weights and the
@@ -33,7 +34,9 @@ def check_numerical_fidelity(
     enable_torchax()
 
     config = AutoConfig.from_pretrained(model_id, revision=revision)
-    model_plain = AutoModelForCausalLM.from_pretrained(model_id, revision=revision)
+    model_plain = AutoModelForCausalLM.from_pretrained(
+        model_id, revision=revision, torch_dtype=torch_dtype
+    )
     model_plain.eval()
 
     torch.manual_seed(0)

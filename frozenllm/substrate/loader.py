@@ -12,8 +12,10 @@ _SUPPORTED_MODEL_TYPES = {"gpt2", "gpt_neox"}
 def load_torchax_model(
     model_id: str,
     revision: str | None = None,
+    torch_dtype: torch.dtype | str = torch.float32,
+    attn_implementation: str | None = "eager",
 ) -> tuple[torch.nn.Module, dict[str, torch.Tensor]]:
-    """Load a real HF GPT-2 checkpoint, moved onto TorchAX's JAX-backed
+    """Load a real HF model checkpoint, moved onto TorchAX's JAX-backed
     device, with its parameters frozen and exposed as an explicit dict.
     """
     enable_torchax()
@@ -27,7 +29,21 @@ def load_torchax_model(
             f"{model_id!r}. Supported: {sorted(_SUPPORTED_MODEL_TYPES)}."
         )
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision)
+    load_kwargs: dict[str, Any] = {"torch_dtype": torch_dtype}
+    if attn_implementation is not None:
+        load_kwargs["attn_implementation"] = attn_implementation
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, revision=revision, **load_kwargs
+        )
+    except TypeError:
+        # Backward compatibility for transformers versions lacking attn_implementation
+        load_kwargs.pop("attn_implementation", None)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, revision=revision, **load_kwargs
+        )
+
     model.eval()
     model = to_torchax_device(model)
 

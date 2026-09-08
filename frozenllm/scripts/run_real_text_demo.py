@@ -26,6 +26,7 @@ import argparse
 import sys
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 # Ensure repo root and frozenllm are on sys.path even when run directly as a script
 FROZENLLM_DIR = Path(__file__).resolve().parent.parent
@@ -174,7 +175,26 @@ def main() -> int:
         help="Steering strength; 0 keeps the pure identity hook",
     )
     parser.add_argument("--topk", type=int, default=5, help="Next-token candidates")
+    parser.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["float32", "bfloat16", "float16"],
+        help="Model compute dtype (default: float32 to prevent FP16 attention overflow)",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default="eager",
+        choices=["eager", "sdpa"],
+        help="Attention implementation (default: eager to avoid cuDNN version mismatches)",
+    )
     args = parser.parse_args()
+
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    selected_dtype = dtype_map.get(args.dtype, torch.float32)
 
     section("1. ENVIRONMENT")
     print(f"JAX backend : {jax.default_backend()}")
@@ -197,8 +217,20 @@ def main() -> int:
 
     # Load native PyTorch reference model BEFORE enabling TorchAX dispatch,
     # so it runs on vanilla CPU PyTorch (prevents nan from TorchAX interception).
-    print("Pre-loading native PyTorch reference model on CPU...")
-    torch_ref_model = AutoModelForCausalLM.from_pretrained(args.model).eval()
+    print(f"Pre-loading native PyTorch reference model on CPU ({args.dtype})...")
+    ref_kwargs: dict[str, Any] = {"torch_dtype": selected_dtype}
+    if args.attn_implementation:
+        ref_kwargs["attn_implementation"] = args.attn_implementation
+    try:
+        torch_ref_model = AutoModelForCausalLM.from_pretrained(
+            args.model, **ref_kwargs
+        ).eval()
+    except TypeError:
+        ref_kwargs.pop("attn_implementation", None)
+        torch_ref_model = AutoModelForCausalLM.from_pretrained(
+            args.model, **ref_kwargs
+        ).eval()
+
     with torch.no_grad():
         ref_logits_np = torch_ref_model(
             input_ids=torch.from_numpy(input_ids)
@@ -211,10 +243,14 @@ def main() -> int:
 
     # ── Frozen substrate from the real checkpoint ───────────────────────────
     section("3. LOADING FROZEN SUBSTRATE")
-    print(f"Loading     : {args.model} via TorchAX")
+    print(
+        f"Loading     : {args.model} via TorchAX ({args.dtype}, attn={args.attn_implementation})"
+    )
     sub = FrozenSubstrate(
         model_id_or_model=args.model,
         tokenizer=tokenizer,
+        torch_dtype=selected_dtype,
+        attn_implementation=args.attn_implementation,
     )
     arch = sub.architecture
     layers = parse_layers(args.layers, arch.num_layers)

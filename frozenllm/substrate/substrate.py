@@ -97,6 +97,8 @@ class FrozenSubstrate:
         min_memory_headroom: float = 0.5,
         tokenizer: Any = None,
         params: Mapping[str, Any] | None = None,
+        torch_dtype: torch.dtype | str = torch.float32,
+        attn_implementation: str | None = "eager",
     ) -> None:
         if model_id_or_model is None:
             if params is not None:
@@ -132,7 +134,11 @@ class FrozenSubstrate:
 
         # 1. Load or accept PyTorch model and tokenizer
         if isinstance(model_id_or_model, str):
-            model, params = load_torchax_model(model_id_or_model)
+            model, params = load_torchax_model(
+                model_id_or_model,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+            )
             config = config or getattr(model, "config", None)
             if self._tokenizer is None:
                 try:

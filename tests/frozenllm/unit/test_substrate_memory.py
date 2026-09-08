@@ -4,12 +4,13 @@ Tests that require a real accelerator are skipped automatically on CPU-only
 environments (e.g. CI) instead of failing.
 """
 
+
 from __future__ import annotations
 
 import jax
 import pytest
 
-from frozenllm.substrate import (
+from frozenllm.substrate.memory import (
     MemoryStatus,
     check_memory_headroom,
     compute_memory_headroom,
@@ -156,7 +157,7 @@ class TestDrift:
     def test_kl_zero_for_identical(self):
         import jax.numpy as jnp
 
-        from frozenllm.substrate import compute_kl_drift
+        from frozenllm.substrate.drift import compute_kl_drift
 
         logits = jnp.array(
             [
@@ -172,7 +173,7 @@ class TestDrift:
     def test_kl_positive_for_different(self):
         import jax.numpy as jnp
 
-        from frozenllm.substrate import compute_kl_drift
+        from frozenllm.substrate.drift import compute_kl_drift
 
         a = jnp.array([[1.0, 2.0, 3.0]])
         b = jnp.array([[3.0, 2.0, 1.0]])
@@ -185,7 +186,7 @@ class TestDrift:
         # Extreme logits must not produce NaN.
         import jax.numpy as jnp
 
-        from frozenllm.substrate import compute_kl_drift
+        from frozenllm.substrate.drift import compute_kl_drift
 
         a = jnp.array([[1e10, -1e10, 0.0]])
         b = jnp.array([[-1e10, 1e10, 0.0]])

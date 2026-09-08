@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from .torchax_backend import enable_torchax, to_torchax_device
+from frozenllm.substrate.torchax_backend import enable_torchax, to_torchax_device
 
 _SUPPORTED_MODEL_TYPES = {"gpt2", "gpt_neox"}
 

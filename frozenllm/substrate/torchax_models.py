@@ -5,7 +5,7 @@ from typing import Any
 import torch
 from torch.func import functional_call
 
-from .torchax_backend import enable_torchax, to_torchax_device
+from frozenllm.substrate.torchax_backend import enable_torchax, to_torchax_device
 
 
 def functional_model(

@@ -17,14 +17,14 @@ import jax.numpy as jnp
 import torch
 from flax.core import freeze, unfreeze
 
-from .architecture import (
+from frozenllm.substrate.architecture import (
     Architecture,
     detect_architecture,
     validate_interception_layers,
 )
-from .interception import identity_modify, run_with_hooks
+from frozenllm.substrate.interception import identity_modify, run_with_hooks
 from .loader import load_tokenizer, load_torchax_model
-from .memory import (
+from frozenllm.substrate.memory import (
     MemoryStatus,
     check_memory_headroom,
     get_memory_status,

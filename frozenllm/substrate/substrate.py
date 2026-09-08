@@ -5,6 +5,7 @@ Forward passes execute the monolithic model on TorchAX with per-layer
 hidden-state interception via forward hooks, returning JAX-compatible
 logits and intermediate states.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence

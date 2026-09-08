@@ -14,7 +14,9 @@ import numpy as np
 import pytest
 import torch
 
-from substrate import FrozenJAXSubstrate, state_dict_to_jax_pytree
+# Workaround for torchax expecting sub-byte float dtypes missing in torch 2.6
+if not hasattr(torch, "float4_e2m1fn_x2"):
+    torch.float4_e2m1fn_x2 = object()
 
 GPT2_CFG: dict[str, Any] = {
     "n_layer": 12,
@@ -69,20 +71,6 @@ def _config(family: str):
     from transformers import GPTNeoXConfig
 
     return GPTNeoXConfig(**NEOX_CFG)
-
-
-def make_substrate(family: str, intercept_layers=None, modify_hook=None, seed: int = 0):
-    """Build the torch reference model plus a FrozenJAXSubstrate wrapper."""
-    model = _torch_model(family, seed=seed)
-    model.eval()
-    params = state_dict_to_jax_pytree(model.state_dict())
-    substrate = FrozenJAXSubstrate(
-        params,
-        _config(family),
-        intercept_layers=intercept_layers,
-        modify_hook=modify_hook,
-    )
-    return model, substrate
 
 
 def torch_logits(model, ids):

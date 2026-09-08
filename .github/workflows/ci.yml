@@ -63,15 +63,22 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: pip install -e .[dev]
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==2.6.0"
+          pip install -e .[dev]
+
 
       - name: Run unit tests (if they exist)
         run: |
-          if [ -d "tests/unit" ] && [ "$(ls -A tests/unit 2>/dev/null)" ]; then
+          if [ -d "tests/frozenllm/unit" ] && [ "$(ls -A tests/frozenllm/unit 2>/dev/null)" ]; then
+            pytest tests/frozenllm/unit/ -v --tb=short
+          elif [ -d "tests/unit" ] && [ "$(ls -A tests/unit 2>/dev/null)" ]; then
             pytest tests/unit/ -v --tb=short
           else
             echo "No unit tests found. Skipping."
           fi
+
 
       - name: Run grammar integration tests (if they exist)
         run: |

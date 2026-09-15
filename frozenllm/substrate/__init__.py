@@ -19,9 +19,6 @@ from .architecture import (
     discover_layers,
     discover_layers_from_config,
     get_block_accessor,
-    get_embedding_module,
-    get_head_modules,
-    get_position_embedding_module,
     validate_interception_layers,
 )
 from .drift import compute_kl_drift
@@ -65,9 +62,6 @@ __all__ = [
     "discover_layers",
     "discover_layers_from_config",
     "get_block_accessor",
-    "get_embedding_module",
-    "get_head_modules",
-    "get_position_embedding_module",
     "validate_interception_layers",
     # Substrate & Execution
     "ForwardResult",

@@ -422,21 +422,6 @@ class FrozenSubstrate:
         }
         return result, report
 
-    # ── forward internals (pure, JIT-safe legacy fallback) ──────────────────
-
-    @staticmethod
-    def _run_forward_legacy(
-        params: Any,
-        arch: Architecture,
-        intercept_layers: tuple[int, ...],
-        hook: Callable[[jax.Array, int], jax.Array],
-        input_ids: jax.Array,
-    ) -> tuple[jax.Array, dict[int, jax.Array]]:
-        raise NotImplementedError(
-            "Legacy pure-JAX forward execution via models.py was removed in favor of "
-            "monolithic TorchAX execution. Use FrozenSubstrate with live models."
-        )
-
     def __repr__(self) -> str:
         return (
             f"FrozenSubstrate(model_family={self._architecture.model_family!r}, "

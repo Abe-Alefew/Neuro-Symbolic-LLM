@@ -345,6 +345,7 @@ def run_sequential(
     objective_cfg: Any,
     training: TrainingConfig,
     writer: RunWriter,
+    optimizer: optax.GradientTransformation | None = None,
 ) -> tuple[AdapterParams, dict[str, Any]]:
     if not domains:
         raise ValueError("At least one domain is required.")
@@ -363,7 +364,9 @@ def run_sequential(
     # after_task=-1: before training, where adapted equals base.
     init = eval_all(-1)
 
-    optimizer = optax.adam(training.learning_rate)
+    # Stages with extra trainable groups (A2 predictor) can pass their own optimizer.
+    if optimizer is None:
+        optimizer = optax.adam(training.learning_rate)
     grad_fn = jax.value_and_grad(objective_fn, has_aux=True)
 
     def train_step(
@@ -566,3 +569,4 @@ __all__ = [
     "run_sequential",
     "summarize",
 ]
+

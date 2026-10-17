@@ -1,0 +1,64 @@
+# Stage A2 (local-predictor part)
+adapter:
+  rank: 16
+  activation: identity  # identity | gelu | relu | tanh
+  alpha: null
+  init_std: null
+  late_start: null
+  late_end: null
+  layers: null
+  seed: 0
+objective:
+  lambda_kl: 0.0
+  lambda_wd: 0.0
+  lambda_hid: 0.1                        # weight of L_hidden-pred (0 disables the predictor term)
+  hidden_target: corrected_teacher       # corrected_teacher (review Option B) | base_anchor (Option A)
+  hidden_norm: target_var                # target_var (MSE / target variance) | none (plain MSE)
+  skip_first_token: true                 # drop position 0 (GPT-2 massive activations) from L_hidden-pred
+  predictor_lr_mult: 1.0                 # predictor lr = training.learning_rate * this
+  predictor:                             # P_l(u) = W2 GELU(W1 LN(u) + b1) + b2, FabricPC nodes
+    ff_dim: 256
+    out_init_std: null                   
+    predict_delta: false                 
+    detach_input: true                   
+    layers: null                         
+  stability:                             
+    mode: "off"                          
+    layers: null                         
+    delta: 1.0e-6                        
+training:
+  model: gpt2
+  seq_len: 128
+  batch_size: 8
+  epochs: 3
+  learning_rate: 1.0e-3
+  eval_batches: 8
+  log_every: 10
+  seed: 0
+  reset_optimizer: true
+  output_dir: runs
+# Same three LexGLUE legal domains as A1, trained in order, so A2 is directly comparable to A1.
+domains:
+  - name: eurlex
+    dataset: coastalcph/lex_glue
+    dataset_config: eurlex
+    train_split: "train[:5000]"
+    eval_split: "validation[:500]"
+    test_split: "test[:500]"
+    separator: "\n\n"
+
+  - name: ledgar
+    dataset: coastalcph/lex_glue
+    dataset_config: ledgar
+    train_split: "train[:20000]"
+    eval_split: "validation[:2000]"
+    test_split: "test[:2000]"
+    separator: "\n\n"
+
+  - name: scotus
+    dataset: coastalcph/lex_glue
+    dataset_config: scotus
+    train_split: "train[:500]"
+    eval_split: "validation[:200]"
+    test_split: "test[:200]"
+    separator: "\n\n"

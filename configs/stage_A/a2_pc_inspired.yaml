@@ -1,0 +1,76 @@
+# Stage A2: the A1 hidden-state residual adapter + PC-inspired auxiliary losses.
+# Backprop only (no settling). Keys mirror ResidualConfig / A2Config / TrainingConfig /
+# DomainConfig; unknown keys are rejected. See stages/stage_A/a2.py.
+#
+# L = L_task + lambda_kl*KL + lambda_wd*||phi||^2 + lambda_cp*L_cpc + lambda_stab*L_stab
+# Set a weight to 0 to switch its term (and its heads) off; all of cpc/stab at 0 is A1.
+adapter:
+  rank: 16
+  activation: identity  # identity | gelu | relu | tanh
+  alpha: null
+  init_std: null
+  late_start: null
+  late_end: null
+  layers: null
+  seed: 0
+objective:
+  lambda_kl: 0.0
+  lambda_wd: 0.0
+  seed: 0               # seed of the auxiliary heads / fixed-random highway
+  # Contrastive future loss (InfoNCE on a q-projected code; heads are FabricPC nodes).
+  cpc:
+    weight: 0.05        # lambda_cp; first runs: small
+    offsets: [1]        # future offsets k (paper: 1, 2, 4); one predictor per offset
+    dim: 32             # width m of the CPC code (32 or 64)
+    tau: 0.1            # temperature (0.05 - 0.2)
+    positive: base      # base | corrected: the positive's source (stop-gradient)
+    max_anchors_per_seq: 256
+    a_init_noise: 0.01
+    heads: fabricpc     # fabricpc | jax (reference)
+  # Stability: w_anch * L_zanch (anchor to the base state) + w_hep * L_hep-nudge.
+  stab:
+    weight: 0.1         # lambda_stab
+    w_anch: 1.0
+    w_hep: 0.0          # > 0 needs hep.kind: lowrank (or dense) = a trainable highway
+    normalize: relative # relative | none
+    backend: fabricpc   # fabricpc | jax (reference)
+    hep:
+      kind: fixed_random  # null | dense | lowrank | fixed_random (tied: not wired yet)
+      rank: 16
+      alpha: 1.0
+training:
+  model: gpt2
+  seq_len: 128
+  batch_size: 8
+  epochs: 3
+  learning_rate: 1.0e-3
+  eval_batches: 8
+  log_every: 10
+  seed: 0
+  reset_optimizer: true
+  output_dir: runs
+# Same three legal domains as A1 (LexGLUE), trained in order.
+domains:
+  - name: eurlex
+    dataset: coastalcph/lex_glue
+    dataset_config: eurlex
+    train_split: "train[:5000]"
+    eval_split: "validation[:500]"
+    test_split: "test[:500]"
+    separator: "\n\n"
+
+  - name: ledgar
+    dataset: coastalcph/lex_glue
+    dataset_config: ledgar
+    train_split: "train[:20000]"
+    eval_split: "validation[:2000]"
+    test_split: "test[:2000]"
+    separator: "\n\n"
+
+  - name: scotus
+    dataset: coastalcph/lex_glue
+    dataset_config: scotus
+    train_split: "train[:500]"
+    eval_split: "validation[:200]"
+    test_split: "test[:200]"
+    separator: "\n\n"

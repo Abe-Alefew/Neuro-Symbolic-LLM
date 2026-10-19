@@ -2,21 +2,22 @@
 # Backprop only (no settling). Keys mirror ResidualConfig / A2Config / TrainingConfig /
 # DomainConfig; unknown keys are rejected. See stages/stage_A/a2.py.
 #
-# L = L_task + lambda_kl*KL + lambda_wd*||phi||^2 + lambda_cp*L_cpc + lambda_stab*L_stab
-# Set a weight to 0 to switch its term (and its heads) off; all of cpc/stab at 0 is A1.
+# L = L_task + lambda_kl*KL + lambda_wd*||phi||^2
+#   + lambda_cp*L_cpc + lambda_stab*(w_anch*L_zanch + w_hep*L_hep) + lambda_hid*L_hid
+# Set a weight to 0 to switch its term (and its heads) off
 adapter:
-  rank: 16
-  activation: identity  # identity | gelu | relu | tanh
-  alpha: null
-  init_std: null
-  late_start: null
+  rank: 16              # LoRA-equivalent rank matching paper Sec 12.2 (r=16)
+  activation: identity  # Linear residual adapter matching standard LoRA (BA) parameterization
+  alpha: 16             # LoRA scaling parameter: scale = alpha / rank = 1.0
+  init_std: null        # Default Gaussian 1/sqrt(d) for A, zeros for B (zero residual init)
+  late_start: null      # Targets late blocks (L//2, L-2], paper Sec 7.2 & 12.2 (L_sym = L/4)
   late_end: null
   layers: null
   seed: 0
 objective:
-  lambda_kl: 0.0
+  lambda_kl: 0.0        # Same meaning as in A1
   lambda_wd: 0.0
-  seed: 0               # seed of the auxiliary heads / fixed-random highway
+  seed: 0               # seed of the auxiliary heads / predictors / fixed-random highway
   # Contrastive future loss (InfoNCE on a q-projected code; heads are FabricPC nodes).
   cpc:
     weight: 0.05        # lambda_cp; first runs: small
@@ -38,18 +39,37 @@ objective:
       kind: fixed_random  # null | dense | lowrank | fixed_random (tied: not wired yet)
       rank: 16
       alpha: 1.0
+  # Hidden prediction: P_l(h~_l) predicts the next frozen block's output (stop-gradient target).
+  hid:
+    weight: 0.1         # lambda_hid; 0 switches the term and the predictors off
+    hidden_norm: target_var  # target_var (scale-free) | none (plain MSE)
+    skip_first_token: true   # position 0 has no left context
+    predictor:
+      ff_dim: 256       # hidden width of P_l = W2 GELU(W1 LN(u) + b1) + b2
+      out_init_std: null  # std of W2 at init (null: the FabricPC default)
+      predict_delta: false  # true: P_l(u) = u + MLP(u)
+      detach_input: false   # true: only P_l trains (negative control); false: the adapter too
+      layers: null      # null: every adapted layer that has a following block
+      seed: null        # null: objective.seed
+  # Stability metrics, logged but never in the loss: residual smoothness
+  # (res_smooth, input_smooth, res_vs_input) and the settling-step metrics (0 in A2).
+  monitor:
+    mode: diagnostic    # off | diagnostic
+    layers: null        # null: every adapted layer
+    delta: 1.0e-6
 training:
-  model: gpt2
-  seq_len: 128
-  batch_size: 8
-  epochs: 3
-  learning_rate: 1.0e-3
-  eval_batches: 8
-  log_every: 10
-  seed: 0
-  reset_optimizer: true
+  model: gpt2           # 124M base transformer (Experiment A-small, paper Sec 17.1)
+  seq_len: 128          # Fixed sequence block length
+  batch_size: 16        # Balanced batch size ensuring memory headroom (paper App F) and stability on smaller domains
+  epochs: 3             # Standard adapter fine-tuning baseline (1-3 epochs)
+  learning_rate: 1.0e-3 # Standard Adam learning rate for rank-16 adapters
+  eval_batches: 8       # Fixed evaluation sample size
+  log_every: 10         # Metric logging interval
+  seed: 0               # Global training seed
+  reset_optimizer: true # Fresh Adam moments per domain to isolate sequential domain transfer
   output_dir: runs
-# Same three legal domains as A1 (LexGLUE), trained in order.
+  jit: true             # JAX XLA JIT compilation for static execution graph and kernel fusion
+# Three related legal domains (LexGLUE) trained in order: shared legal language,
 domains:
   - name: eurlex
     dataset: coastalcph/lex_glue

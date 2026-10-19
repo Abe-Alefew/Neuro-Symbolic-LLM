@@ -381,29 +381,7 @@ def hep_nudge_loss(
     return loss, metrics
 
 
-def hidden_prediction_loss(
-    pred: jax.Array, target: jax.Array, source: jax.Array, config: Any
-) -> dict[str, jax.Array]:
-    """Compute hidden-prediction loss and its scale-free diagnostics.
 
-    ``pred``, ``target`` and ``source`` have shape ``[B, S, D]``. The target
-    is always detached. ``loss`` is target-variance-normalized unless
-    ``config.hidden_norm`` is ``"none"``.
-    """
-    target = jax.lax.stop_gradient(target.astype(jnp.float32))
-    source = source.astype(jnp.float32)
-    if config.skip_first_token:
-        pred, target, source = pred[:, 1:], target[:, 1:], source[:, 1:]
-    mse = jnp.mean(jnp.square(pred - target))
-    var = jnp.mean(jnp.var(target, axis=(0, 1))) + _VAR_FLOOR
-    copy_mse = jnp.mean(jnp.square(jax.lax.stop_gradient(source) - target))
-    rel = mse / var
-    return {
-        "loss": rel if config.hidden_norm == "target_var" else mse,
-        "mse": mse,
-        "rel": rel,
-        "copy_rel": copy_mse / var,
-    }
 
 
 def collect_stability_metrics(

@@ -1,24 +1,4 @@
-"""Highway error propagation (HEP) matrices ``V_{y -> i}`` for the stability loss.
-
-HEP sends the output error ``eps_y`` straight to a hidden state ``i`` through a
-matrix ``V_{y -> i}`` (``[d_y, d_i]``), scaled by a gain ``alpha_y``; the nudge
-injected into state ``i`` is ``alpha_y * eps_y @ V_{y -> i}``. This module only
-provides the matrices; the nudge and its norm penalty are in ``aux_losses.py``.
-
-Four kinds (research note: dense is fine for char-level vocabularies, use
-low-rank, tied or fixed-random for BPE):
-
-    dense         V trainable, ``[d_y, d_i]``
-    lowrank       V = U @ W, both trainable, ``[d_y, r]`` and ``[r, d_i]``
-    fixed_random  V = U @ W with random constant factors (not parameters)
-    tied          V supplied by the caller, e.g. the frozen LM head (not a parameter)
-
-Only ``dense`` and ``lowrank`` live in the parameter tree, under
-``hep_<layer>``; fixed matrices must NOT be parameters (the Adam loop would
-otherwise update them).
-
-    {"hep_7": {"V": f32[d_y, d_i]}}                      # dense
-    {"hep_7": {"U": f32[d_y, r], "W": f32[r, d_i]}}      # lowrank
+""" Highway error propagation (HEP) matrices ``V_{y -> i}`` for the stability loss.
 """
 
 from __future__ import annotations

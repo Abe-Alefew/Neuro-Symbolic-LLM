@@ -1,22 +1,5 @@
 """Squared-error energies of the A2 stability terms, computed by FabricPC nodes.
 
-Both stability terms are Gaussian prediction-error energies, which FabricPC
-evaluates per sample as ``0.5 * ||target - mu||^2``:
-
-* anchor:  a source node holding ``h~`` feeds an ``IdentityNode``; the anchor
-  ``sg(h^base)`` is clamped as its target, so ``mu = h~`` and the energy is
-  ``0.5 * ||h~ - h^base||^2``.
-* HEP:     a source node holding ``eps`` feeds ``Linear`` node(s) that apply the
-  highway ``V`` (one node for a dense ``V``, two for a low-rank ``U @ W``); the
-  target is clamped to zero, so the energy is ``0.5 * ||eps V||^2``.
-
-Every token is one sample (tokens are folded into the batch axis, so the graphs do
-not depend on the sequence length), and the functions return the *squared norm*
-per token, ``2 * energy``, shaped like the input without its last axis. Masking,
-averaging and normalisation stay in ``aux_losses.py``. There is no inference or
-settling: only the feed-forward value of the nodes is used, so gradients are the
-ordinary autodiff gradients of the energy (the same numbers as ``backend="jax"``,
-which is the test oracle).
 """
 
 from __future__ import annotations

@@ -1,12 +1,4 @@
-"""Pure auxiliary losses on residual-corrected hidden states (stage-agnostic).
-
-No substrate, no config objects: arrays and head parameters in, ``(scalar,
-metrics)`` out, all in float32. Stage code (``stages/stage_A/a2*.py``) decides
-which hidden states to feed in and with which weight.
-
-Tensor convention (settling-ready): hidden states are ``[..., B, T, d]``. The
-extra leading axes (e.g. K settling steps in Stage A3) are treated as more
-samples of the *same* sequences; A2 passes plain ``[B, T, d]``.
+""" auxiliary losses on residual-corrected hidden states.
 """
 
 from __future__ import annotations
@@ -26,22 +18,12 @@ from residual.hep import Highway, apply_highway
 _NEG = -1e30
 _EPS = 1e-8
 
-from residual import ResidualAdapter
-from residual.stability import (
-    STEP_KEYS,
-    StabilityMonitor,
-    residual_smoothness,
-    step_metrics,
-)
+from residual import adapter
 
-_VAR_FLOOR = 1e-6
+
+
 A2_LOSS_KEYS = ("task", "kl", "wd", "hid")
-STABILITY_METRIC_KEYS = (
-    "res_smooth",
-    "input_smooth",
-    "res_vs_input",
-    *STEP_KEYS,
-)
+
 
 
 def _l2_normalize(x: jax.Array) -> jax.Array:
@@ -50,10 +32,6 @@ def _l2_normalize(x: jax.Array) -> jax.Array:
 
 def anchor_positions(num_positions: int, max_anchors: int | None) -> tuple[int, ...]:
     """Deterministic anchor subsampling: every ``stride``-th position from 0.
-
-    ``stride = ceil(num_positions / max_anchors)``, so at most ``max_anchors``
-    positions are kept; ``None`` keeps all of them. No RNG: objectives receive
-    neither a step counter nor a key.
     """
     if num_positions < 1:
         raise ValueError(f"num_positions must be >= 1, got {num_positions}")
@@ -85,36 +63,7 @@ def contrastive_future_loss(
         positive   y_{b,t} = normalize( stop_gradient( q(targets[b, t + offset]) ) )
 
         L = mean_{b,t}  -log  exp(z.y_pos / tau) / ( exp(z.y_pos / tau) + sum_neg exp(z.y_neg / tau) )
-
-    Negatives are the positives of *other* sequences of the batch only; entries
-    of the same sequence (other positions, other leading-axis samples) are never
-    used as negatives. A batch with a single sequence has no negatives: the loss
-    is 0 (finite, zero gradient) and ``cpc_valid`` is 0.
-
-    Padding: with ``mask`` (``True`` = real token), an anchor ``(b, t)`` is used only
-    if both ``t`` and ``t + offset`` are real tokens; a masked-out position is neither
-    an anchor, nor a positive, nor a negative, and does not count in the mean or the
-    metrics. Anchors with no valid negative (every other sequence masked out there)
-    are dropped from the mean as well.
-
-    Args:
-        q_params: ``{"W": [d, m]}`` projection head.
-        a_params: ``{"M": [m, m]}`` predictor head for this ``offset``.
-        anchors: corrected hidden states ``h~``, ``[..., B, T, d]``; carries the
-            gradient into the adapter and the heads.
-        targets: hidden states the positives are read from (``h^base`` or
-            ``h~``), same shape. Always under ``stop_gradient`` here.
-        offset: ``k >= 1``, how far ahead the positive is; ``k < T``.
-        tau: softmax temperature (> 0).
-        max_anchors_per_seq: keep at most this many anchor positions per
-            sequence (deterministic stride); ``None`` keeps all.
-        mask: optional ``[B, T]`` (or ``[..., B, T]``) boolean validity of each token
-            (``False`` for padding); ``None`` treats every token as real.
-        backend: ``"fabricpc"`` (heads run as FabricPC nodes) or ``"jax"`` (reference).
-
-    Returns:
-        ``(loss, metrics)``; ``metrics`` has ``cpc_top1``, ``cpc_pos_sim``,
-        ``cpc_neg_sim``, ``cpc_n_anchors`` and ``cpc_valid`` (float32 scalars).
+    
     """
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
         raise ValueError(f"offset must be an integer >= 1, got {offset!r}")
@@ -213,7 +162,7 @@ def contrastive_future_loss(
     return loss.astype(jnp.float32), metrics
 
 
-# --- stability: anchor loss and HEP nudge ---------------------------------------------------
+# --- stability: anchor loss and HEP nudge 
 
 
 def _masked_mean(x: jax.Array, mask: jax.Array | None) -> jax.Array:
@@ -236,26 +185,6 @@ def anchor_loss(
 
         L = mean_{...,b,t} || z - sg(z_anchor) ||^2        (``normalize="none"``)
         L = that / ( mean || sg(z_anchor) ||^2 + eps )     (``normalize="relative"``)
-
-    The note sums over layers, positions and settling steps; the mean (and the
-    relative scaling) only rescales the weight ``w_anch`` so it is comparable
-    across layers and models.
-
-    Args:
-        z: the state kept near the anchor, ``[..., B, T, d]``. In A2 this is the
-            corrected hidden state ``h~``; in A3 it may carry a leading
-            settling-step axis ``S``.
-        z_anchor: feed-forward anchor (A2: ``h^base``), ``[B, T, d]`` or the same
-            shape as ``z``. Always under ``stop_gradient``.
-        mask: optional ``[B, T]`` validity mask (``False`` = padding).
-        backend: ``"fabricpc"``: the squared distance is the Gaussian energy of an
-            ``IdentityNode`` with the anchor clamped as its target; ``"jax"``: plain
-            array arithmetic (the test oracle). Same values and gradients.
-
-    Returns:
-        ``(loss, metrics)`` with ``anch_dist`` (mean L2 distance) and
-        ``anch_ratio`` (RMS distance over RMS anchor norm; in A2 this is
-        ``||R|| / ||h||`` at the site).
     """
     if normalize not in ("relative", "none"):
         raise ValueError(f"normalize must be 'relative' or 'none', got {normalize!r}")
@@ -288,15 +217,6 @@ def anchor_loss(
 
 def output_error(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Output error ``eps_y = softmax(logits) - onehot(next token)``.
-
-    This is the gradient of the cross-entropy w.r.t. the logits, i.e. the error
-    HEP broadcasts to hidden states. Position ``t`` of the result is the error of
-    the prediction made *at* ``t`` (label ``t + 1``), so the result has ``T - 1``
-    positions. Labels equal to ``-100`` are ignored (zero error, ``mask`` False).
-    The logits are under ``stop_gradient`` here.
-
-    Returns:
-        ``(eps, mask)`` with shapes ``[B, T-1, V]`` and ``[B, T-1]``.
     """
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError(
@@ -331,28 +251,7 @@ def hep_nudge_loss(
     """HEP-nudge penalty ``L_hep-nudge``: the squared size of the injected nudge.
 
         L = mean_{...,b,t} || alpha * sg(eps) @ V ||^2
-        L = that / ( mean || sg(reference) ||^2 + eps )      if ``reference`` is given
-
-    ``eps`` is under ``stop_gradient`` (as in the note), so the only trainable
-    inputs are ``V`` and ``alpha``: this term shrinks the highway, it never moves
-    the residual. With a fixed ``V`` and ``alpha`` it has no gradient at all and
-    is only worth reading as the metric ``hep_nudge_norm``.
-
-    Args:
-        eps: output error ``[..., B, T, d_y]`` (see ``output_error``; a leading
-            settling-step axis is allowed).
-        v: ``[d_y, d_i]`` matrix or a ``(U, W)`` low-rank pair.
-        alpha: gain ``alpha_y`` (> 0 gives a non-trivial penalty).
-        reference: state the nudge is injected into, ``[..., B, T, d_i]``, used
-            only to scale the penalty (nudge-to-state ratio).
-        mask: optional ``[B, T]`` validity mask.
-        backend: ``"fabricpc"``: ``V`` is one (dense) or two (low-rank) ``Linear``
-            nodes with the target clamped to zero, so the squared norm is the node's
-            Gaussian energy; ``"jax"``: plain matrix products (the test oracle).
-
-    Returns:
-        ``(loss, metrics)`` with ``hep_nudge_norm`` (mean L2 norm of the nudge)
-        and, with ``reference``, ``hep_nudge_ratio`` (RMS nudge over RMS state).
+        L = that / ( mean || sg(reference) ||^2 + eps ) 
     """
     if eps.ndim < 3:
         raise ValueError(f"expected eps [..., B, T, d_y], got shape {eps.shape}")
@@ -382,24 +281,6 @@ def hep_nudge_loss(
 
 
 
-
-
-def collect_stability_metrics(
-    monitor: StabilityMonitor,
-    adapter: ResidualAdapter,
-    adapter_params: Mapping[str, Any],
-    site_inputs: Mapping[int, jax.Array],
-    corrected: Mapping[int, jax.Array] | None = None,
-) -> dict[str, jax.Array]:
-    """Collect A2 stability metrics without adding them to the loss."""
-    return monitor.metrics(
-        adapter,
-        adapter_params,
-        site_inputs,
-        corrected=corrected,
-    )
-
-
 __all__ = [
     "anchor_loss",
     "anchor_positions",
@@ -407,10 +288,4 @@ __all__ = [
     "hep_nudge",
     "hep_nudge_loss",
     "output_error",
-    "A2_LOSS_KEYS",
-    "STABILITY_METRIC_KEYS",
-    "collect_stability_metrics",
-    "hidden_prediction_loss",
-    "residual_smoothness",
-    "step_metrics",
 ]

@@ -3,21 +3,6 @@
 
     c_t = q_l(h~_t) = LN(h~_t) @ W        W: [d, m]
     z_t = A_{l,k}(c_t) = c_t @ M          M: [m, m]   (predicts the code k steps ahead)
-
-The two matrix products are FabricPC nodes (the default ``backend="fabricpc"``):
-``q`` is a bias-free ``Linear`` node fed by the parameter-free LayerNorm, and ``A`` is
-a bias-free ``Linear`` node. Each runs as a tiny two-node FabricPC graph whose
-feed-forward value is the head's output; there is no inference/settling, so
-gradients come from ordinary autodiff of the loss, exactly as with
-``backend="jax"``, the pure-JAX reference used as the test oracle. The weights
-stay in the flat A2 parameter tree (below); a FabricPC ``GraphParams`` is built
-from them at call time, so nothing FabricPC-specific is stored or checkpointed.
-
-Parameters are stored in the flat, prefixed, two-level layout shared with the
-adapter tree, so ``RunWriter.save_params`` and ``ResidualAdapter.modify_fn``
-(which ignores unknown keys) work unchanged:
-
-    {"cpcq_7": {"W": f32[d, m]}, "cpca_7_1": {"M": f32[m, m]}, ...}
 """
 
 from __future__ import annotations

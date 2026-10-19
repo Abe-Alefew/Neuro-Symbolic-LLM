@@ -39,20 +39,7 @@ objective:
       kind: fixed_random  # null | dense | lowrank | fixed_random (tied: not wired yet)
       rank: 16
       alpha: 1.0
-  # Hidden prediction: P_l(h~_l) predicts the next frozen block's output (stop-gradient target).
-  hid:
-    weight: 0.1         # lambda_hid; 0 switches the term and the predictors off
-    hidden_norm: target_var  # target_var (scale-free) | none (plain MSE)
-    skip_first_token: true   # position 0 has no left context
-    predictor:
-      ff_dim: 256       # hidden width of P_l = W2 GELU(W1 LN(u) + b1) + b2
-      out_init_std: null  # std of W2 at init (null: the FabricPC default)
-      predict_delta: false  # true: P_l(u) = u + MLP(u)
-      detach_input: false   # true: only P_l trains (negative control); false: the adapter too
-      layers: null      # null: every adapted layer that has a following block
-      seed: null        # null: objective.seed
-  # Stability metrics, logged but never in the loss: residual smoothness
-  # (res_smooth, input_smooth, res_vs_input) and the settling-step metrics (0 in A2).
+
   monitor:
     mode: diagnostic    # off | diagnostic
     layers: null        # null: every adapted layer

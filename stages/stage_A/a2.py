@@ -4,41 +4,6 @@
          + lambda_cp   * L_cpc                                               (contrastive future)
          + lambda_stab * (w_anch * L_zanch + w_hep * L_hep-nudge)            (stability)
          + lambda_hid  * L_hid                                               (hidden prediction)
-
-plus stop-gradient stability *metrics* (residual smoothness, settling-step metrics) that are
-logged but never enter the loss.
-
-Backprop only: there is no settling in A2, so "PC-inspired" means the auxiliary
-*losses* are PC-flavoured, not that the weights are trained by predictive coding.
-Where FabricPC applies (the CPC heads, the squared-error energies of the anchor and
-HEP terms, and the hidden predictors ``P_l``) it supplies the nodes; the pure math
-lives in ``residual/``.
-
-Everything stage-level is in this one file, in this order:
-
-1. configuration   ``CPCConfig``, ``HEPConfig``, ``StabilityConfig``, ``HiddenConfig``,
-                   ``MonitorConfig``, ``A2Config``
-2. parameters      ``init_a2_params`` and friends (one flat, two-level tree)
-3. terms           ``cpc_term``, ``stability_term``, ``hid_term``: pure functions of
-                   hidden-state dictionaries, so they never touch the substrate
-4. objective       ``a2_objective``: the A1 ``Objective`` contract for ``run_sequential``
-5. arms            ``ARMS`` / ``apply_arm``: which terms an ablation arm switches on
-6. audit           ``a2_audit``: checkpoints to inspect (finite, A1 parity, gradient routing, ...)
-
-``L_step`` and ``L_res-smooth`` are *metrics* in A2 (``MonitorConfig``, computed by
-``residual.stability``): A2 has no settling, so the step metrics are exactly 0 and the
-smoothness metric is only worth adding to the loss if it shows a problem.
-
-Parameter tree (``run_sequential`` differentiates all of it with one optimiser)::
-
-    layer_<l>      {A, B}        adapter                  (A1)
-    cpcq_<l>       {W}           CPC projection q_l       (lambda_cp > 0)
-    cpca_<l>_<k>   {M}           CPC predictor A_{l,k}    (lambda_cp > 0)
-    hep_<l>        {V} | {U, W}  trainable highway        (lambda_stab > 0, hep.kind dense / lowrank)
-    pred_layer_<l> {node.w.W, ...}  hidden predictor P_l   (lambda_hid > 0)
-
-``ResidualAdapter.num_params`` and ``l2_norm_sq`` must only see the ``layer_<l>``
-sub-tree (``adapter_params``): the weight decay of A1 is on the adapter alone.
 """
 
 from __future__ import annotations
@@ -279,12 +244,6 @@ HIDDEN_NORMS = ("target_var", "none")
 @dataclass(frozen=True)
 class HiddenConfig:
     """``objective.hid`` section of the A2 YAML: the hidden-prediction loss ``L_hid``.
-
-    A local predictor ``P_l`` guesses the *next* frozen block's output from the corrected
-    state: ``L_hid = mean_l || P_l(h~_l) - sg(h_{l+1}) ||^2``, where ``h_{l+1}`` is the
-    output of block ``l+1`` of the adapted pass (the next frozen block applied to the
-    corrected state). ``predictor.detach_input`` decides whether the predictor error can
-    reach the adapter (``false``) or only trains ``P_l`` (``true``, a negative control).
     """
 
     # lambda_hid; 0 switches the term (and the predictors) off.
@@ -421,10 +380,6 @@ def predictor_bank(
     config: HiddenConfig, adapter: ResidualAdapter
 ) -> LocalPredictorBank:
     """The predictors ``P_l`` of ``config`` for ``adapter``'s sites (built once, then reused).
-
-    Sites default to the adapted layers that have a following block;
-    ``hid.predictor.layers`` overrides. The bank only holds the FabricPC graph, never
-    parameters, so sharing it is safe.
     """
     p = config.predictor
     arch = adapter.architecture
@@ -987,11 +942,6 @@ def a2_audit(
 ) -> list[Check]:
     """Run the A2 checkpoints once on ``input_ids`` and return them.
 
-    The checks use a fresh ``init_a2_params(config, adapter)`` tree. Because ``B = 0``
-    at init (so ``A`` gets no gradient and the anchor is 0), the gradient and
-    magnitude checks use a *probe*: the same tree with a random ``B`` of scale
-    ``probe_scale``. ``ok=False`` is a failure; ``ok=None`` is information (for example
-    the gradient ratios that help to choose the lambdas).
     """
     checks: list[Check] = []
 

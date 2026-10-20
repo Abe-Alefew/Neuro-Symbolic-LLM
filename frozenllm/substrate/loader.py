@@ -19,8 +19,6 @@ def load_torchax_model(
     attn_implementation: str | None = "eager",
     torch_dtype: torch.dtype | str | None = None,
 ) -> tuple[torch.nn.Module, dict[str, torch.Tensor]]:
-    enable_torchax()
-
     config = AutoConfig.from_pretrained(model_id, revision=revision)
     if config.model_type not in _SUPPORTED_MODEL_TYPES:
         raise ValueError(
@@ -50,6 +48,11 @@ def load_torchax_model(
                 model_id, revision=revision, **load_kwargs
             )
 
+    # Load the Transformers model as a normal PyTorch module first.  Recent
+    # Transformers versions lazily import torchvision while resolving model
+    # classes; enabling TorchAX before that import can route torchvision's
+    # CUDA-version probe through TorchAX, where the operator is unsupported.
+    enable_torchax()
     model.eval()
     model = to_torchax_device(model)
 

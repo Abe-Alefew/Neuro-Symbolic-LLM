@@ -18,6 +18,21 @@ objective:
   lambda_kl: 0.0        # Same meaning as in A1
   lambda_wd: 0.0
   seed: 0               # seed of the auxiliary heads / predictors / fixed-random highway
+  lambda_hid: 0.1                        # weight of L_hidden-pred (0 disables the predictor term)
+  hidden_target: corrected_teacher       # corrected_teacher (review Option B) | base_anchor (Option A)
+  hidden_norm: target_var                # target_var (MSE / target variance) | none (plain MSE)
+  skip_first_token: true                 # drop position 0 (GPT-2 massive activations) from L_hidden-pred
+  predictor_lr_mult: 1.0                 # predictor lr = training.learning_rate * this
+  predictor:                             # P_l(u) = W2 GELU(W1 LN(u) + b1) + b2, FabricPC nodes
+    ff_dim: 256
+    out_init_std: null                   
+    predict_delta: false                 
+    detach_input: true                   
+    layers: null                         
+  stability:                             
+    mode: "off"                          
+    layers: null                         
+    delta: 1.0e-6  
   # Contrastive future loss (InfoNCE on a q-projected code; heads are FabricPC nodes).
   cpc:
     weight: 0.05        # lambda_cp; first runs: small

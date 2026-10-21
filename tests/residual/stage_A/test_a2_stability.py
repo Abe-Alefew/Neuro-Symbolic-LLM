@@ -15,7 +15,7 @@ from residual.a2_losses import anchor_loss
 from residual.hep import hep_key
 from stages.stage_A.a2 import (
     HEPConfig,
-    StabilityConfig,
+    StabLossConfig,
     init_hep_params,
     stability_term,
 )
@@ -26,16 +26,16 @@ SEQ = 12
 LAYERS = [5, 6]
 
 
-def cfg_of(hep_kind=None, **kw) -> StabilityConfig:
+def cfg_of(hep_kind=None, **kw) -> StabLossConfig:
     hep = HEPConfig(kind=hep_kind, rank=4, alpha=1.0)
-    return StabilityConfig(weight=1.0, hep=hep, **kw)
+    return StabLossConfig(weight=1.0, hep=hep, **kw)
 
 
 # --- configuration --------------------------------------------------------------------------
 
 
 def test_defaults_are_off() -> None:
-    cfg = StabilityConfig()
+    cfg = StabLossConfig()
     assert not cfg.enabled and not cfg.needs_base_states and not cfg.needs_output_error
     assert cfg.hep.kind is None and cfg.w_anch == 1.0 and cfg.w_hep == 0.0
 
@@ -45,13 +45,13 @@ def test_flags() -> None:
     assert not cfg_of().needs_output_error
     assert cfg_of("tied").needs_output_error
     assert not cfg_of(w_anch=0.0).needs_base_states
-    assert not StabilityConfig(
+    assert not StabLossConfig(
         weight=0.0, hep=HEPConfig(kind="dense")
     ).needs_output_error
 
 
 def test_from_dict_nested_and_unknown_keys() -> None:
-    cfg = StabilityConfig.from_dict(
+    cfg = StabLossConfig.from_dict(
         {
             "weight": 0.3,
             "w_hep": 0.1,
@@ -59,12 +59,12 @@ def test_from_dict_nested_and_unknown_keys() -> None:
         }
     )
     assert cfg.hep == HEPConfig(kind="lowrank", rank=8, alpha=0.5) and cfg.w_hep == 0.1
-    assert StabilityConfig.from_dict({}) == StabilityConfig()
-    assert StabilityConfig.from_dict({"hep": None}) == StabilityConfig()
-    with pytest.raises(ValueError, match="Unknown StabilityConfig keys"):
-        StabilityConfig.from_dict({"w_step": 1.0})
+    assert StabLossConfig.from_dict({}) == StabLossConfig()
+    assert StabLossConfig.from_dict({"hep": None}) == StabLossConfig()
+    with pytest.raises(ValueError, match="Unknown StabLossConfig keys"):
+        StabLossConfig.from_dict({"w_step": 1.0})
     with pytest.raises(ValueError, match="Unknown HEPConfig keys"):
-        StabilityConfig.from_dict({"hep": {"gain": 1.0}})
+        StabLossConfig.from_dict({"hep": {"gain": 1.0}})
 
 
 @pytest.mark.parametrize(
@@ -80,19 +80,19 @@ def test_from_dict_nested_and_unknown_keys() -> None:
 )
 def test_invalid_stability_config(kwargs: dict) -> None:
     with pytest.raises(ValueError):
-        StabilityConfig(**kwargs)
+        StabLossConfig(**kwargs)
 
 
 @pytest.mark.parametrize("kind", ["tied", "fixed_random"])
 def test_hep_loss_needs_a_trainable_highway(kind: str) -> None:
     with pytest.raises(ValueError, match="no gradient"):
-        StabilityConfig(w_hep=0.1, hep=HEPConfig(kind=kind))
-    StabilityConfig(w_hep=0.0, hep=HEPConfig(kind=kind))  # metric only: fine
+        StabLossConfig(w_hep=0.1, hep=HEPConfig(kind=kind))
+    StabLossConfig(w_hep=0.0, hep=HEPConfig(kind=kind))  # metric only: fine
 
 
 @pytest.mark.parametrize("kind", ["dense", "lowrank"])
 def test_hep_loss_allowed_with_trainable_highway(kind: str) -> None:
-    assert StabilityConfig(w_hep=0.1, hep=HEPConfig(kind=kind)).w_hep == 0.1
+    assert StabLossConfig(w_hep=0.1, hep=HEPConfig(kind=kind)).w_hep == 0.1
 
 
 @pytest.mark.parametrize(
@@ -107,10 +107,10 @@ def test_invalid_hep_config(kwargs: dict) -> None:
 
 
 def test_init_hep_params_only_for_enabled_trainable_highways() -> None:
-    assert init_hep_params(StabilityConfig(), 0, (5, 6), 64, 32) == {}
+    assert init_hep_params(StabLossConfig(), 0, (5, 6), 64, 32) == {}
     assert init_hep_params(cfg_of("tied"), 0, (5, 6), 64, 32) == {}
     assert init_hep_params(cfg_of("fixed_random"), 0, (5, 6), 64, 32) == {}
-    off = StabilityConfig(weight=0.0, hep=HEPConfig(kind="dense"))
+    off = StabLossConfig(weight=0.0, hep=HEPConfig(kind="dense"))
     assert init_hep_params(off, 0, (5, 6), 64, 32) == {}
     dense = init_hep_params(cfg_of("dense"), 0, (5, 6), 64, 32)
     assert set(dense) == {hep_key(5), hep_key(6)} and dense["hep_5"]["V"].shape == (
@@ -461,11 +461,11 @@ def test_jit_matches_eager(substrate, adapter, input_ids) -> None:
 
 
 def test_backend_setting_is_validated_and_defaults_to_fabricpc() -> None:
-    assert StabilityConfig().backend == "fabricpc"
-    assert StabilityConfig.from_dict({"backend": "jax"}).backend == "jax"
+    assert StabLossConfig().backend == "fabricpc"
+    assert StabLossConfig.from_dict({"backend": "jax"}).backend == "jax"
     for bad in ("torch", "", None):
         with pytest.raises(ValueError, match="backend"):
-            StabilityConfig(backend=bad)  # type: ignore[arg-type]
+            StabLossConfig(backend=bad)  # type: ignore[arg-type]
 
 
 def _states(seed: int, layers=(5, 6), d: int = 16, shape=(3, 8)):
@@ -486,7 +486,7 @@ def test_term_agrees_across_backends(kind) -> None:
     tied = jax.random.normal(jax.random.PRNGKey(5), (v, d)) / np.sqrt(v)
     out = {}
     for backend in ("fabricpc", "jax"):
-        cfg = StabilityConfig(
+        cfg = StabLossConfig(
             weight=1.0,
             w_hep=0.5 if kind in ("dense", "lowrank") else 0.0,
             backend=backend,
@@ -520,7 +520,7 @@ def test_term_agrees_across_backends(kind) -> None:
 
 
 def test_padding_is_ignored_by_the_anchor_term() -> None:
-    cfg = StabilityConfig(weight=1.0)
+    cfg = StabLossConfig(weight=1.0)
     corrected, base = _states(1), _states(2)
     mask = jnp.arange(8)[None, :] < jnp.asarray([8, 5, 6])[:, None]
     junk = jnp.where(
@@ -586,7 +586,7 @@ def test_the_config_backend_reaches_the_energies(monkeypatch, backend, expect) -
         "_per_token_energy",
         lambda *a, **k: (calls.append(a[-1]), real(*a, **k))[1],
     )
-    cfg = StabilityConfig(weight=1.0, backend=backend, hep=HEPConfig(kind="dense"))
+    cfg = StabLossConfig(weight=1.0, backend=backend, hep=HEPConfig(kind="dense"))
     d, v = 16, 24
     hp = init_hep_params(cfg, 0, (5, 6), v, d)
     stability_term(

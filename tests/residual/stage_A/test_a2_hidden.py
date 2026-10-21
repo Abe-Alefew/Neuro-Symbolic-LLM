@@ -18,6 +18,7 @@ from frozenllm.substrate import FrozenSubstrate
 from residual import ResidualAdapter, ResidualConfig, layer_key
 from residual.a2_losses import hidden_prediction_loss
 from residual.local_predictor import PredictorConfig, predictor_key
+from residual.stability import StabilityConfig
 from stages.results import RunWriter, load_params
 from stages.stage_A.a1 import A1Config, a1_objective
 from stages.stage_A.a2 import (
@@ -25,9 +26,7 @@ from stages.stage_A.a2 import (
     ARMS,
     A2Config,
     CPCConfig,
-    HiddenConfig,
-    MonitorConfig,
-    StabilityConfig,
+    StabLossConfig,
     a2_audit,
     a2_objective,
     adapter_params,
@@ -72,13 +71,11 @@ def make_cfg(
         lambda_wd=wd,
         seed=seed,
         cpc=CPCConfig(weight=cpc, dim=8),
-        stab=StabilityConfig(weight=stab),
-        hid=HiddenConfig(
-            weight=hid,
-            predictor=PredictorConfig(ff_dim=FF, detach_input=detach),
-            **hid_kw,
-        ),
-        monitor=MonitorConfig(mode=monitor),
+        stab=StabLossConfig(weight=stab),
+        lambda_hid=hid,
+        predictor=PredictorConfig(ff_dim=FF, detach_input=detach),
+        stability=StabilityConfig(mode=monitor),
+        **hid_kw,
     )
 
 
@@ -86,58 +83,64 @@ def make_cfg(
 
 
 def test_defaults_are_off() -> None:
-    cfg = HiddenConfig()
-    assert not cfg.enabled and cfg.weight == 0.0
-    assert (cfg.hidden_norm, cfg.skip_first_token) == ("target_var", True)
+    cfg = A2Config()
+    assert not cfg.uses_hidden_pred and cfg.lambda_hid == 0.0
+    assert (cfg.hidden_target, cfg.hidden_norm, cfg.skip_first_token) == (
+        "corrected_teacher",
+        "target_var",
+        True,
+    )
     assert cfg.predictor == PredictorConfig() and cfg.predictor.detach_input is True
-    a2 = A2Config()
-    assert a2.hid == cfg and a2.monitor == MonitorConfig() and not a2.monitor.enabled
-    assert not a2.aux_enabled and not a2.needs_corrected
+    assert cfg.predictor_lr_mult == 1.0
+    assert cfg.stability == StabilityConfig() and not cfg.stability.enabled
+    assert not cfg.aux_enabled and not cfg.needs_corrected
 
 
 def test_flags() -> None:
     assert make_cfg(hid=0.1).aux_enabled and make_cfg(hid=0.1).needs_corrected
-    assert not make_cfg(
-        hid=0.1
-    ).needs_base_states  # the target is the next block, not h^base
+    assert make_cfg(hid=0.1).uses_hidden_pred
+    # The corrected-teacher target is the next block, not h^base; base_anchor needs it.
+    assert not make_cfg(hid=0.1).needs_base_states
+    assert not make_cfg(hid=0.1).needs_base_targets
+    assert make_cfg(hid=0.1, hidden_target="base_anchor").needs_base_targets
+    assert not make_cfg(hidden_target="base_anchor").needs_base_targets
     assert not make_cfg(monitor="diagnostic").aux_enabled
     assert make_cfg(monitor="diagnostic").needs_corrected
-    assert HiddenConfig(
-        weight=1.0, predictor=PredictorConfig(detach_input=False)
-    ).coupled
-    assert not HiddenConfig(weight=1.0).coupled
+    assert make_cfg(hid=1.0, detach=False).hid_coupled
+    assert not make_cfg(hid=1.0).hid_coupled
+    assert not make_cfg(hid=0.0, detach=False).hid_coupled
 
 
 def test_from_dict_builds_the_nested_sections() -> None:
     cfg = A2Config.from_dict(
         {
-            "hid": {
-                "weight": 0.2,
-                "hidden_norm": "none",
-                "skip_first_token": False,
-                "predictor": {"ff_dim": 8, "detach_input": False, "layers": [5]},
-            },
-            "monitor": {"mode": "diagnostic", "layers": [6]},
+            "lambda_hid": 0.2,
+            "hidden_target": "base_anchor",
+            "hidden_norm": "none",
+            "skip_first_token": False,
+            "predictor_lr_mult": 2.0,
+            "predictor": {"ff_dim": 8, "detach_input": False, "layers": [5]},
+            "stability": {"mode": "diagnostic", "layers": [6]},
         }
     )
-    assert cfg.hid.weight == 0.2 and cfg.hid.hidden_norm == "none"
-    assert not cfg.hid.skip_first_token
-    assert cfg.hid.predictor == PredictorConfig(
-        ff_dim=8, detach_input=False, layers=[5]
-    )
-    assert cfg.monitor == MonitorConfig(mode="diagnostic", layers=[6])
-    # Null sections (``hid:`` with nothing under it in YAML) mean the defaults; a bare
-    # ``mode: off`` is read by YAML as False.
-    assert A2Config.from_dict({"hid": None, "monitor": None}) == A2Config()
-    assert A2Config.from_dict({"monitor": {"mode": False}}).monitor.mode == "off"
+    assert cfg.lambda_hid == 0.2 and cfg.hidden_norm == "none"
+    assert cfg.hidden_target == "base_anchor" and cfg.predictor_lr_mult == 2.0
+    assert not cfg.skip_first_token
+    assert cfg.predictor == PredictorConfig(ff_dim=8, detach_input=False, layers=[5])
+    assert cfg.stability == StabilityConfig(mode="diagnostic", layers=[6])
+    # Null sections (``predictor:`` with nothing under it in YAML) mean the defaults; a
+    # bare ``mode: off`` is read by YAML as False.
+    assert A2Config.from_dict({"predictor": None, "stability": None}) == A2Config()
+    assert A2Config.from_dict({"stability": {"mode": False}}).stability.mode == "off"
 
 
 @pytest.mark.parametrize(
     "data",
     [
-        {"hid": {"wieght": 0.1}},
-        {"hid": {"predictor": {"ffdim": 4}}},
-        {"monitor": {"modee": "off"}},
+        {"hid": {"weight": 0.1}},
+        {"lambda_hidd": 0.1},
+        {"predictor": {"ffdim": 4}},
+        {"stability": {"modee": "off"}},
     ],
 )
 def test_unknown_keys_are_rejected(data: dict) -> None:
@@ -148,23 +151,26 @@ def test_unknown_keys_are_rejected(data: dict) -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"weight": -0.1},
-        {"weight": "0.1"},
-        {"weight": True},
+        {"lambda_hid": -0.1},
+        {"lambda_hid": "0.1"},
+        {"lambda_hid": True},
         {"hidden_norm": "std"},
+        {"hidden_target": "teacher"},
         {"skip_first_token": 1},
+        {"predictor_lr_mult": 0.0},
+        {"predictor_lr_mult": True},
     ],
 )
 def test_invalid_hidden_values_are_rejected(kwargs: dict) -> None:
     with pytest.raises(ValueError):
-        HiddenConfig(**kwargs)
+        A2Config(**kwargs)
 
 
 def test_nested_validation_still_applies() -> None:
     with pytest.raises(ValueError, match="ff_dim"):
-        A2Config.from_dict({"hid": {"predictor": {"ff_dim": 0}}})
+        A2Config.from_dict({"predictor": {"ff_dim": 0}})
     with pytest.raises(ValueError, match="mode"):
-        A2Config.from_dict({"monitor": {"mode": "full"}})
+        A2Config.from_dict({"stability": {"mode": "full"}})
 
 
 def test_asdict_round_trip() -> None:
@@ -180,40 +186,40 @@ def test_the_hidden_arms_exist_and_switch_only_hid_on() -> None:
     cfg = make_cfg(monitor="diagnostic")
     for arm, detach in (("hid_detached", True), ("hid_coupled", False)):
         out = apply_arm(cfg, arm)
-        assert out.hid.enabled and not out.cpc.enabled and not out.stab.enabled
-        assert out.hid.predictor.detach_input is detach
-        assert out.hid.weight == ARM_DEFAULT_WEIGHTS["hid"]
-        assert out.monitor == cfg.monitor
+        assert out.uses_hidden_pred and not out.cpc.enabled and not out.stab.enabled
+        assert out.predictor.detach_input is detach
+        assert out.lambda_hid == ARM_DEFAULT_WEIGHTS["hid"]
+        assert out.stability == cfg.stability
         assert not out.needs_base_states
 
 
 def test_arms_without_hid_switch_it_off_and_full_has_everything() -> None:
     cfg = make_cfg(hid=0.4)
     for arm in ("a1_mode", "stab_anch", "stab_hep", "cpc_base", "cpc_multi"):
-        assert not apply_arm(cfg, arm).hid.enabled
+        assert not apply_arm(cfg, arm).uses_hidden_pred
     full = apply_arm(cfg, "full")
-    assert full.hid.enabled and full.cpc.enabled and full.stab.enabled
-    assert full.hid.weight == 0.4 and full.hid.coupled
+    assert full.uses_hidden_pred and full.cpc.enabled and full.stab.enabled
+    assert full.lambda_hid == 0.4 and full.hid_coupled
     assert not apply_arm(cfg, "a1_mode").aux_enabled
 
 
 def test_arms_keep_the_predictor_settings() -> None:
     cfg = replace(
         make_cfg(hid=0.4),
-        hid=HiddenConfig(
-            weight=0.4,
-            hidden_norm="none",
-            skip_first_token=False,
-            predictor=PredictorConfig(ff_dim=8, predict_delta=True, layers=[5]),
-        ),
+        hidden_target="base_anchor",
+        hidden_norm="none",
+        skip_first_token=False,
+        predictor_lr_mult=3.0,
+        predictor=PredictorConfig(ff_dim=8, predict_delta=True, layers=[5]),
     )
-    out = apply_arm(cfg, "hid_coupled").hid
+    out = apply_arm(cfg, "hid_coupled")
     assert (out.hidden_norm, out.skip_first_token) == ("none", False)
+    assert (out.hidden_target, out.predictor_lr_mult) == ("base_anchor", 3.0)
     assert (out.predictor.ff_dim, out.predictor.predict_delta) == (8, True)
     assert out.predictor.layers == [5]
-    zero = replace(cfg, hid=replace(cfg.hid, weight=0.0))
+    zero = replace(cfg, lambda_hid=0.0)
     assert (
-        apply_arm(zero, "hid_coupled").hid.weight > 0
+        apply_arm(zero, "hid_coupled").lambda_hid > 0
     )  # falls back to the arm default
 
 
@@ -301,7 +307,7 @@ def test_predictor_sites_default_to_the_adapted_layers_and_can_be_restricted(
 ) -> None:
     cfg = replace(
         make_cfg(hid=0.1),
-        hid=HiddenConfig(weight=0.1, predictor=PredictorConfig(ff_dim=FF, layers=[5])),
+        predictor=PredictorConfig(ff_dim=FF, layers=[5]),
     )
     assert set(predictor_params(init_a2_params(cfg, adapter))) == {predictor_key(5)}
 
@@ -318,7 +324,7 @@ def test_the_last_block_gets_no_predictor_by_default(substrate) -> None:
 def test_predictor_sites_must_be_adapted_layers(substrate, adapter) -> None:
     cfg = replace(
         make_cfg(hid=0.1),
-        hid=HiddenConfig(weight=0.1, predictor=PredictorConfig(ff_dim=FF, layers=[2])),
+        predictor=PredictorConfig(ff_dim=FF, layers=[2]),
     )
     with pytest.raises(ValueError, match="adapted layers"):
         init_a2_params(cfg, adapter)
@@ -340,39 +346,52 @@ def test_param_counts_include_the_predictors(substrate, adapter) -> None:
     assert param_counts(adapter.init_params())["pred"] == 0
 
 
-def test_seed_controls_the_predictors_and_not_the_adapter(substrate, adapter) -> None:
-    a = init_a2_params(make_cfg(hid=0.1, seed=0), adapter)
-    b = init_a2_params(make_cfg(hid=0.1, seed=0), adapter)
-    c = init_a2_params(make_cfg(hid=0.1, seed=1), adapter)
+def test_predictor_seed_controls_the_predictors_and_not_the_adapter(
+    substrate, adapter
+) -> None:
+    def cfg(seed):
+        return replace(
+            make_cfg(hid=0.1), predictor=PredictorConfig(ff_dim=FF, seed=seed)
+        )
+
+    a, b, c = (init_a2_params(cfg(s), adapter) for s in (0, 0, 1))
     name = "pred_hidden.w.W_ff1"
     np.testing.assert_array_equal(a[predictor_key(5)][name], b[predictor_key(5)][name])
     assert not np.allclose(a[predictor_key(5)][name], c[predictor_key(5)][name])
     np.testing.assert_array_equal(a[layer_key(5)]["A"], c[layer_key(5)]["A"])
 
 
-def test_a_pinned_predictor_seed_ignores_the_objective_seed(substrate, adapter) -> None:
-    def cfg(seed):
-        return replace(
-            make_cfg(hid=0.1, seed=seed),
-            hid=HiddenConfig(weight=0.1, predictor=PredictorConfig(ff_dim=FF, seed=7)),
-        )
-
+def test_the_objective_seed_does_not_move_the_predictors(substrate, adapter) -> None:
     name = "pred_hidden.w.W_ff1"
-    a, b = init_a2_params(cfg(0), adapter), init_a2_params(cfg(3), adapter)
+    a = init_a2_params(make_cfg(hid=0.1, seed=0), adapter)
+    b = init_a2_params(make_cfg(hid=0.1, seed=3), adapter)
     np.testing.assert_array_equal(a[predictor_key(5)][name], b[predictor_key(5)][name])
 
 
+def test_init_does_not_depend_on_the_sequence_length_argument(
+    substrate, adapter
+) -> None:
+    cfg = make_cfg(hid=0.1)
+    a = init_a2_params(cfg, adapter)
+    b = init_a2_params(cfg, adapter, seq_len=SEQ)
+    assert jax.tree_util.tree_structure(a) == jax.tree_util.tree_structure(b)
+    for x, y in zip(
+        jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b), strict=True
+    ):
+        np.testing.assert_array_equal(x, y)
+
+
 def test_the_bank_is_built_once_per_configuration(substrate, adapter) -> None:
-    a = predictor_bank(
-        HiddenConfig(weight=1.0, predictor=PredictorConfig(ff_dim=FF)), adapter
-    )
-    b = predictor_bank(
-        HiddenConfig(weight=2.0, predictor=PredictorConfig(ff_dim=FF)), adapter
-    )
+    a = predictor_bank(replace(make_cfg(hid=1.0)), adapter, SEQ)
+    b = predictor_bank(replace(make_cfg(hid=2.0)), adapter, SEQ)
     c = predictor_bank(
-        HiddenConfig(weight=1.0, predictor=PredictorConfig(ff_dim=FF + 1)), adapter
+        replace(make_cfg(hid=1.0), predictor=PredictorConfig(ff_dim=FF + 1)),
+        adapter,
+        SEQ,
     )
-    assert a is b and a is not c
+    d = predictor_bank(make_cfg(hid=1.0), adapter, SEQ + 1)
+    assert a is b and a is not c and a is not d
+    assert a.seq_len == SEQ and tuple(a.layers) == tuple(LAYERS)
 
 
 def test_tree_is_flat_two_level_and_checkpointable(
@@ -397,7 +416,7 @@ def test_tree_is_flat_two_level_and_checkpointable(
 def test_hid_term_is_the_mean_of_the_site_losses(substrate, adapter) -> None:
     cfg = make_cfg(hid=0.1, detach=False)
     params = with_random_predictors(init_a2_params(cfg, adapter))
-    bank = predictor_bank(cfg.hid, adapter)
+    bank = predictor_bank(cfg, adapter, SEQ)
     rng = np.random.default_rng(3)
     d = substrate.architecture.hidden_size
     corrected = {
@@ -407,11 +426,11 @@ def test_hid_term_is_the_mean_of_the_site_losses(substrate, adapter) -> None:
         i: jnp.asarray(rng.normal(size=(BATCH, SEQ, d)), jnp.float32) for i in LAYERS
     }
     loss, metrics = hid_term(
-        params, config=cfg.hid, bank=bank, corrected=corrected, targets=targets
+        params, config=cfg, bank=bank, corrected=corrected, targets=targets
     )
     parts = [
         hidden_prediction_loss(
-            bank.predict(params, i, corrected[i]), targets[i], corrected[i], cfg.hid
+            bank.predict(params, i, corrected[i]), targets[i], corrected[i], cfg
         )
         for i in LAYERS
     ]
@@ -428,17 +447,13 @@ def test_hid_term_is_the_mean_of_the_site_losses(substrate, adapter) -> None:
 def test_hid_term_needs_every_site(substrate, adapter) -> None:
     cfg = make_cfg(hid=0.1)
     params = init_a2_params(cfg, adapter)
-    bank = predictor_bank(cfg.hid, adapter)
+    bank = predictor_bank(cfg, adapter, SEQ)
     d = substrate.architecture.hidden_size
     z = jnp.zeros((BATCH, SEQ, d))
     with pytest.raises(KeyError, match="corrected"):
-        hid_term(
-            params, config=cfg.hid, bank=bank, corrected={5: z}, targets={5: z, 6: z}
-        )
+        hid_term(params, config=cfg, bank=bank, corrected={5: z}, targets={5: z, 6: z})
     with pytest.raises(KeyError, match="next-block"):
-        hid_term(
-            params, config=cfg.hid, bank=bank, corrected={5: z, 6: z}, targets={5: z}
-        )
+        hid_term(params, config=cfg, bank=bank, corrected={5: z, 6: z}, targets={5: z})
 
 
 # --- objective: parity and contract ------------------------------------------------------------
@@ -492,7 +507,7 @@ def test_the_target_is_the_next_blocks_output_of_the_adapted_pass(
     cfg = make_cfg(hid=0.1, detach=False, skip_first_token=False)
     params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
     ap = adapter_params(params)
-    bank = predictor_bank(cfg.hid, adapter)
+    bank = predictor_bank(cfg, adapter, SEQ)
     # Independent path: intercept every block, apply the adapter on the way.
     every = tuple(range(substrate.architecture.num_layers))
     run = substrate.run_with_interception(
@@ -503,9 +518,7 @@ def test_the_target_is_the_next_blocks_output_of_the_adapted_pass(
         source = adapter.apply(ap, run.hidden_state(i), i)
         pred = bank.predict(params, i, source)
         losses.append(
-            hidden_prediction_loss(pred, run.hidden_state(i + 1), source, cfg.hid)[
-                "loss"
-            ]
+            hidden_prediction_loss(pred, run.hidden_state(i + 1), source, cfg)["loss"]
         )
     _, terms = run_objective(substrate, adapter, cfg, params, input_ids)
     assert float(terms["hid"]) == pytest.approx(float(np.mean(losses)), rel=1e-4)
@@ -618,7 +631,7 @@ def test_coupled_gradient_matches_a_reference_with_a_stopped_target(
     adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
     cfg = make_cfg(hid=1.0, detach=False)
     params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
-    bank = predictor_bank(cfg.hid, adapter)
+    bank = predictor_bank(cfg, adapter, SEQ)
     every = tuple(range(gpt2.architecture.num_layers))
 
     def reference(p):
@@ -631,7 +644,7 @@ def test_coupled_gradient_matches_a_reference_with_a_stopped_target(
             source = adapter.apply(ap, run.hidden_state(i), i)
             target = jax.lax.stop_gradient(run.hidden_state(i + 1))
             pred = bank.predict(p, i, source)
-            losses.append(hidden_prediction_loss(pred, target, source, cfg.hid)["loss"])
+            losses.append(hidden_prediction_loss(pred, target, source, cfg)["loss"])
         return jnp.mean(jnp.stack(losses))
 
     want = jax.grad(reference)(params)
@@ -737,7 +750,7 @@ def test_monitor_changes_neither_the_total_nor_a_gradient(
     substrate, adapter, input_ids
 ) -> None:
     base = make_cfg(hid=0.2, detach=False, cpc=0.1, stab=0.1)
-    watched = replace(base, monitor=MonitorConfig(mode="diagnostic"))
+    watched = replace(base, stability=StabilityConfig(mode="diagnostic"))
     params = with_random_predictors(with_random_b(init_a2_params(base, adapter)))
     t0, _ = run_objective(substrate, adapter, base, params, input_ids)
     t1, _ = run_objective(substrate, adapter, watched, params, input_ids)
@@ -764,7 +777,7 @@ def test_monitor_alone_equals_a1(substrate, adapter, input_ids) -> None:
 
 
 def test_monitor_sites_must_be_adapted(substrate, adapter, input_ids) -> None:
-    cfg = replace(make_cfg(), monitor=MonitorConfig(mode="diagnostic", layers=[2]))
+    cfg = replace(make_cfg(), stability=StabilityConfig(mode="diagnostic", layers=[2]))
     with pytest.raises(ValueError, match="adapted sites"):
         run_objective(substrate, adapter, cfg, init_a2_params(cfg, adapter), input_ids)
 
@@ -812,7 +825,7 @@ def test_every_arm_runs_through_the_objective(gpt2, input_ids) -> None:
         params = with_random_b(init_a2_params(cfg, adapter))
         total, terms = run_objective(gpt2, adapter, cfg, params, input_ids)
         assert bool(jnp.isfinite(total)), arm
-        assert ("hid" in terms) == cfg.hid.enabled, arm
+        assert ("hid" in terms) == cfg.uses_hidden_pred, arm
 
 
 # --- audit ------------------------------------------------------------------------------------

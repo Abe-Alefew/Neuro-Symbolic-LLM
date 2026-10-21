@@ -1,4 +1,5 @@
 """The four stability losses of A2: anchor, HEP nudge, residual smoothness and step loss.
+
 """
 
 from __future__ import annotations

@@ -2,8 +2,9 @@
 
 A2 keeps the A1 setup (a small trainable residual on the hidden states of a frozen language model) and adds **auxiliary losses on the hidden states**. Training is still plain backpropagation with one optimiser: there is **no settling** in A2, so "PC-inspired" describes the shape of the losses, not the way the weights are trained. FabricPC supplies the nodes where it applies (the contrastive heads and the squared-error energies).
 
-Everything stage-level is in one file, [`a2.py`](a2.py). The pure loss math is in [`residual/`](../../residual/).
 
+
+> **Status.** Built and tested: the objective wiring, the contrastive future loss, the stability loss, the hidden-prediction loss `L_hid` with its local predictors, the stability monitor (residual smoothness, settling-step metrics), the runner, ablation arms and the audit. 
 
 ---
 
@@ -31,9 +32,9 @@ Everything stage-level is in one file, [`a2.py`](a2.py). The pure loss math is i
 
 $$\mathcal{L}_{A2} = \underbrace{\mathcal{L}_{task} + \lambda_{kl}\,\mathrm{KL}(p_{F_0}\,\|\,p_{F_0+R}) + \lambda_{wd}\lVert\phi\rVert^2}_{\text{A1, unchanged}} + \lambda_{cp}\,\mathcal{L}_{cpc} + \lambda_{stab}\,\mathcal{L}_{stab} + \lambda_{hid}\,\mathcal{L}_{hid}$$
 
-$$\mathcal{L}_{stab} = w_{anch}\,\mathcal{L}_{zanch} + w_{hep}\,\mathcal{L}_{hep\text{-}nudge}$$
+$$\mathcal{L}_{stab} = w_{anch}\,\mathcal{L}_{zanch} + w_{hep}\,\mathcal{L}_{hep\text{-}nudge} + w_{smooth}\,\mathcal{L}_{res\text{-}smooth} + w_{step}\,\mathcal{L}_{step}$$
 
-With `cpc.weight = stab.weight = hid.weight = 0` the objective, the parameter tree and the gradients are exactly A1's (a test checks it).
+With `cpc.weight = stab.weight = lambda_hid = 0` the objective, the parameter tree and the gradients are exactly A1's (a test checks it).
 
 ```text
 input ids ─► frozen model ─────────────────────────────► h^base_l  (stop-gradient), base logits
@@ -54,6 +55,8 @@ input ids ─► frozen model ────────────────�
 | `L_cpc` | InfoNCE: from `h~_{l,t}` predict the stop-gradient code of the base (or corrected) state `k` positions ahead | adapter, `cpcq_<l>`, `cpca_<l>_<k>` |
 | `L_zanch` | `‖h~_l − sg(h^base_l)‖²`, normalised by the base norm (`normalize: relative`) | adapter |
 | `L_hep-nudge` | `‖α · sg(ε_y) · V‖²` with `ε_y = softmax(logits) − onehot(next token)` | highway `hep_<l>` only |
+| `L_res-smooth` | `mean_t ‖R(h_t) − R(h_{t−1})‖²`, divided by the input's own jitter `mean_t ‖h_t − h_{t−1}‖²` (`normalize: relative`) | adapter |
+| `L_step` | `mean_tokens Σ_s ‖z^(s+1) − z^(s)‖²` over a settling trajectory; exactly 0 in A2 | nothing in A2 (A3: the settling state) |
 | `L_hid` | `‖P_l(h~_l) − sg(h_{l+1})‖² / Var(h_{l+1})`: a local predictor guesses the next frozen block's output from the corrected state | predictor `pred_layer_<l>`; the adapter too when `detach_input: false` |
 
 **Contrastive future loss.** Code `c = q(h~_t)` (parameter-free LayerNorm, then a bias-free linear projection to `dim`), prediction `p = A_{l,k} c` (bias-free linear, initialised near identity), both L2-normalised. The positive is `q(h_{t+k})` under stop-gradient, taken from the base state (`positive: base`) or the corrected state (`positive: corrected`). Negatives are the positives of the **other sequences** in the batch. Anchors are subsampled by a deterministic stride (`max_anchors_per_seq`). Padding is masked: an anchor counts only if both `t` and `t+k` are real tokens and at least one real negative exists. Several offsets (`offsets: [1, 2, 4]`) each get their own predictor; the term is the mean over sites `(l, k)`.
@@ -62,24 +65,9 @@ input ids ─► frozen model ────────────────�
 
 **HEP nudge.** The output error `ε_y` is a training-time-only signal that is projected into the hidden space by a "highway" matrix `V`. Because `ε_y` is under stop-gradient, this loss reaches **only `V`**, never the adapter. With a trainable highway (`dense`, `lowrank`) it trains `V`; with a fixed one (`fixed_random`) it has no gradient and is a **logged metric** (`hep_nudge_norm`, `hep_nudge_ratio`), so the config rejects `w_hep > 0` for fixed highways.
 
-**Hidden prediction.** For each adapted site `l` that has a following block, a small predictor `P_l(u) = W2 GELU(W1 LN(u) + b1) + b2` (one FabricPC graph: `IdentityNode → LnMlp1Node → Linear`, applied token by token, so its weights do not depend on the sequence length) guesses the output `h_{l+1}` of block `l+1` from `u = h~_l`. The target is the next frozen block applied to the *corrected* state in the adapted forward (the adapted run simply intercepts block `l+1` as well), under stop-gradient. The squared error is divided by the target variance (`hidden_norm: target_var`; `none` gives the plain MSE) and position 0 is skipped by default (`skip_first_token`: it has no left context). `hid_copy_rel` is the same error for the trivial predictor "copy `h~_l`": a useful predictor has `hid_rel < hid_copy_rel`. Padding (`labels == -100`) is masked.
+**Residual smoothness.** `R = h~ − h` is the correction at a site and `h` the hidden state the adapter receives. The loss is the squared difference of the correction between neighbouring tokens, divided by the same quantity for the input (`normalize: relative`, a scale-free ratio; below 1 means the correction is smoother than its input). The input's jitter is under stop-gradient, so the term only moves the adapter. It is 0 at initialisation. Pairs of tokens count only if both are real. The squared differences are FabricPC `IdentityNode` energies (`backend: fabricpc`) or plain arithmetic (`jax`); the two agree in value and gradient.
 
-`predictor.detach_input` decides who learns. **`true`** (the shipped default of the predictor, arm `hid_detached`) is a *negative control*: only `P_l` trains, nothing reaches the adapter, so the loss cannot change `R`. **`false`** (arm `hid_coupled`, and the shipped YAML) lets the prediction error flow into `h~_l` and so into the adapter: it makes the corrected states easier to predict from themselves. The contrast between the two arms is what shows whether `L_hid` does anything beyond training a side head.
 
-**Stability monitor (not a loss).** `monitor.mode: diagnostic` logs, for every adapted site and averaged over sites, the residual smoothness `res_smooth = mean_t ‖R(h_t) − R(h_{t−1})‖²`, the input's own jitter `input_smooth`, and their ratio `res_vs_input` (below 1: the correction is smoother than its input; above 1: it amplifies jitter), plus `res_smooth_l<l>` per site. The settling-step metrics `step_loss`, `step_noncontract`, `step_last_norm` are defined over settling iterations, so they are exactly 0 in A2 (no settling); A3 passes its real trajectory to the same function. Everything here is stop-gradient: a test checks that switching the monitor on changes neither the total nor any gradient.
-
-## Where FabricPC is used
-
-Project policy: use FabricPC wherever it can apply. In A2 it is used for **feed-forward values and Gaussian energies only**:
-
-| Piece | FabricPC node | File |
-|---|---|---|
-| CPC projection `q` and predictor `A_{l,k}` | bias-free `Linear` | `residual/cpc_heads.py` |
-| Anchor squared distance | `IdentityNode` energy, base state clamped as the target | `residual/fpc_energy.py` |
-| HEP squared norm of the nudge | `Linear` node(s) (low-rank through a `mid` node), zero target | `residual/fpc_energy.py` |
-| Hidden predictor `P_l` | `IdentityNode → LnMlp1Node → Linear` (feed-forward) | `residual/local_predictor.py` |
-
-All FabricPC imports go through [`residual/_fpc_compat.py`](../../residual/_fpc_compat.py), which works on FabricPC 0.3.x (the repository pin) and 0.6.x: the graph-builder modules moved between the two releases, and the calls used here are the same. The tests pass on both. This is backprop **through** FabricPC nodes, not predictive-coding training (no inference loop). The LayerNorm and the InfoNCE (which needs the other sequences as negatives, so it is not a per-sample energy) stay in JAX. A plain-JAX reference backend (`heads: jax`, `backend: jax`) is kept as the test oracle: values, gradients and `jit` agree with the FabricPC path.
 
 ## Parameters
 
@@ -113,28 +101,32 @@ objective:                  # → A2Config
     max_anchors_per_seq: 256
     a_init_noise: 0.01
     heads: fabricpc         # fabricpc | jax
-  stab:                     # → StabilityConfig
+  stab:                     # → StabLossConfig (the stability *loss*)
     weight: 0.1             # λ_stab; 0 switches the term off
     w_anch: 1.0
     w_hep: 0.0              # > 0 needs hep.kind: lowrank | dense
+    w_smooth: 0.1           # residual smoothness
+    w_step: 1.0             # settling-step loss (exactly 0 in A2)
     normalize: relative     # relative | none
     backend: fabricpc       # fabricpc | jax
     hep:                    # → HEPConfig
       kind: fixed_random    # null | dense | lowrank | fixed_random
       rank: 16
       alpha: 1.0
-  hid:                      # → HiddenConfig
-    weight: 0.1             # λ_hid; 0 switches the term and the predictors off
+  hid:                      # → HiddenConfig (hidden prediction)
+    lambda_hid: 0.1         # λ_hid (alias of `weight`); 0 switches the term and the predictors off
+    hidden_target: corrected_teacher  # corrected_teacher (Option B) | base_anchor (Option A)
     hidden_norm: target_var # target_var | none
     skip_first_token: true
-    predictor:              # → PredictorConfig
+    predictor_lr_mult: 1.0  # predictor lr = training.learning_rate * this
+    predictor:              # → PredictorConfig (residual/local_predictor.py)
       ff_dim: 256
       out_init_std: null
       predict_delta: false  # true: P_l(u) = u + MLP(u)
-      detach_input: false   # true: only P_l trains (negative control)
+      detach_input: true    # true: only P_l trains (negative control); false: reaches the adapter
       layers: null          # null: every adapted layer with a following block
-      seed: null            # null: objective.seed
-  monitor:                  # → MonitorConfig (logged, never in the loss)
+      seed: 0               # seed of the predictor weights
+  monitor:                  # → residual.stability.StabilityConfig (metrics, never in the loss)
     mode: diagnostic        # off | diagnostic
     layers: null
     delta: 1.0e-6
@@ -144,24 +136,24 @@ objective:                  # → A2Config
 |---|---|---|
 | `cpc.weight` (λ_cp) | 0.0 (YAML: 0.05) | first runs: small |
 | `stab.weight` (λ_stab) | 0.0 (YAML: 0.1) | |
-| `hid.weight` (λ_hid) | 0.0 (YAML: 0.1) | the error is target-variance normalised, so it is about 1 for a copy |
-| `stab.w_anch` / `stab.w_hep` | 1.0 / 0.0 | |
+| `hid.lambda_hid` / `hid.weight` (λ_hid) | 0.0 (YAML: 0.1) | the error is target-variance normalised, so it is about 1 for a copy |
+| `stab.w_anch` / `stab.w_hep` | 1.0 / 0.0 | HEP needs a trainable highway |
+| `stab.w_smooth` / `stab.w_step` | 0.0 / 0.0 (YAML: 0.1 / 1.0) | `w_step` has no effect until a stage has settling |
 | `cpc.tau` | 0.1 | 0.05 – 0.2 |
 | `cpc.dim` | 32 | 32 or 64 |
 
-The shipped values are first-run guesses and are **not calibrated**. Precedence, weakest to strongest: YAML → `--arm` → `--lambda-*` flags.
-
-`hep.kind: tied` (the frozen LM head as `V`) is supported by the loss function but **rejected by `A2Config`** until `a2_objective` can obtain that matrix.
 
 ## Ablation arms
 
-An arm chooses which terms run and their variant; `λ_kl`, `λ_wd`, data, optimiser and seeds are shared, so contrasts against `a1_mode` isolate one term. The λ values come from the config (a weight of 0 falls back to cpc 0.05 / stab 0.1 / hid 0.1). The monitor is measurement-only and is never switched by an arm: set `monitor.mode` (or `--monitor`) to log it in any arm.
+An arm chooses which terms run and their variant; `λ_kl`, `λ_wd`, data, optimiser and seeds are shared, so contrasts against `a1_mode` isolate one term. The λ values come from the config (a weight of 0 falls back to cpc 0.05 / stab 0.1 / hid 0.1). The monitor is measurement-only and is never switched by an arm: set `stability.mode` (or `--stability-mode`) to log it in any arm.
 
 | `--arm` | Terms on |
 |---|---|
 | `a1_mode` | none: the A1 objective |
 | `stab_anch` | anchor only |
 | `stab_hep` | anchor + trainable low-rank HEP highway |
+| `stab_smooth` | anchor + residual smoothness |
+| `stab_all` | all four stability losses (anchor, HEP nudge on a trainable low-rank highway, residual smoothness, step) |
 | `cpc_base` | contrastive future, positive from the base state |
 | `cpc_corrected` | contrastive future, positive from the corrected state |
 | `cpc_multi` | contrastive future, offsets 1, 2, 4 |
@@ -182,7 +174,8 @@ python experiments/run_stage_a2.py --arm full --seed 0
 
 # Weights from the command line (override the YAML and the arm)
 python experiments/run_stage_a2.py --lambda-cp 0.1 --lambda-stab 0 --lambda-hid 0
-python experiments/run_stage_a2.py --arm hid_coupled --monitor diagnostic
+python experiments/run_stage_a2.py --arm hid_coupled --stability-mode diagnostic
+python experiments/run_stage_a2.py --lambda-hid 0.1 --hidden-target base_anchor --no-detach-input
 python experiments/run_stage_a2.py --lambda-kl 0.1 --lambda-wd 1e-4
 
 # Smoke run, and evaluating a saved checkpoint (the auxiliary heads are ignored)
@@ -190,7 +183,6 @@ python experiments/run_stage_a2.py --rank 8 --epochs 1 --run-name smoke
 python experiments/run_stage_a2.py --eval-checkpoint runs/<run>/params/task_2_scotus.npz
 ```
 
-Other flags are those of the A1 runner (`--model`, `--rank`, `--epochs`, `--output-dir`, `--run-name`, `--split`, `--eval-batches`). A run writes `runs/<name>/` (default `a2[-<arm>][-s<seed>]-<UTC time>`) with `config.yaml`, `meta.json` (including `arm`, `seed` and the parameter counts by group), `metrics.jsonl`, `results.json` and `params/task_<t>_<name>.npz`. `results.json` has the same external metrics as A1 (`loss`, `ppl`, `kl`, `improvement`, `mean_seen_loss`, `mean_forgetting`, `mean_step_time`, `params_unchanged`).
 
 > `run_sequential` JIT-compiles the training step (`training.jit: true`); a test compares jit and eager values and gradients of the A2 objective.
 
@@ -205,8 +197,10 @@ Other flags are those of the A1 runner (`--model`, `--rank`, `--epochs`, `--outp
 | `cpc_top1`, `cpc_pos_sim`, `cpc_neg_sim`, `cpc_n_anchors`, `cpc_valid` | contrastive diagnostics (top-1 accuracy of the positive, similarities, counted anchors) |
 | `stab_anch`, `anch_dist`, `anch_ratio` | anchor loss, raw distance, relative distance |
 | `stab_hep`, `hep_nudge_norm`, `hep_nudge_ratio` | HEP loss and the size of the nudge |
+| `stab_smooth`, `smooth_res`, `smooth_ratio` | residual-smoothness loss, its numerator and the ratio to the input's jitter |
+| `stab_step`, `step_sq` | step loss and its unnormalised value (0 in A2) |
 | `hid_mse`, `hid_rel`, `hid_copy_rel` | hidden prediction: squared error, relative to the target variance, and the same for the copy baseline |
-| `res_smooth`, `input_smooth`, `res_vs_input`, `res_smooth_l<l>`, `step_*` | stability monitor (only with `monitor.mode: diagnostic`; `step_*` are 0 in A2) |
+| `res_smooth`, `input_smooth`, `res_vs_input`, `res_smooth_l<l>`, `step_*` | stability monitor (only with `stability.mode: diagnostic`; `step_*` are 0 in A2) |
 
 ## Internal metrics
 
@@ -234,10 +228,10 @@ The post-hoc script that applies them to saved checkpoints is not written yet.
 | `total_decomposition` | `total` = task + λ_kl·kl + λ_wd·wd + λ_cp·cpc + λ_stab·stab + λ_hid·hid |
 | `a1_parity` | with the auxiliary weights at 0, total and adapter gradient equal `a1_objective`'s |
 | `monitor_measurement_only` | (monitor on) switching the monitor on changes neither the total nor any gradient |
-| `grad_routing_task / cpc / hid / stab_anch / stab_hep` | each term's gradient reaches exactly the intended groups: task → adapter; cpc → adapter and cpc heads; hid → predictors (and the adapter when `detach_input: false`); anchor → adapter; HEP → highway only |
+| `grad_routing_task / cpc / hid / stab_anch / stab_smooth / stab_step / stab_hep` | each term's gradient reaches exactly the intended groups: task → adapter; cpc → adapter and cpc heads; hid → predictors (and the adapter when `detach_input: false`); anchor and smoothness → adapter; step → nothing in A2; HEP → highway only |
 | `jit_equals_eager` | the jitted objective equals the eager one |
 | `finite_with_ignored_labels` | terms stay finite when half the labels are `-100` |
-| `grad_ratio_cpc`, `grad_ratio_stab_anch`, `grad_ratio_hid` | **information, no pass/fail**: `λ · ‖∇_adapter term‖ / ‖∇_adapter task‖`; the plan aims at about 0.1 to 1 per auxiliary term, so use it to choose the λ's (`hid` only when coupled) |
+| `grad_ratio_cpc`, `grad_ratio_stab_anch`, `grad_ratio_stab_smooth`, `grad_ratio_hid` | **information, no pass/fail**: `λ · ‖∇_adapter term‖ / ‖∇_adapter task‖`; the plan aims at about 0.1 to 1 per auxiliary term, so use it to choose the λ's (`hid` only when coupled) |
 | `hid_vs_copy` | **information**: `hid_rel` against `hid_copy_rel` for the untrained predictor |
 
 From the runner:
@@ -260,10 +254,9 @@ The audit uses the first `batch_size` blocks of the first domain, so it needs th
 | [`stages/stage_A/a2.py`](a2.py) | **Everything stage-level**: configs, parameter tree, `cpc_term`, `stability_term`, `hid_term`, `a2_objective`, arms, audit |
 | [`residual/a2_losses.py`](../../residual/a2_losses.py) | Pure losses: `contrastive_future_loss`, `anchor_loss`, `output_error`, `hep_nudge_loss`, `hidden_prediction_loss` |
 | [`residual/local_predictor.py`](../../residual/local_predictor.py) | Hidden predictors `P_l` (FabricPC graph) and their pure-JAX reference |
-| [`residual/stability.py`](../../residual/stability.py) | Stability monitor: residual smoothness and settling-step metrics |
-| [`residual/_fpc_compat.py`](../../residual/_fpc_compat.py) | One import point for FabricPC 0.3.x / 0.6.x |
+
 | [`residual/cpc_heads.py`](../../residual/cpc_heads.py) | CPC heads `q` and `A_{l,k}` (FabricPC nodes) and their reference |
-| [`residual/hep.py`](../../residual/hep.py) | HEP highway matrices (`dense`, `lowrank`, `fixed_random`, `tied`) |
+
 | [`residual/fpc_energy.py`](../../residual/fpc_energy.py) | FabricPC energies for the anchor and the HEP norm |
 | [`metrics/representation.py`](../../metrics/representation.py) | Internal metrics (above) |
 | [`experiments/run_stage_a2.py`](../../experiments/run_stage_a2.py) | CLI runner (`--arm`, `--seed`, `--lambda-*`) |
@@ -284,13 +277,13 @@ The A2 tests run on tiny GPT-2 and GPT-NeoX fixtures on CPU: nothing here has be
 | `stage_A/test_a2_objective.py` | `A2Config` and the YAML, the parameter tree, A1 parity, term weighting, gradient audit, padding, jit vs eager, arms, `run_sequential`, the runner end to end |
 | `stage_A/test_a2_audit.py` | the audit passes on a correct objective, catches a wrong total, a gradient leak and a NaN, and the runner flags |
 | `stage_A/test_a2_cpc.py`, `test_a2_stability.py` | the two terms through the frozen model (GPT-2 and NeoX), configs, reduction over sites |
-| `stage_A/test_a2_hidden.py` | `HiddenConfig` / `MonitorConfig`, predictor parameters, `hid_term`, the target (next block of the adapted pass), gradient routing for both `detach_input` settings against an independent reference, the monitor never changing a gradient, training, the new arms, the audit |
+| `stage_A/test_a2_smoothness_step.py` | residual smoothness and step losses: numpy reference, both backends, masks, scale invariance, gradient routing, arms, audit with all four stability losses |
+| `stage_A/test_a2_hidden.py` | flat hidden-prediction config and `stability`, predictor parameters, `hid_term`, the target (next block of the adapted pass), gradient routing for both `detach_input` settings against an independent reference, the monitor never changing a gradient, training, the new arms, the audit |
 | `test_contrastive_loss.py`, `test_contrastive_mask.py` | InfoNCE, anchor, output error, HEP nudge, padding mask, backend switch |
 | `test_cpc_heads*.py`, `test_stability_losses.py`, `test_stability_fabricpc.py`, `test_hep.py` | heads, energies and highways; FabricPC against the plain-JAX reference |
 | `test_local_predictor.py` | predictor sites, parameter layout, FabricPC graph = pure-JAX reference, token-wise application, `detach_input` and `predict_delta` |
 | `test_hidden_loss.py` | `hidden_prediction_loss`: values against NumPy, normalisation, `skip_first_token`, the mask, stop-gradients |
 | `test_stability_monitor.py` | residual smoothness, step metrics, the monitor over sites, no gradient |
-| `test_fpc_compat.py` | the FabricPC import shim |
 
 Guarantees enforced by tests:
 
@@ -310,8 +303,7 @@ Guarantees enforced by tests:
 - **Where `h^base` comes from.** The adapted and base runs are separate forwards; the base states are the output of the unmodified model, not of the adapted model's earlier layers.
 - **Logged names.** The shared loop prefixes every term with `loss_`, so diagnostics appear as `loss_cpc_top1`.
 - **Cost not measured.** FabricPC builds a small graph state on every head call; it has not been benchmarked against a plain matrix product, and `mean_step_time` per arm has not been recorded. `L_hid` adds one `[B·T, d] → ff_dim → d` MLP per site and intercepts the block after each site.
-- **`L_hid` target.** It is the *raw* output of block `l+1` given the corrected state (not that block's corrected output). The first token is skipped by default; GPT-2's position 0 is an attention sink with a very large norm.
 - **Hyperparameters are uncalibrated.** A calibration of each term's gradient norm against the task gradient is planned, not written.
-- **Dependency.** FabricPC 0.3.0 (the repository pin) and 0.6.0 are both tested, through `residual/_fpc_compat.py`. Bias leaves of the FabricPC nodes have a leading singleton axis (`[1, d]`); only the shapes differ between the versions by that axis, not the values.
+
 
 

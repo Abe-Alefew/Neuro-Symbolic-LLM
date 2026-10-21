@@ -25,17 +25,19 @@ from residual import ResidualAdapter  # noqa: E402
 from residual.stability import (  # noqa: E402
     StabilityMonitor,
 )
-from residual.local_predictor import (  # noqa: E402
-    LocalPredictorBank,
-    merge_params,
-    split_params,
-)
 from stages.results import RunWriter, default_run_name, run_metadata  # noqa: E402
 from stages.stage_A.a2 import (  # noqa: E402
+    ARMS,
     A2Config,
+    a2_audit,
     a2_diagnostics,
+    apply_arm,
+    audit_to_dict,
+    init_a2_params,
     make_a2_objective,
     make_a2_optimizer,
+    param_counts,
+    predictor_bank,
 )
 from stages.stage_base import (  # noqa: E402
     Domain,
@@ -63,6 +65,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--arm", choices=ARMS, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--lambda-kl", type=float, default=None)
+    parser.add_argument("--lambda-wd", type=float, default=None)
+    parser.add_argument("--lambda-cp", type=float, default=None)
+    parser.add_argument("--lambda-stab", type=float, default=None)
     parser.add_argument(
         "--eval-checkpoint",
         type=Path,
@@ -90,12 +98,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--predictor-lr-mult", type=float, default=None)
     # Stability
     parser.add_argument("--stability-mode", choices=("off", "diagnostic"), default=None)
+    parser.add_argument("--audit", action="store_true", default=False)
+    parser.add_argument("--audit-only", action="store_true", default=False)
     return parser.parse_args(argv)
 
 
 def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
     adapter, training, domains = cfg.adapter, cfg.training, cfg.domains
     obj: A2Config = cfg.objective
+    if args.arm is not None:
+        obj = apply_arm(obj, args.arm)
+    if args.seed is not None:
+        adapter = replace(adapter, seed=args.seed)
+        training = replace(training, seed=args.seed)
+        obj = replace(
+            obj,
+            seed=args.seed,
+            hid=replace(obj.hid, predictor=replace(obj.predictor, seed=args.seed)),
+        )
     if args.rank is not None:
         adapter = replace(adapter, rank=args.rank)
     if args.model is not None:
@@ -106,6 +126,21 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
         training = replace(training, jit=False)
     if args.eval_batches is not None:
         training = replace(training, eval_batches=args.eval_batches)
+    obj = replace(
+        obj,
+        lambda_kl=args.lambda_kl if args.lambda_kl is not None else obj.lambda_kl,
+        lambda_wd=args.lambda_wd if args.lambda_wd is not None else obj.lambda_wd,
+        cpc=replace(
+            obj.cpc,
+            weight=args.lambda_cp if args.lambda_cp is not None else obj.cpc.weight,
+        ),
+        stab=replace(
+            obj.stab,
+            weight=args.lambda_stab
+            if args.lambda_stab is not None
+            else obj.stab.weight,
+        ),
+    )
     if args.epochs is not None:
         if args.epochs < 0:
             raise ValueError(f"epochs must be >= 0, got {args.epochs}")
@@ -167,21 +202,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"seq_len={train_cfg.seq_len} exceeds {max_pos} positions.")
 
     adapter = ResidualAdapter(cfg.adapter, arch)
-    bank = (
-        LocalPredictorBank(obj.predictor, arch, train_cfg.seq_len, adapter.layers)
-        if obj.uses_hidden_pred
-        else None
-    )
+    bank = predictor_bank(obj, adapter, train_cfg.seq_len) if obj.uses_hidden_pred else None
     monitor = (
         StabilityMonitor(obj.stability, adapter.layers)
         if obj.stability.enabled
         else None
     )
-    adapter_params = adapter.init_params()
-    predictor_params = bank.init_params() if bank is not None else {}
-    params = merge_params(adapter_params, predictor_params)
-    n_adapter = ResidualAdapter.num_params(adapter_params)
-    n_pred = LocalPredictorBank.num_params(predictor_params)
+    params = init_a2_params(obj, adapter, train_cfg.seq_len)
+    counts = param_counts(params)
+    n_adapter = counts["adapter"]
+    n_pred = counts["pred"]
     n_frozen = sum(p.numel() for p in substrate.params.values())
     log.info(
         "model=%s L=%d d=%d adapter_layers=%s predictor_layers=%s rank=%d "
@@ -240,6 +270,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             len(domains[-1].eval_set),
         )
 
+    audit_data = None
+    if args.audit or args.audit_only:
+        audit_data = audit_to_dict(
+            a2_audit(substrate, adapter, obj, domains[0].eval_set[0])
+        )
+        if args.audit_only:
+            print(json.dumps(audit_data, indent=2))
+            return 0 if audit_data["ok"] else 1
+        if not audit_data["ok"]:
+            print(json.dumps(audit_data, indent=2))
+            return 1
+
     def diagnostics(p: dict, domain: Domain) -> dict[str, float]:
         if bank is None:
             return {}
@@ -252,6 +294,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     with RunWriter(train_cfg.output_dir, run_name) as writer:
         log.info("run_dir=%s", writer.dir)
         writer.write_config(cfg.to_dict())
+        if audit_data is not None:
+            writer.write_json("audit.json", audit_data)
         writer.write_json(
             "meta.json",
             {
@@ -264,7 +308,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "predictor_layers": list(bank.layers) if bank else [],
                 "adapter_params": n_adapter,
                 "predictor_params": n_pred,
+                "trainable_params": counts["total"],
+                "trainable_params_by_group": counts,
                 "frozen_params": n_frozen,
+                "arm": args.arm,
+                "seed": train_cfg.seed,
                 "epochs": {d.name: d.epochs for d in domains},
                 "jit": train_cfg.jit,
             },
@@ -297,12 +345,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         # Final test-set evaluation across domains for paper-table results
         test_results = {}
-        adapter_only, _ = split_params(params)
         for d in cfg.domains:
             test_blocks = load_token_blocks(substrate, d, d.test_split, train_cfg.seq_len)
             test_set = make_eval_set(test_blocks, train_cfg.batch_size, train_cfg.eval_batches)
             test_results[d.name] = evaluate(
-                substrate, adapter, adapter_only, test_set, jit=train_cfg.jit
+                substrate, adapter, params, test_set, jit=train_cfg.jit
             )
             writer.log("test", domain=d.name, **test_results[d.name])
         summary["test"] = test_results

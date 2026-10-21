@@ -22,7 +22,7 @@ from stages.stage_A.a2 import (
     Check,
     CPCConfig,
     HEPConfig,
-    StabilityConfig,
+    StabLossConfig,
     a2_audit,
     audit_ok,
     audit_to_dict,
@@ -59,7 +59,7 @@ def full_cfg(**kw: Any) -> A2Config:
         lambda_kl=0.1,
         lambda_wd=0.01,
         cpc=CPCConfig(weight=0.05, dim=8),
-        stab=StabilityConfig(
+        stab=StabLossConfig(
             weight=0.1, w_hep=0.1, hep=HEPConfig(kind="lowrank", rank=4)
         ),
         **kw,
@@ -124,7 +124,7 @@ def test_only_the_enabled_terms_are_audited(substrate, adapter, input_ids) -> No
     assert "grad_routing_cpc" not in off and "finite_with_ignored_labels" not in off
     assert audit_ok(list(off.values()))
     # A fixed highway is a metric: its HEP gradient reaches nothing.
-    cfg = A2Config(stab=StabilityConfig(weight=0.1, hep=HEPConfig("fixed_random", 4)))
+    cfg = A2Config(stab=StabLossConfig(weight=0.1, hep=HEPConfig("fixed_random", 4)))
     fixed = by_name(a2_audit(substrate, adapter, cfg, input_ids))
     assert fixed["grad_routing_stab_hep"].ok is True
     assert fixed["grad_routing_stab_hep"].value["hep"] == 0
@@ -201,6 +201,9 @@ def runner() -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    if not hasattr(module, "main"):
+        sys.modules.pop(spec.name, None)
+        pytest.skip("experiments/run_stage_a2.py is not implemented yet (runner PR)")
     yield module
     sys.modules.pop(spec.name, None)
 

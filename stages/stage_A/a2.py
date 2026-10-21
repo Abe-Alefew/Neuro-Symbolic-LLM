@@ -2,7 +2,8 @@
 
     L_A2 = L_task + lambda_kl * KL(p_F0 || p_F0+R) + lambda_wd * ||phi||^2   (A1, unchanged)
          + lambda_cp   * L_cpc                                               (contrastive future)
-         + lambda_stab * (w_anch * L_zanch + w_hep * L_hep-nudge)            (stability)
+         + lambda_stab * (w_anch * L_zanch + w_hep * L_hep-nudge
+                          + w_smooth * L_res-smooth + w_step * L_step)    (stability)
          + lambda_hid  * L_hid                                               (hidden prediction)
 """
 
@@ -16,6 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import numpy as np
+import optax
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
 from residual import AdapterParams, ResidualAdapter
@@ -26,6 +29,8 @@ from residual.a2_losses import (
     hep_nudge_loss,
     hidden_prediction_loss,
     output_error,
+    residual_smoothness_loss,
+    step_loss,
 )
 from residual.cpc_heads import BACKENDS as CPC_BACKENDS
 from residual.cpc_heads import (
@@ -50,14 +55,12 @@ from residual.local_predictor import (
     PredictorParams,
     split_params,
 )
-from residual.stability import StabilityConfig as MonitorConfig
-from residual.stability import StabilityMonitor
+from residual.stability import StabilityConfig, StabilityMonitor
 from stages.stage_A.a1 import A1Config, a1_objective
 from stages.stage_base import base_logits, checked_kwargs
 
-# =============================================================================
-# 1. Configuration
-# =============================================================================
+#  Configuration
+
 
 
 POSITIVES = ("base", "corrected")
@@ -68,21 +71,18 @@ HIDDEN_TARGETS = ("corrected_teacher", "base_anchor")
 class CPCConfig:
     """``objective.cpc`` section of the A2 YAML."""
 
-    # lambda_cp; 0 switches the term (and its heads) off.
     weight: float = 0.0
-    # Future offsets k (the paper: "such as 1, 2 or 4"; start with (1,)): the
-    # positive is the code k positions ahead. One predictor A_{l,k} per offset.
+    
     offsets: tuple[int, ...] = (1,)
     # m: width of the CPC code.
     dim: int = 32
     tau: float = 0.1
-    # "base": positive from the unmodified model h^base; "corrected": from h~.
     positive: str = "base"
-    # Deterministic stride subsampling of anchor positions; null keeps all.
+    
     max_anchors_per_seq: int | None = 256
-    # Std of the noise added to the identity predictor A_{l,k}.
+    
     a_init_noise: float = 0.01
-    # "fabricpc": the heads q and A run as FabricPC nodes; "jax": pure-JAX reference.
+    
     heads: str = "fabricpc"
 
     def __post_init__(self) -> None:
@@ -162,7 +162,7 @@ class HEPConfig:
     kind: str | None = None
     # Rank of the low-rank / fixed-random highway.
     rank: int = 16
-    # alpha_y: gain of the nudge (the program sweeps it).
+    
     alpha: float = 1.0
 
     def __post_init__(self) -> None:
@@ -188,22 +188,28 @@ class HEPConfig:
 
 
 @dataclass(frozen=True)
-class StabilityConfig:
-    """``objective.stab`` section of the A2 YAML."""
+class StabLossConfig:
+    """``objective.stab`` section of the A2 YAML: the stability *loss*.
+
+    ``L_stab = w_anch * L_zanch + w_hep * L_hep-nudge + w_smooth * L_res-smooth + w_step * L_step``.
+    """
 
     # lambda_stab; 0 switches the whole term off.
     weight: float = 0.0
     w_anch: float = 1.0
     # 0: HEP nudge is only logged. > 0 needs a trainable highway (dense / lowrank).
     w_hep: float = 0.0
+    # Residual smoothness: neighbouring tokens get similar corrections.
+    w_smooth: float = 0.0
+    # Settling-step loss: exactly 0 in A2 (no settling); used by A3.
+    w_step: float = 0.0
     normalize: str = "relative"
-    # "fabricpc": the squared errors are FabricPC node energies (IdentityNode for the
-    # anchor, Linear node(s) for the highway); "jax": plain arithmetic (test oracle).
+
     backend: str = "fabricpc"
     hep: HEPConfig = field(default_factory=HEPConfig)
 
     def __post_init__(self) -> None:
-        for name in ("weight", "w_anch", "w_hep"):
+        for name in ("weight", "w_anch", "w_hep", "w_smooth", "w_step"):
             _number(name, getattr(self, name))
         if self.normalize not in NORMALIZATIONS:
             raise ValueError(
@@ -223,7 +229,7 @@ class StabilityConfig:
             )
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> StabilityConfig:
+    def from_dict(cls, data: Mapping[str, Any]) -> StabLossConfig:
         raw = dict(checked_kwargs(cls, data))
         raw["hep"] = HEPConfig.from_dict(raw.get("hep") or {})
         return cls(**raw)
@@ -241,6 +247,7 @@ class StabilityConfig:
         return self.enabled and self.hep.kind is not None
 
 
+HIDDEN_TARGETS = ("corrected_teacher", "base_anchor")
 HIDDEN_NORMS = ("target_var", "none")
 
 
@@ -257,12 +264,25 @@ class HiddenConfig:
     # "target_var": divide the squared error by the target variance (scale-free);
     # "none": plain mean squared error.
     hidden_norm: str = "target_var"
-    # The first token has no left context (an attention sink with a huge norm in GPT-2).
+    
     skip_first_token: bool = True
+    
+    predictor_lr_mult: float = 1.0
     predictor: PredictorConfig = field(default_factory=PredictorConfig)
+    
+    stability: StabilityConfig = field(default_factory=StabilityConfig)
+    cpc: CPCConfig = field(default_factory=CPCConfig)
+    stab: StabLossConfig = field(default_factory=StabLossConfig)
 
     def __post_init__(self) -> None:
-        _number("weight", self.weight)
+        for name in ("lambda_kl", "lambda_wd", "lambda_hid"):
+            _number(name, getattr(self, name))
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            raise ValueError(f"seed must be an integer, got {self.seed!r}")
+        if self.hidden_target not in HIDDEN_TARGETS:
+            raise ValueError(
+                f"hidden_target must be one of {HIDDEN_TARGETS}, got {self.hidden_target!r}"
+            )
         if self.lambda_hid is not None:
             _number("lambda_hid", self.lambda_hid)
             if self.weight != 0.0 and self.weight != self.lambda_hid:
@@ -283,7 +303,7 @@ class HiddenConfig:
             )
         if self.hidden_norm not in HIDDEN_NORMS:
             raise ValueError(
-                f"hidden_norm must be one of {list(HIDDEN_NORMS)}, got {self.hidden_norm!r}"
+                f"hidden_norm must be one of {HIDDEN_NORMS}, got {self.hidden_norm!r}"
             )
         if not isinstance(self.skip_first_token, bool):
             raise ValueError(
@@ -371,11 +391,21 @@ class A2Config:
             hid.update(legacy_hid)
             raw["hid"] = hid
         raw = dict(checked_kwargs(cls, raw))
+        raw["predictor"] = PredictorConfig.from_dict(raw.get("predictor") or {})
+        raw["stability"] = StabilityConfig.from_dict(raw.get("stability") or {})
         raw["cpc"] = CPCConfig.from_dict(raw.get("cpc") or {})
-        raw["stab"] = StabilityConfig.from_dict(raw.get("stab") or {})
-        raw["hid"] = HiddenConfig.from_dict(raw.get("hid") or {})
-        raw["monitor"] = MonitorConfig.from_dict(raw.get("monitor") or {})
+        raw["stab"] = StabLossConfig.from_dict(raw.get("stab") or {})
         return cls(**raw)
+
+    @property
+    def uses_hidden_pred(self) -> bool:
+        """Whether the hidden-prediction loss (and so the predictor bank) is on."""
+        return self.lambda_hid > 0
+
+    @property
+    def hid_coupled(self) -> bool:
+        """Whether the predictor error reaches the adapter (``detach_input`` false)."""
+        return self.uses_hidden_pred and not self.predictor.detach_input
 
     @property
     def needs_base_states(self) -> bool:
@@ -387,19 +417,29 @@ class A2Config:
         )
 
     @property
+    def needs_base_targets(self) -> bool:
+        """Whether the hidden-prediction target comes from the base model (Option A)."""
+        return self.uses_hidden_pred and self.hidden_target == "base_anchor"
+
+    @property
+    def needs_base_targets(self) -> bool:
+        """Whether the hidden-prediction target comes from the base model (Option A)."""
+        return self.uses_hidden_pred and self.hidden_target == "base_anchor"
+
+    @property
     def aux_enabled(self) -> bool:
         """Whether any auxiliary *loss* is on."""
-        return self.cpc.enabled or self.stab.enabled or self.hid.enabled
+        return self.cpc.enabled or self.stab.enabled or self.uses_hidden_pred
 
     @property
     def needs_corrected(self) -> bool:
-        """Whether the corrected states ``h~_l`` are needed (a loss or the monitor)."""
-        return self.aux_enabled or self.monitor.enabled
+        """Whether the corrected states ``h~_l`` are needed (a loss or the metrics)."""
+        return self.aux_enabled or self.stability.enabled
 
 
-# =============================================================================
-# 2. Parameters
-# =============================================================================
+
+# Parameters
+
 
 # The flat tree is two levels deep (``RunWriter.save_params`` requires it).
 ADAPTER_PREFIX = "layer_"  # layer_key(l) == f"{ADAPTER_PREFIX}{l}"
@@ -410,10 +450,15 @@ def adapter_params(params: Mapping[str, Mapping[str, jax.Array]]) -> AdapterPara
     return {k: dict(v) for k, v in params.items() if k.startswith(ADAPTER_PREFIX)}
 
 
-def init_a2_params(config: A2Config, adapter: ResidualAdapter) -> dict[str, Any]:
-    """The adapter parameters plus the heads the enabled terms need.
+# The predictor weights do not depend on the sequence length (only the graph's input shape
+# does), so a tree initialised here works for any ``seq_len``.
+_INIT_SEQ_LEN = 1
 
-    With every auxiliary weight at 0 this is exactly ``adapter.init_params()``.
+
+def init_a2_params(
+    config: A2Config, adapter: ResidualAdapter, seq_len: int | None = None
+) -> dict[str, Any]:
+    """The adapter parameters plus the heads and predictors the enabled terms need.
     """
     d = adapter.hidden_size
     layers = tuple(adapter.layers)
@@ -428,8 +473,9 @@ def init_a2_params(config: A2Config, adapter: ResidualAdapter) -> dict[str, Any]
     if clash:
         raise ValueError(f"head parameters clash with the adapter keys: {clash}")
     params.update(heads)
-    if config.hid.enabled:
-        pred = predictor_bank(config.hid, adapter).init_params(config.seed)
+    if config.uses_hidden_pred:
+        bank = predictor_bank(config, adapter, seq_len or _INIT_SEQ_LEN)
+        pred = bank.init_params()
         clash = sorted(set(pred) & set(params))
         if clash:
             raise ValueError(f"predictor parameters clash with the other keys: {clash}")
@@ -441,9 +487,9 @@ _BANKS: dict[tuple[Any, ...], LocalPredictorBank] = {}
 
 
 def predictor_bank(
-    config: HiddenConfig, adapter: ResidualAdapter
+    config: A2Config, adapter: ResidualAdapter, seq_len: int
 ) -> LocalPredictorBank:
-    """The predictors ``P_l`` of ``config`` for ``adapter``'s sites (built once, then reused).
+    """The predictors ``P_l`` of ``config.predictor`` for ``adapter``'s sites (built once).
     """
     p = config.predictor
     arch = adapter.architecture
@@ -456,10 +502,11 @@ def predictor_bank(
         p.seed,
         arch.hidden_size,
         arch.num_layers,
+        seq_len,
         tuple(adapter.layers),
     )
     if key not in _BANKS:
-        bank = LocalPredictorBank(p, arch, tuple(adapter.layers))
+        bank = LocalPredictorBank(p, arch, seq_len, adapter.layers)
         stray = sorted(set(bank.layers) - set(adapter.layers))
         if stray:
             raise ValueError(
@@ -512,7 +559,7 @@ def init_cpc_params(
 
 
 def init_hep_params(
-    config: StabilityConfig,
+    config: StabLossConfig,
     seed: int,
     layers: tuple[int, ...],
     vocab_size: int,
@@ -527,18 +574,13 @@ def init_hep_params(
     )
 
 
-# =============================================================================
-# 3. Terms (pure functions of hidden-state dictionaries ``{layer: [B, T, d]}``)
-# =============================================================================
+
+# Terms (pure functions of hidden-state dictionaries ``{layer: [B, T, d]}``)
+
 
 
 def token_mask(labels: jax.Array | None, ignore_index: int = -100) -> jax.Array | None:
     """``[B, T]`` validity of the tokens from the labels: ``labels != ignore_index``.
-
-    ``None`` when there are no labels (every token is then treated as real). Note
-    that tokens whose label is ignored for the task loss (a prompt, say) are also
-    left out of the contrastive term; pass an explicit ``mask`` to ``cpc_term``
-    to keep them.
     """
     if labels is None:
         return None
@@ -599,7 +641,7 @@ def cpc_term(
 def stability_term(
     params: Mapping[str, Mapping[str, jax.Array]],
     *,
-    config: StabilityConfig,
+    config: StabLossConfig,
     corrected: Mapping[int, jax.Array],
     base: Mapping[int, jax.Array] | None = None,
     logits: jax.Array | None = None,
@@ -607,21 +649,13 @@ def stability_term(
     seed: int = 0,
     tied: jax.Array | None = None,
     mask: jax.Array | None = None,
+    sites: Mapping[int, jax.Array] | None = None,
+    trajectories: Mapping[int, jax.Array] | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """``w_anch * L_zanch + w_hep * L_hep-nudge`` (without ``lambda_stab``) and diagnostics.
+    """The stability loss without ``lambda_stab``, and diagnostics::
 
-    Args:
-        params: a tree holding the trainable highway entries ``hep_<l>`` (if any).
-        corrected: ``{layer: h~_l}``, each ``[..., B, T, d]``, carrying gradient.
-        base: ``{layer: h^base_l}``; required when ``w_anch > 0``.
-        logits, labels: adapted logits ``[B, T, V]`` and the labels (the inputs when
-            training on plain text); required when HEP is configured. ``-100`` labels
-            are ignored.
-        seed: seed of the ``fixed_random`` highway.
-        tied: ``[V, d]`` matrix for ``hep.kind == "tied"``.
-        mask: optional ``[B, T]`` token validity (``False`` = padding) for the anchor
-            term, e.g. ``token_mask(labels)``. The HEP term masks by the
-            ignored labels on its own.
+        w_anch * L_zanch + w_hep * L_hep-nudge + w_smooth * L_res-smooth + w_step * L_step
+
     """
     if not corrected:
         raise ValueError("stability_term needs at least one site.")
@@ -647,6 +681,43 @@ def stability_term(
         l_anch = jnp.mean(jnp.stack(losses))
         total = total + config.w_anch * l_anch
         metrics["stab_anch"] = l_anch
+        for name in parts[0]:
+            metrics[name] = jnp.mean(jnp.stack([m[name] for m in parts]))
+
+    if config.w_smooth > 0:
+        if sites is None:
+            raise ValueError("w_smooth > 0 requires the adapter input states (sites).")
+        losses, parts = [], []
+        for layer, h in corrected.items():
+            if layer not in sites:
+                raise KeyError(f"missing adapter input state for layer {layer}.")
+            loss, m = residual_smoothness_loss(
+                h - sites[layer],
+                sites[layer],
+                normalize=config.normalize,
+                mask=mask,
+                backend=config.backend,
+            )
+            losses.append(loss)
+            parts.append(m)
+        l_smooth = jnp.mean(jnp.stack(losses))
+        total = total + config.w_smooth * l_smooth
+        metrics["stab_smooth"] = l_smooth
+        for name in parts[0]:
+            metrics[name] = jnp.mean(jnp.stack([m[name] for m in parts]))
+
+    if config.w_step > 0:
+        losses, parts = [], []
+        for layer, h in corrected.items():
+            traj = h[None] if trajectories is None else trajectories[layer]
+            loss, m = step_loss(
+                traj, normalize=config.normalize, mask=mask, backend=config.backend
+            )
+            losses.append(loss)
+            parts.append(m)
+        l_step = jnp.mean(jnp.stack(losses))
+        total = total + config.w_step * l_step
+        metrics["stab_step"] = l_step
         for name in parts[0]:
             metrics[name] = jnp.mean(jnp.stack([m[name] for m in parts]))
 
@@ -691,25 +762,13 @@ def stability_term(
 def hid_term(
     params: Mapping[str, Mapping[str, jax.Array]],
     *,
-    config: HiddenConfig,
+    config: A2Config,
     bank: LocalPredictorBank,
     corrected: Mapping[int, jax.Array],
     targets: Mapping[int, jax.Array],
     mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Unweighted ``L_hid`` (mean over the predictor sites) and its diagnostics.
-
-    Args:
-        params: a tree holding the predictors ``pred_layer_<l>``.
-        bank: the :class:`LocalPredictorBank` that built them.
-        corrected: ``{layer: h~_l}``, each ``[B, T, d]`` (the predictor input).
-        targets: ``{layer: h_{l+1}}``, the output of the next frozen block for the
-            adapted pass; stop-gradient is applied here.
-        mask: optional ``[B, T]`` token validity (``False`` = padding).
-
-    ``hid_rel`` is the squared error relative to the target variance and
-    ``hid_copy_rel`` the same for the trivial predictor ``h~_l`` itself: a predictor
-    that beats copying has ``hid_rel < hid_copy_rel``.
     """
     losses = []
     parts: list[dict[str, jax.Array]] = []
@@ -730,61 +789,109 @@ def hid_term(
     return jnp.mean(jnp.stack(losses)), metrics
 
 
-# =============================================================================
-# 4. Objective
-# =============================================================================
+
+# Objective
 
 
-def a2_objective(
+
+def compose_a2_loss(
+    model_loss: jax.Array,
+    *,
+    config: A2Config,
+    weight_decay: jax.Array,
+    task: jax.Array | None = None,
+    kl: jax.Array | None = None,
+    hidden: jax.Array | None = None,
+    cpc: jax.Array | None = None,
+    stab: jax.Array | None = None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Combine the loss terms and return ``(total, terms)
+    """
+    total = model_loss + config.lambda_wd * weight_decay
+    terms: dict[str, jax.Array] = {
+        "task": model_loss if task is None else task,
+        "wd": weight_decay,
+    }
+    if kl is not None:
+        terms["kl"] = kl
+    for name, value, weight in (
+        ("cpc", cpc, config.cpc.weight),
+        ("stab", stab, config.stab.weight),
+        ("hid", hidden, config.lambda_hid),
+    ):
+        if value is not None:
+            total = total + weight * value
+            terms[name] = value
+    return total, terms
+
+
+def _intercept_sites(
+    adapter: ResidualAdapter, pred_layers: Sequence[int]
+) -> tuple[int, ...]:
+    """Adapted sites, the predictor input sites, and the blocks that follow them."""
+    return tuple(
+        sorted(set(adapter.layers) | set(pred_layers) | {i + 1 for i in pred_layers})
+    )
+
+
+def _a2_objective(
     params: Mapping[str, Mapping[str, jax.Array]],
     *,
     substrate: FrozenSubstrate,
     adapter: ResidualAdapter,
     config: A2Config,
     input_ids: jax.Array,
-    labels: jax.Array | None = None,
-    base: jax.Array | None = None,
+    labels: jax.Array | None,
+    base: jax.Array | None,
+    bank: LocalPredictorBank | None,
+    monitor: StabilityMonitor | None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """``(total, terms)`` of the A2 objective; the ``Objective`` contract of ``run_sequential``.
-
-    ``params`` is the whole flat tree of :func:`init_a2_params`. ``base`` is optional
-    precomputed base *logits* (as in A1). ``terms`` holds ``total``, ``task``,
-    ``wd`` (and ``kl`` when computed), plus ``cpc`` / ``stab`` / ``hid`` and their
-    diagnostics for the enabled terms (``cpc``, ``stab`` and ``hid`` are logged *before*
-    their lambda), and the monitor metrics when ``monitor.mode`` is ``diagnostic``.
-
-    With every auxiliary weight 0 the result equals ``a1_objective``; the monitor never
-    changes ``total`` or a gradient.
-    """
     ap = adapter_params(params)
-    bank = predictor_bank(config.hid, adapter) if config.hid.enabled else None
-    # The hidden-prediction target of site l is the output of block l+1, so that block
-    # is intercepted as well (a layer without adapter parameters is passed through).
-    intercept = tuple(adapter.layers)
-    if bank is not None:
-        intercept = tuple(sorted(set(intercept) | {i + 1 for i in bank.layers}))
+    use_hid = config.uses_hidden_pred
+    if use_hid and bank is None:
+        bank = predictor_bank(config, adapter, int(input_ids.shape[1]))
+    pred_layers: tuple[int, ...] = tuple(bank.layers) if (use_hid and bank) else ()
+    if monitor is None and config.stability.enabled:
+        monitor = StabilityMonitor(config.stability, adapter.layers)
+    monitor_on = monitor is not None and monitor.config.enabled
+
+    # The hidden-prediction target of site l is the output of block l+1, so that block is
+    # intercepted as well (a layer without adapter parameters is passed through).
     run = substrate.run_with_interception(
-        input_ids, modify_fn=adapter.modify_fn(ap), intercept_layers=intercept
+        input_ids,
+        modify_fn=adapter.modify_fn(ap),
+        intercept_layers=_intercept_sites(adapter, pred_layers),
     )
     adapted = run.logits
     target_labels = input_ids if labels is None else labels
     wd = ResidualAdapter.l2_norm_sq(ap)
 
     need_states = config.needs_base_states
+    need_targets = config.needs_base_targets
     need_kl = config.lambda_kl > 0 or base is not None
     base_states: dict[int, jax.Array] | None = None
+    base_targets: dict[int, jax.Array] | None = None
     base_lg: jax.Array | None = None
-    if need_states:
-        # One extra forward gives both the base states and (if not given) base logits.
+    if need_states or need_targets:
+        
+        wanted = set(adapter.layers) if need_states else set()
+        if need_targets:
+            wanted |= {i + 1 for i in pred_layers}
         base_run = substrate.run_with_interception(
             input_ids,
             modify_fn=identity_modify,
-            intercept_layers=intercept,
+            intercept_layers=tuple(sorted(wanted)),
         )
-        base_states = {
-            layer: jax.lax.stop_gradient(base_run.hidden_state(layer))
-            for layer in intercept
-        }
+        if need_states:
+            base_states = {
+                layer: jax.lax.stop_gradient(base_run.hidden_state(layer))
+                for layer in intercept
+            }
+        if need_targets:
+            base_targets = {
+                i: jax.lax.stop_gradient(base_run.hidden_state(i + 1))
+                for i in pred_layers
+            }
         base_lg = jax.lax.stop_gradient(base_run.logits if base is None else base)
     elif need_kl:
         base_lg = (
@@ -793,13 +900,13 @@ def a2_objective(
             else jax.lax.stop_gradient(base)
         )
 
-    terms: dict[str, jax.Array]
-    if base_lg is None:  # no KL: skip it rather than log NaN (strict JSON rejects it)
-        task = substrate.compute_loss(adapted, target_labels, losses=("CE",))
-        total = task
-        terms = {"task": task}
+    if base_lg is None:  
+        model_loss = task = substrate.compute_loss(
+            adapted, target_labels, losses=("CE",)
+        )
+        kl = None
     else:
-        total, components = substrate.compute_loss(
+        model_loss, components = substrate.compute_loss(
             adapted,
             target_labels,
             losses=("CE", "KL"),
@@ -807,23 +914,27 @@ def a2_objective(
             weights={"KL": config.lambda_kl},
             return_components=True,
         )
-        task = components["ce"]
-        terms = {"task": task, "kl": components["kl"]}
-    total = total + config.lambda_wd * wd
-    terms["wd"] = wd
+        task, kl = components["ce"], components["kl"]
 
-    if config.needs_corrected:
+    l_cpc = l_stab = l_hid = None
+    extra: dict[str, jax.Array] = {}
+    if config.needs_corrected or monitor_on:
         # h~_l = R applied to the pristine block output (what the next block receives).
         sites = {layer: run.hidden_state(layer) for layer in adapter.layers}
         corrected = {layer: adapter.apply(ap, h, layer) for layer, h in sites.items()}
         mask = token_mask(labels)
-        if config.monitor.enabled:
-            terms.update(
+        if monitor_on:
+            assert monitor is not None
+            # Metrics only (stop-gradient inside); the loss is untouched.
+            extra.update(
                 collect_stability_metrics(
-                    StabilityMonitor(config.monitor, adapter.layers),
+                    monitor,
                     adapter,
                     ap,
-                    sites,
+                    {
+                        i: sites[i] if i in sites else run.hidden_state(i)
+                        for i in monitor.layers
+                    },
                     corrected=corrected,
                 )
             )
@@ -835,9 +946,7 @@ def a2_objective(
                 base=base_states,
                 mask=mask,
             )
-            total = total + config.cpc.weight * l_cpc
-            terms["cpc"] = l_cpc
-            terms.update(m)
+            extra.update(m)
         if config.stab.enabled:
             l_stab, m = stability_term(
                 params,
@@ -848,12 +957,27 @@ def a2_objective(
                 labels=target_labels,
                 seed=config.seed,
                 mask=mask,
+                sites=sites,
             )
-            total = total + config.stab.weight * l_stab
-            terms["stab"] = l_stab
-            terms.update(m)
-        if config.hid.enabled:
+            extra.update(m)
+        if use_hid:
             assert bank is not None
+            inputs = {
+                i: (
+                    corrected[i]
+                    if i in corrected
+                    else adapter.apply(ap, run.hidden_state(i), i)
+                )
+                for i in pred_layers
+            }
+            targets = (
+                base_targets
+                if base_targets is not None
+                else {
+                    i: jax.lax.stop_gradient(run.hidden_state(i + 1))
+                    for i in pred_layers
+                }
+            )
             if config.hid.hidden_target == "base_anchor":
                 assert base_states is not None
                 targets = {
@@ -867,22 +991,160 @@ def a2_objective(
                 }
             l_hid, m = hid_term(
                 params,
-                config=config.hid,
+                config=config,
                 bank=bank,
-                corrected=corrected,
+                corrected=inputs,
                 targets=targets,
                 mask=mask,
             )
-            total = total + config.hid.weight * l_hid
-            terms["hid"] = l_hid
-            terms.update(m)
+            extra.update(m)
+            for i in pred_layers:  # per-site relative error, as the predictor sees it
+                extra[f"hid_rel_l{i}"] = _site_rel(
+                    params, config, bank, inputs[i], targets[i], i, mask
+                )
 
-    return total, {"total": total, **terms}
+    total, terms = compose_a2_loss(
+        model_loss,
+        config=config,
+        weight_decay=wd,
+        task=task,
+        kl=kl,
+        hidden=l_hid,
+        cpc=l_cpc,
+        stab=l_stab,
+    )
+    return total, {"total": total, **terms, **extra}
 
 
-# =============================================================================
-# 5. Ablation arms
-# =============================================================================
+def _site_rel(
+    params: Mapping[str, Mapping[str, jax.Array]],
+    config: A2Config,
+    bank: LocalPredictorBank,
+    source: jax.Array,
+    target: jax.Array,
+    layer: int,
+    mask: jax.Array | None,
+) -> jax.Array:
+    out = hidden_prediction_loss(
+        bank.predict(params, layer, source), target, source, config, mask=mask
+    )
+    return out["rel"]
+
+
+def make_a2_objective(
+    bank: LocalPredictorBank | None = None, monitor: StabilityMonitor | None = None
+) -> Callable[..., tuple[jax.Array, dict[str, jax.Array]]]:
+    """Bind the predictor bank and the stability monitor into a stage objective.
+    """
+
+    def a2_objective(
+        params: Mapping[str, Mapping[str, jax.Array]],
+        *,
+        substrate: FrozenSubstrate,
+        adapter: ResidualAdapter,
+        config: A2Config,
+        input_ids: jax.Array,
+        labels: jax.Array | None = None,
+        base: jax.Array | None = None,
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        return _a2_objective(
+            params,
+            substrate=substrate,
+            adapter=adapter,
+            config=config,
+            input_ids=input_ids,
+            labels=labels,
+            base=base,
+            bank=bank,
+            monitor=monitor,
+        )
+
+    return a2_objective
+
+
+# The objective that builds its bank and monitor from the config (tests, audit, notebooks).
+a2_objective = make_a2_objective()
+
+
+def make_a2_optimizer(
+    config: A2Config, learning_rate: float
+) -> optax.GradientTransformation:
+    """Adam over the combined PyTree; the predictor group can use its own step size."""
+    if config.predictor_lr_mult == 1.0:
+        return optax.adam(learning_rate)
+
+    def labels(params: Mapping[str, Any]) -> dict[str, Any]:
+        _, pred = split_params(params)
+        return {
+            k: jax.tree_util.tree_map(
+                lambda _, group="pred" if k in pred else "adapter": group, v
+            )
+            for k, v in params.items()
+        }
+
+    return optax.multi_transform(
+        {
+            "adapter": optax.adam(learning_rate),
+            "pred": optax.adam(learning_rate * config.predictor_lr_mult),
+        },
+        labels,
+    )
+
+
+def a2_diagnostics(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    bank: LocalPredictorBank,
+    config: A2Config,
+    params: Mapping[str, Any],
+    eval_batches: Sequence[jax.Array],
+    *,
+    jit: bool = True,
+) -> dict[str, float]:
+  
+    adapter_p = adapter_params(params)
+    pred_p = predictor_params(params)
+    sites = _intercept_sites(adapter, bank.layers)
+    next_blocks = tuple(sorted({i + 1 for i in bank.layers}))
+
+    def step(p_adapter: Mapping[str, Any], p_pred: Mapping[str, Any], ids: jax.Array):
+        res = substrate.run_with_interception(
+            ids, modify_fn=adapter.modify_fn(p_adapter), intercept_layers=sites
+        )
+        base_res = substrate.run_with_interception(
+            ids, modify_fn=identity_modify, intercept_layers=next_blocks
+        )
+        out: dict[str, jax.Array] = {}
+        for i in bank.layers:
+            u = adapter.apply(p_adapter, res.hidden_state(i), i)
+            guess = bank.predict(p_pred, i, u)
+            teacher = res.hidden_state(i + 1)
+            base_next = base_res.hidden_state(i + 1)
+            on_teacher = hidden_prediction_loss(guess, teacher, u, config)
+            on_base = hidden_prediction_loss(guess, base_next, u, config)
+            shift = hidden_prediction_loss(teacher, base_next, teacher, config)
+            out[f"pred_rel_l{i}"] = on_teacher["rel"]
+            out[f"copy_rel_l{i}"] = on_teacher["copy_rel"]
+            out[f"pred_rel_base_l{i}"] = on_base["rel"]
+            out[f"teacher_shift_l{i}"] = shift["rel"]
+        return out
+
+    fn = jax.jit(step) if jit else step
+    rows = [
+        {k: float(v) for k, v in fn(adapter_p, pred_p, ids).items()}
+        for ids in eval_batches
+    ]
+    summary = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
+    for name in ("pred_rel", "copy_rel"):
+        summary[f"{name}_mean"] = float(
+            np.mean([summary[f"{name}_l{i}"] for i in bank.layers])
+        )
+    return summary
+
+
+
+# Ablation arms
+
 
 # Weights used when an arm switches a term on and the config's own weight is 0.
 ARM_DEFAULT_WEIGHTS = {"cpc": 0.05, "stab": 0.1, "hid": 0.1}
@@ -890,11 +1152,13 @@ ARM_DEFAULT_WEIGHTS = {"cpc": 0.05, "stab": 0.1, "hid": 0.1}
 # Arms the implemented terms allow. Each arm only chooses *which* terms run and their
 # variant; lambda_kl, lambda_wd, the data, optimiser and seeds are shared, so contrasts
 # against ``a1_mode`` isolate one term. ``monitor`` is measurement-only and is never
-# switched by an arm: set ``objective.monitor.mode`` to log it in any arm.
+# switched by an arm: set ``objective.stability.mode`` to log it in any arm.
 ARMS = (
     "a1_mode",  # no auxiliary term: the A1 objective
     "stab_anch",  # anchor only
     "stab_hep",  # anchor + trainable low-rank HEP highway
+    "stab_smooth",  # anchor + residual smoothness
+    "stab_all",  # all four: anchor, HEP nudge, residual smoothness, step
     "cpc_base",  # contrastive future, positive from the base state
     "cpc_corrected",  # contrastive future, positive from the corrected state
     "cpc_multi",  # contrastive future, offsets 1, 2, 4
@@ -909,22 +1173,18 @@ def _weight(section_weight: float, term: str) -> float:
 
 
 def apply_arm(config: A2Config, arm: str) -> A2Config:
-    """``config`` with the terms of ablation arm ``arm`` on and all others off.
-
-    The lambdas of the config are kept (a zero weight falls back to
-    ``ARM_DEFAULT_WEIGHTS``), so ``objective.cpc.weight`` / ``objective.stab.weight``
-    in the YAML tune the arms.
-    """
+    
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}; choose one of {list(ARMS)}")
     off_cpc = replace(config.cpc, weight=0.0)
-    off_stab = replace(config.stab, weight=0.0, w_hep=0.0, hep=HEPConfig())
-    off_hid = replace(config.hid, weight=0.0)
+    off_stab = replace(
+        config.stab, weight=0.0, w_hep=0.0, w_smooth=0.0, w_step=0.0, hep=HEPConfig()
+    )
 
     def cpc_on(**over: Any) -> CPCConfig:
         return replace(config.cpc, weight=_weight(config.cpc.weight, "cpc"), **over)
 
-    def anchor_on() -> StabilityConfig:
+    def anchor_on() -> StabLossConfig:
         # Keep a fixed highway of the config as a logged metric; a trainable one would
         # allocate parameters that get no gradient without w_hep.
         hep = config.stab.hep if not config.stab.hep.trainable else HEPConfig()
@@ -933,16 +1193,18 @@ def apply_arm(config: A2Config, arm: str) -> A2Config:
             weight=_weight(config.stab.weight, "stab"),
             w_anch=1.0,
             w_hep=0.0,
+            w_smooth=0.0,
+            w_step=0.0,
             hep=hep,
         )
 
-    def hid_on(detach_input: bool) -> HiddenConfig:
-        predictor = replace(config.hid.predictor, detach_input=detach_input)
-        return replace(
-            config.hid, weight=_weight(config.hid.weight, "hid"), predictor=predictor
-        )
+    def hid_on(detach_input: bool) -> dict[str, Any]:
+        return {
+            "lambda_hid": _weight(config.lambda_hid, "hid"),
+            "predictor": replace(config.predictor, detach_input=detach_input),
+        }
 
-    cpc, stab, hid = off_cpc, off_stab, off_hid
+    cpc, stab, hid = off_cpc, off_stab, {"lambda_hid": 0.0}
     if arm == "stab_anch":
         stab = anchor_on()
     elif arm == "stab_hep":
@@ -950,6 +1212,20 @@ def apply_arm(config: A2Config, arm: str) -> A2Config:
         kind = config.stab.hep.kind if config.stab.hep.trainable else "lowrank"
         w_hep = config.stab.w_hep if config.stab.w_hep > 0 else 0.1
         stab = replace(base, w_hep=w_hep, hep=replace(config.stab.hep, kind=kind))
+    elif arm == "stab_smooth":
+        stab = replace(
+            anchor_on(),
+            w_smooth=config.stab.w_smooth if config.stab.w_smooth > 0 else 0.1,
+        )
+    elif arm == "stab_all":
+        kind = config.stab.hep.kind if config.stab.hep.trainable else "lowrank"
+        stab = replace(
+            anchor_on(),
+            w_hep=config.stab.w_hep if config.stab.w_hep > 0 else 0.1,
+            w_smooth=config.stab.w_smooth if config.stab.w_smooth > 0 else 0.1,
+            w_step=config.stab.w_step if config.stab.w_step > 0 else 1.0,
+            hep=replace(config.stab.hep, kind=kind),
+        )
     elif arm == "cpc_base":
         cpc = cpc_on(positive="base")
     elif arm == "cpc_corrected":
@@ -966,12 +1242,12 @@ def apply_arm(config: A2Config, arm: str) -> A2Config:
             anchor_on(),
             hid_on(detach_input=False),
         )
-    return replace(config, cpc=cpc, stab=stab, hid=hid)
+    return replace(config, cpc=cpc, stab=stab, **hid)
 
 
-# =============================================================================
-# 6. Audit: checkpoints you can inspect
-# =============================================================================
+
+# Audit: checkpoints you can inspect
+
 
 
 @dataclass(frozen=True)
@@ -1014,14 +1290,13 @@ def a2_audit(
     probe_scale: float = 0.05,
 ) -> list[Check]:
     """Run the A2 checkpoints once on ``input_ids`` and return them.
-
     """
     checks: list[Check] = []
 
     def add(name: str, ok: bool | None, value: Any, detail: str = "") -> None:
         checks.append(Check(name, ok, value, detail))
 
-    params0 = init_a2_params(config, adapter)
+    params0 = init_a2_params(config, adapter, seq_len=int(input_ids.shape[1]))
     key = jax.random.PRNGKey(config.seed + 1)
     probe = {k: dict(v) for k, v in params0.items()}
     for i, k in enumerate(adapter_params(params0)):
@@ -1040,11 +1315,11 @@ def a2_audit(
             **kw,
         )
 
-    # 1. The parameter tree has exactly the groups the config asks for.
+    
     counts = param_counts(params0)
     want_cpc = config.cpc.enabled
     want_hep = config.stab.enabled and config.stab.hep.trainable
-    want_pred = config.hid.enabled
+    want_pred = config.uses_hidden_pred
     add(
         "param_groups",
         (counts["cpc"] > 0) == want_cpc
@@ -1055,10 +1330,10 @@ def a2_audit(
         f"hidden predictors: {want_pred}",
     )
 
-    # 2. The frozen model is untouched before we start.
+    
     add("frozen_before", bool(substrate.params_unchanged()), None)
 
-    # 3. At init the adapted model equals the base model.
+    
     base = base_logits(substrate, input_ids)
     adapted0 = substrate.run_with_interception(
         input_ids,
@@ -1068,13 +1343,13 @@ def a2_audit(
     diff = _f(jnp.max(jnp.abs(adapted0 - base)))
     add("init_equals_base", diff < 1e-4, diff, "max |adapted logits - base logits|")
 
-    # 4. Every term is finite, at init and at the probe.
+    
     for label, p in (("init", params0), ("probe", probe)):
         _, terms = run(p)
         bad = sorted(k for k, v in terms.items() if not bool(jnp.isfinite(v)))
         add(f"finite_{label}", not bad, {k: _f(v) for k, v in terms.items()}, str(bad))
 
-    # 5. total = the weighted sum of the logged terms.
+    
     total, t = run(probe)
     expected = (
         t["task"]
@@ -1082,17 +1357,17 @@ def a2_audit(
         + config.lambda_wd * t["wd"]
         + config.cpc.weight * t.get("cpc", 0.0)
         + config.stab.weight * t.get("stab", 0.0)
-        + config.hid.weight * t.get("hid", 0.0)
+        + config.lambda_hid * t.get("hid", 0.0)
     )
     err = abs(_f(total) - _f(expected)) / max(abs(_f(total)), 1e-12)
     add("total_decomposition", err < 1e-4, err, "relative error of total vs the sum")
 
-    # 6. With the auxiliary weights at 0, A2 is A1 (values and gradients).
+    
     off = replace(
         config,
         cpc=replace(config.cpc, weight=0.0),
         stab=replace(config.stab, weight=0.0),
-        hid=replace(config.hid, weight=0.0),
+        lambda_hid=0.0,
     )
     a1_cfg = A1Config(lambda_kl=config.lambda_kl, lambda_wd=config.lambda_wd)
     ap = adapter_params(probe)
@@ -1124,9 +1399,9 @@ def a2_audit(
         "aux weights 0: A2 total and adapter gradient vs a1_objective",
     )
 
-    # 6b. The monitor is measurement-only: it changes neither the total nor a gradient.
-    if config.monitor.enabled:
-        quiet = replace(config, monitor=replace(config.monitor, mode="off"))
+    
+    if config.stability.enabled:
+        quiet = replace(config, stability=replace(config.stability, mode="off"))
         t_on, t_off = run(probe)[0], run(probe, quiet)[0]
         g_on = jax.grad(lambda p: run(p)[0])(probe)
         g_off = jax.grad(lambda p: run(p, quiet)[0])(probe)
@@ -1146,16 +1421,22 @@ def a2_audit(
             "monitor on vs off: total and full gradient",
         )
 
-    # 7. Gradient routing: which term reaches which parameter group.
+    
     _, probe_terms = run(probe)
     routed = {"task": ("task", {"adapter"})}
     if config.cpc.enabled:
         routed["cpc"] = ("cpc", {"adapter", "cpc"})
-    if config.hid.enabled:
-        # detach_input: only P_l learns (negative control); otherwise the adapter does too.
-        routed["hid"] = ("hid", {"adapter", "pred"} if config.hid.coupled else {"pred"})
+    if config.uses_hidden_pred:
+        
+        routed["hid"] = ("hid", {"adapter", "pred"} if config.hid_coupled else {"pred"})
     if "stab_anch" in probe_terms:
         routed["stab_anch"] = ("stab_anch", {"adapter"})
+    if "stab_smooth" in probe_terms:
+        routed["stab_smooth"] = ("stab_smooth", {"adapter"})
+    if (
+        "stab_step" in probe_terms
+    ):  
+        routed["stab_step"] = ("stab_step", set())
     if "stab_hep" in probe_terms:
         routed["stab_hep"] = (
             "stab_hep",
@@ -1173,13 +1454,13 @@ def a2_audit(
             f"gradient reaches {sorted(got)}, expected {sorted(expected_groups)}",
         )
 
-    # 8. Information: size of each term's gradient on the adapter relative to the task's
-    #    (the plan aims at roughly 0.1 to 1 for each auxiliary term).
+   
     task_norm = norms["task"]["adapter"]
     weights = {
         "cpc": config.cpc.weight,
         "stab_anch": config.stab.weight * config.stab.w_anch,
-        "hid": config.hid.weight if config.hid.coupled else 0.0,
+        "stab_smooth": config.stab.weight * config.stab.w_smooth,
+        "hid": config.lambda_hid if config.hid_coupled else 0.0,
     }
     for label, weight in weights.items():
         if label in norms and task_norm > 0 and weight > 0:
@@ -1191,8 +1472,8 @@ def a2_audit(
                 "lambda * |grad_adapter(term)| / |grad_adapter(task)|; target ~0.1-1",
             )
 
-    # 8b. Information: does the predictor beat copying its input? (rel < copy_rel)
-    if config.hid.enabled:
+    
+    if config.uses_hidden_pred:
         add(
             "hid_vs_copy",
             None,
@@ -1203,7 +1484,7 @@ def a2_audit(
             "target-variance-normalised error of P_l(h~) vs the copy baseline h~ (untrained P_l)",
         )
 
-    # 9. jit equals eager.
+    
     eager = _f(run(probe)[0])
     jitted = _f(jax.jit(lambda p: run(p)[0])(probe))
     add(
@@ -1212,7 +1493,7 @@ def a2_audit(
         {"eager": eager, "jit": jitted},
     )
 
-    # 10. Ignored labels (-100) keep every term finite.
+    
     if config.needs_corrected:
         half = input_ids.shape[1] // 2
         labels = input_ids.at[:, half:].set(-100)
@@ -1263,29 +1544,34 @@ def format_audit(checks: list[Check]) -> str:
 
 __all__ = [
     "ARMS",
-    "Check",
     "ARM_DEFAULT_WEIGHTS",
     "A2Config",
     "ADAPTER_PREFIX",
     "CPCConfig",
+    "Check",
     "HEPConfig",
     "HIDDEN_NORMS",
-    "HiddenConfig",
-    "MonitorConfig",
+    "HIDDEN_TARGETS",
     "POSITIVES",
-    "StabilityConfig",
+    "StabLossConfig",
+    "a2_audit",
+    "a2_diagnostics",
     "a2_objective",
     "adapter_params",
-    "a2_audit",
     "apply_arm",
     "audit_ok",
     "audit_to_dict",
+    "collect_stability_metrics",
+    "compose_a2_loss",
     "cpc_term",
-    "init_a2_params",
-    "init_cpc_params",
     "format_audit",
     "hid_term",
+    "hidden_prediction_loss",
+    "init_a2_params",
+    "init_cpc_params",
     "init_hep_params",
+    "make_a2_objective",
+    "make_a2_optimizer",
     "param_counts",
     "predictor_bank",
     "predictor_params",

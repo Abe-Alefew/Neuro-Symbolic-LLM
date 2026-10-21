@@ -70,7 +70,7 @@ def test_from_dict_nested_and_unknown_keys() -> None:
     assert StabLossConfig.from_dict({}) == StabLossConfig()
     assert StabLossConfig.from_dict({"hep": None}) == StabLossConfig()
     with pytest.raises(ValueError, match="Unknown StabLossConfig keys"):
-        StabLossConfig.from_dict({"w_step": 1.0})
+        StabLossConfig.from_dict({"w_stepp": 1.0})
     with pytest.raises(ValueError, match="Unknown HEPConfig keys"):
         StabLossConfig.from_dict({"hep": {"gain": 1.0}})
 

@@ -1,6 +1,15 @@
-"""Stage A2 hidden-prediction loss and stability monitor: config, parameters, the term, the
-full path through the frozen substrate and the A1 adapter, gradient routing and the audit
-(GPT-2 and Pythia fixtures)."""
+"""Stage A2 hidden-prediction loss — unified test suite.
+
+Part 1 — Local predictor isolation / unit tests: formula parity (LN→GELU→MLP),
+         feedforward-only graph structure, predict-delta skip connection, gradient
+         routing at the bank level, input validation, split/merge round-trip,
+         and PredictorConfig validation.
+
+Part 2 — A2-objective integration: configuration, parameters, the hid loss term,
+         the full path through the frozen substrate and the A1 adapter, gradient
+         routing through the objective, the stability monitor, training loop,
+         and the audit.  Both GPT-2 and Pythia fixtures.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +26,13 @@ import pytest
 from frozenllm.substrate import FrozenSubstrate
 from residual import ResidualAdapter, ResidualConfig, layer_key
 from residual.a2_losses import hidden_prediction_loss
-from residual.local_predictor import PredictorConfig, predictor_key
+from residual.local_predictor import (
+    LocalPredictorBank,
+    PredictorConfig,
+    merge_params,
+    predictor_key,
+    split_params,
+)
 from stages.results import RunWriter, load_params
 from stages.stage_A.a1 import A1Config, a1_objective
 from stages.stage_A.a2 import (
@@ -55,6 +70,9 @@ LAYERS = [5, 6]
 FF = 16
 
 
+# --- helpers ----------------------------------------------------------------------------------
+
+
 def make_cfg(
     *,
     hid: float = 0.0,
@@ -80,6 +98,225 @@ def make_cfg(
         ),
         monitor=MonitorConfig(mode=monitor),
     )
+
+
+def _bank(
+    substrate: FrozenSubstrate, adapter: ResidualAdapter, **kw: object
+) -> LocalPredictorBank:
+    """Create a raw LocalPredictorBank for isolation tests."""
+    cfg = PredictorConfig(**{"ff_dim": FF, **kw})  # type: ignore[arg-type]
+    return LocalPredictorBank(cfg, substrate.architecture, SEQ, adapter.layers)
+
+
+def _u(d: int, seed: int = 1) -> jax.Array:
+    """Random input tensor for isolation predictor tests."""
+    return jax.random.normal(jax.random.PRNGKey(seed), (BATCH, SEQ, d))
+
+
+def with_random_b(params: dict, scale: float = 0.05) -> dict:
+    rng = np.random.default_rng(1)
+    out = {k: dict(v) for k, v in params.items()}
+    for k in adapter_params(params):
+        out[k]["B"] = jnp.asarray(
+            scale * rng.normal(size=out[k]["B"].shape), jnp.float32
+        )
+    return out
+
+
+def with_random_predictors(params: dict, scale: float = 0.1) -> dict:
+    """Non-trivial predictors (the output bias starts at 0)."""
+    rng = np.random.default_rng(2)
+    out = {k: dict(v) for k, v in params.items()}
+    for k in predictor_params(params):
+        out[k] = {
+            n: v + jnp.asarray(scale * rng.normal(size=v.shape), jnp.float32)
+            for n, v in params[k].items()
+        }
+    return out
+
+
+def run_objective(substrate, adapter, cfg, params, ids, **kw):
+    return a2_objective(
+        params, substrate=substrate, adapter=adapter, config=cfg, input_ids=ids, **kw
+    )
+
+
+def grads_of(substrate, adapter, cfg, params, ids, **kw):
+    return jax.grad(lambda p: run_objective(substrate, adapter, cfg, p, ids, **kw)[0])(
+        params
+    )
+
+
+def max_abs(tree) -> float:
+    leaves = jax.tree_util.tree_leaves(tree)
+    return max(float(jnp.max(jnp.abs(x))) for x in leaves) if leaves else 0.0
+
+
+# --- model fixtures ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module", params=FAMILIES)
+def substrate(request: pytest.FixtureRequest) -> FrozenSubstrate:
+    sub: FrozenSubstrate = make_substrate(request.param)[1]
+    return sub
+
+
+@pytest.fixture(scope="module")
+def adapter(substrate: FrozenSubstrate) -> ResidualAdapter:
+    return ResidualAdapter(
+        ResidualConfig(rank=4, layers=LAYERS), substrate.architecture
+    )
+
+
+@pytest.fixture(scope="module")
+def input_ids() -> jax.Array:
+    rng = np.random.default_rng(0)
+    return jnp.asarray(rng.integers(0, NUM_TOKENS, (BATCH, SEQ)), dtype=jnp.int32)
+
+
+@pytest.fixture(scope="module")
+def gpt2() -> FrozenSubstrate:
+    sub: FrozenSubstrate = make_substrate("gpt2")[1]
+    return sub
+
+
+# ==============================================================================================
+# Part 1 — Local predictor: isolation / unit tests
+# ==============================================================================================
+
+
+def test_bank_sites_default_to_adapted_layers(substrate, adapter) -> None:
+    """Bank layers match the adapter; init_params produces one key per site."""
+    bank = _bank(substrate, adapter)
+    assert bank.layers == adapter.layers
+    assert set(bank.init_params()) == {predictor_key(i) for i in adapter.layers}
+
+
+def test_bank_graph_is_feedforward_without_inference(substrate, adapter) -> None:
+    """The compute graph is Identity → LnMlp1 → Linear, no inference node."""
+    bank = _bank(substrate, adapter)
+    assert bank.structure.config["inference"] is None
+    assert list(bank.structure.node_order) == [
+        "pred_input",
+        "pred_hidden",
+        "pred_output",
+    ]
+    kinds = {n: v.node_info.node_type for n, v in bank.structure.nodes.items()}
+    assert kinds == {
+        "pred_input": "IdentityNode",
+        "pred_hidden": "LnMlp1Node",
+        "pred_output": "Linear",
+    }
+
+
+def test_bank_matches_ln_gelu_mlp_formula(substrate, adapter) -> None:
+    """bank.predict reproduces the manual LayerNorm → GELU → linear formula."""
+    bank = _bank(substrate, adapter)
+    params = bank.init_params()
+    layer = LAYERS[0]
+    pkey = predictor_key(layer)
+    # Non-trivial biases/gain so the check is not satisfied by zeros/ones.
+    q = {
+        k: v + 0.1 * jax.random.normal(jax.random.PRNGKey(i), v.shape)
+        for i, (k, v) in enumerate(params[pkey].items())
+    }
+    params = {**params, pkey: q}
+    u = _u(substrate.architecture.hidden_size)
+    mu, var = u.mean(-1, keepdims=True), u.var(-1, keepdims=True)
+    xn = (
+        (u - mu) / jnp.sqrt(var + 1e-5) * q["pred_hidden.w.ln_gamma"]
+        + q["pred_hidden.b.ln_beta"]
+    )
+    hid = jax.nn.gelu(xn @ q["pred_hidden.w.W_ff1"] + q["pred_hidden.b.b_ff1"])
+    expected = hid @ q["pred_output.w.W"] + q["pred_output.b.b"]
+    got = bank.predict(params, layer, u)
+    assert got.shape == (BATCH, SEQ, substrate.architecture.hidden_size)
+    assert jnp.allclose(got, expected, atol=1e-5)
+
+
+def test_bank_predict_delta_adds_the_skip(substrate, adapter) -> None:
+    """predict_delta=True ⇒ output = input + predict(input)."""
+    layer = LAYERS[0]
+    plain = _bank(substrate, adapter)
+    delta = _bank(substrate, adapter, predict_delta=True)
+    params = plain.init_params()
+    u = _u(substrate.architecture.hidden_size)
+    assert jnp.allclose(
+        delta.predict(params, layer, u),
+        u + plain.predict(params, layer, u),
+        atol=1e-6,
+    )
+
+
+def test_bank_gradient_routing_detach_input(substrate, adapter) -> None:
+    """detach_input=True blocks gradients w.r.t. the input tensor u."""
+    d = substrate.architecture.hidden_size
+    layer = LAYERS[0]
+    u = _u(d)
+    for detach in (True, False):
+        bank = _bank(substrate, adapter, detach_input=detach)
+        params = bank.init_params()
+        g_params, g_u = jax.grad(
+            lambda p, x: jnp.sum(bank.predict(p, layer, x) ** 2), argnums=(0, 1)
+        )(params, u)
+        assert (
+            float(sum(jnp.abs(x).sum() for x in jax.tree_util.tree_leaves(g_params)))
+            > 0
+        )
+        assert (float(jnp.abs(g_u).sum()) == 0.0) is detach
+
+
+def test_bank_rejects_wrong_input_shape_and_missing_layer(
+    substrate, adapter
+) -> None:
+    """Wrong sequence length → ValueError; un-adapted layer → KeyError."""
+    bank = _bank(substrate, adapter)
+    params = bank.init_params()
+    d = substrate.architecture.hidden_size
+    layer = LAYERS[0]
+    with pytest.raises(ValueError, match="predictor input"):
+        bank.predict(params, layer, jnp.zeros((BATCH, SEQ + 1, d)))
+    with pytest.raises(KeyError):
+        bank.predict(params, 2, jnp.zeros((BATCH, SEQ, d)))
+
+
+def test_bank_last_block_cannot_have_a_predictor(substrate) -> None:
+    """The last transformer block has no following block to predict."""
+    last = substrate.architecture.num_layers - 1
+    tmp_adapter = ResidualAdapter(
+        ResidualConfig(rank=4, layers=[LAYERS[0], last]), substrate.architecture
+    )
+    with pytest.raises(ValueError, match="following block"):
+        LocalPredictorBank(
+            PredictorConfig(layers=[last]),
+            substrate.architecture,
+            SEQ,
+            tmp_adapter.layers,
+        )
+
+
+def test_bank_split_and_merge_roundtrip(substrate, adapter) -> None:
+    """merge_params → split_params recovers the original adapter & predictor dicts."""
+    bank = _bank(substrate, adapter)
+    a, p = adapter.init_params(), bank.init_params()
+    merged = merge_params(a, p)
+    a2, p2 = split_params(merged)
+    assert set(a2) == set(a) and set(p2) == set(p)
+    with pytest.raises(ValueError, match="overlap"):
+        merge_params(a, a)
+
+
+def test_predictor_config_validation() -> None:
+    """PredictorConfig rejects ff_dim=0 and unknown keys."""
+    with pytest.raises(ValueError, match="ff_dim"):
+        PredictorConfig(ff_dim=0)
+    with pytest.raises(ValueError, match="Unknown PredictorConfig"):
+        PredictorConfig.from_dict({"bogus": 1})
+
+
+# ==============================================================================================
+# Part 2 — A2 objective: configuration, parameters, loss, gradients, monitor, training
+# ==============================================================================================
 
 
 # --- configuration ----------------------------------------------------------------------------
@@ -215,73 +452,6 @@ def test_arms_keep_the_predictor_settings() -> None:
     assert (
         apply_arm(zero, "hid_coupled").hid.weight > 0
     )  # falls back to the arm default
-
-
-# --- model fixtures ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module", params=FAMILIES)
-def substrate(request: pytest.FixtureRequest) -> FrozenSubstrate:
-    sub: FrozenSubstrate = make_substrate(request.param)[1]
-    return sub
-
-
-@pytest.fixture(scope="module")
-def adapter(substrate: FrozenSubstrate) -> ResidualAdapter:
-    return ResidualAdapter(
-        ResidualConfig(rank=4, layers=LAYERS), substrate.architecture
-    )
-
-
-@pytest.fixture(scope="module")
-def input_ids() -> jax.Array:
-    rng = np.random.default_rng(0)
-    return jnp.asarray(rng.integers(0, NUM_TOKENS, (BATCH, SEQ)), dtype=jnp.int32)
-
-
-@pytest.fixture(scope="module")
-def gpt2() -> FrozenSubstrate:
-    sub: FrozenSubstrate = make_substrate("gpt2")[1]
-    return sub
-
-
-def with_random_b(params: dict, scale: float = 0.05) -> dict:
-    rng = np.random.default_rng(1)
-    out = {k: dict(v) for k, v in params.items()}
-    for k in adapter_params(params):
-        out[k]["B"] = jnp.asarray(
-            scale * rng.normal(size=out[k]["B"].shape), jnp.float32
-        )
-    return out
-
-
-def with_random_predictors(params: dict, scale: float = 0.1) -> dict:
-    """Non-trivial predictors (the output bias starts at 0)."""
-    rng = np.random.default_rng(2)
-    out = {k: dict(v) for k, v in params.items()}
-    for k in predictor_params(params):
-        out[k] = {
-            n: v + jnp.asarray(scale * rng.normal(size=v.shape), jnp.float32)
-            for n, v in params[k].items()
-        }
-    return out
-
-
-def run_objective(substrate, adapter, cfg, params, ids, **kw):
-    return a2_objective(
-        params, substrate=substrate, adapter=adapter, config=cfg, input_ids=ids, **kw
-    )
-
-
-def grads_of(substrate, adapter, cfg, params, ids, **kw):
-    return jax.grad(lambda p: run_objective(substrate, adapter, cfg, p, ids, **kw)[0])(
-        params
-    )
-
-
-def max_abs(tree) -> float:
-    leaves = jax.tree_util.tree_leaves(tree)
-    return max(float(jnp.max(jnp.abs(x))) for x in leaves) if leaves else 0.0
 
 
 # --- parameters -------------------------------------------------------------------------------

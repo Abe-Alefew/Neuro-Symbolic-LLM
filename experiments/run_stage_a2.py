@@ -112,7 +112,7 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
         training = replace(training, epochs=args.epochs)
         domains = tuple(replace(d, epochs=args.epochs) for d in domains)
 
-    top = {
+    hid = {
         k: v
         for k, v in {
             "lambda_hid": args.lambda_hid,
@@ -139,9 +139,12 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
     }
     obj = replace(
         obj,
-        **top,
-        predictor=replace(obj.predictor, **pred),
-        stability=replace(obj.stability, **stab),
+        hid=replace(
+            obj.hid,
+            **hid,
+            predictor=replace(obj.hid.predictor, **pred),
+        ),
+        monitor=replace(obj.monitor, **stab),
     )
     return replace(cfg, adapter=adapter, objective=obj, training=training, domains=domains)
 

@@ -3,7 +3,8 @@
 # DomainConfig; unknown keys are rejected. See stages/stage_A/a2.py.
 #
 # L = L_task + lambda_kl*KL + lambda_wd*||phi||^2
-#   + lambda_cp*L_cpc + lambda_stab*(w_anch*L_zanch + w_hep*L_hep) + lambda_hid*L_hid
+#   + lambda_cp*L_cpc + lambda_stab*(w_anch*L_zanch + w_hep*L_hep)
+#   + lambda_hid*L_local_predictor/hidden_prediction
 # Set a weight to 0 to switch its term (and its heads) off
 adapter:
   rank: 16              # LoRA-equivalent rank matching paper Sec 12.2 (r=16)
@@ -18,21 +19,18 @@ objective:
   lambda_kl: 0.0        # Same meaning as in A1
   lambda_wd: 0.0
   seed: 0               # seed of the auxiliary heads / predictors / fixed-random highway
-  lambda_hid: 0.1                        # weight of L_hidden-pred (0 disables the predictor term)
-  hidden_target: corrected_teacher       # corrected_teacher (review Option B) | base_anchor (Option A)
-  hidden_norm: target_var                # target_var (MSE / target variance) | none (plain MSE)
-  skip_first_token: true                 # drop position 0 (GPT-2 massive activations) from L_hidden-pred
-  predictor_lr_mult: 1.0                 # predictor lr = training.learning_rate * this
-  predictor:                             # P_l(u) = W2 GELU(W1 LN(u) + b1) + b2, FabricPC nodes
-    ff_dim: 256
-    out_init_std: null                   
-    predict_delta: false                 
-    detach_input: true                   
-    layers: null                         
-  stability:                             
-    mode: "off"                          
-    layers: null                         
-    delta: 1.0e-6  
+  hid:
+    lambda_hid: 0.1      # local predictor/hidden prediction loss weight
+    hidden_target: corrected_teacher  # corrected_teacher | base_anchor
+    predictor_lr_mult: 1.0 # current sequential optimizer uses one shared LR
+    hidden_norm: target_var  # target_var | none
+    skip_first_token: true
+    predictor:
+      ff_dim: 256
+      out_init_std: null
+      predict_delta: false
+      detach_input: true
+      layers: null
   # Contrastive future loss (InfoNCE on a q-projected code; heads are FabricPC nodes).
   cpc:
     weight: 0.05        # lambda_cp; first runs: small

@@ -54,7 +54,7 @@ input ids ─► frozen model ────────────────�
 | `L_cpc` | InfoNCE: from `h~_{l,t}` predict the stop-gradient code of the base (or corrected) state `k` positions ahead | adapter, `cpcq_<l>`, `cpca_<l>_<k>` |
 | `L_zanch` | `‖h~_l − sg(h^base_l)‖²`, normalised by the base norm (`normalize: relative`) | adapter |
 | `L_hep-nudge` | `‖α · sg(ε_y) · V‖²` with `ε_y = softmax(logits) − onehot(next token)` | highway `hep_<l>` only |
-| `L_hid` | `‖P_l(h~_l) − sg(h_{l+1})‖² / Var(h_{l+1})`: a local predictor guesses the next frozen block's output from the corrected state | predictor `pred_layer_<l>`; the adapter too when `detach_input: false` |
+| `L_hid` | `‖P_l(h~_l) − sg(h_{l+1})‖² / Var(h_{l+1})`: the local predictor/hidden-prediction term guesses the next frozen block's output from the corrected state | predictor `pred_layer_<l>`; the adapter too when `detach_input: false` |
 
 **Contrastive future loss.** Code `c = q(h~_t)` (parameter-free LayerNorm, then a bias-free linear projection to `dim`), prediction `p = A_{l,k} c` (bias-free linear, initialised near identity), both L2-normalised. The positive is `q(h_{t+k})` under stop-gradient, taken from the base state (`positive: base`) or the corrected state (`positive: corrected`). Negatives are the positives of the **other sequences** in the batch. Anchors are subsampled by a deterministic stride (`max_anchors_per_seq`). Padding is masked: an anchor counts only if both `t` and `t+k` are real tokens and at least one real negative exists. Several offsets (`offsets: [1, 2, 4]`) each get their own predictor; the term is the mean over sites `(l, k)`.
 
@@ -165,8 +165,8 @@ An arm chooses which terms run and their variant; `λ_kl`, `λ_wd`, data, optimi
 | `cpc_base` | contrastive future, positive from the base state |
 | `cpc_corrected` | contrastive future, positive from the corrected state |
 | `cpc_multi` | contrastive future, offsets 1, 2, 4 |
-| `hid_detached` | hidden prediction with `detach_input: true`: trains `P_l` only (negative control) |
-| `hid_coupled` | hidden prediction with `detach_input: false`: the prediction error reaches the adapter |
+| `hid_detached` | local predictor/hidden prediction with `detach_input: true`: trains `P_l` only (negative control) |
+| `hid_coupled` | local predictor/hidden prediction with `detach_input: false`: the prediction error reaches the adapter |
 | `full` | `cpc_base` + `stab_anch` + `hid_coupled` |
 
 ## Running
@@ -205,7 +205,7 @@ Other flags are those of the A1 runner (`--model`, `--rank`, `--epochs`, `--outp
 | `cpc_top1`, `cpc_pos_sim`, `cpc_neg_sim`, `cpc_n_anchors`, `cpc_valid` | contrastive diagnostics (top-1 accuracy of the positive, similarities, counted anchors) |
 | `stab_anch`, `anch_dist`, `anch_ratio` | anchor loss, raw distance, relative distance |
 | `stab_hep`, `hep_nudge_norm`, `hep_nudge_ratio` | HEP loss and the size of the nudge |
-| `hid_mse`, `hid_rel`, `hid_copy_rel` | hidden prediction: squared error, relative to the target variance, and the same for the copy baseline |
+| `hid_mse`, `hid_rel`, `hid_copy_rel` | local predictor/hidden prediction: squared error, relative to the target variance, and the same for the copy baseline |
 | `res_smooth`, `input_smooth`, `res_vs_input`, `res_smooth_l<l>`, `step_*` | stability monitor (only with `monitor.mode: diagnostic`; `step_*` are 0 in A2) |
 
 ## Internal metrics
@@ -313,5 +313,4 @@ Guarantees enforced by tests:
 - **`L_hid` target.** It is the *raw* output of block `l+1` given the corrected state (not that block's corrected output). The first token is skipped by default; GPT-2's position 0 is an attention sink with a very large norm.
 - **Hyperparameters are uncalibrated.** A calibration of each term's gradient norm against the task gradient is planned, not written.
 - **Dependency.** FabricPC 0.3.0 (the repository pin) and 0.6.0 are both tested, through `residual/_fpc_compat.py`. Bias leaves of the FabricPC nodes have a leading singleton axis (`[1, d]`); only the shapes differ between the versions by that axis, not the values.
-
 

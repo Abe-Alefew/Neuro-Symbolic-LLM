@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
 from residual import AdapterParams, ResidualAdapter
@@ -59,6 +61,7 @@ from stages.stage_base import base_logits, checked_kwargs
 
 
 POSITIVES = ("base", "corrected")
+HIDDEN_TARGETS = ("corrected_teacher", "base_anchor")
 
 
 @dataclass(frozen=True)
@@ -243,11 +246,14 @@ HIDDEN_NORMS = ("target_var", "none")
 
 @dataclass(frozen=True)
 class HiddenConfig:
-    """``objective.hid`` section of the A2 YAML: the hidden-prediction loss ``L_hid``.
-    """
+    """``objective.hid`` local predictor/hidden prediction configuration."""
 
     # lambda_hid; 0 switches the term (and the predictors) off.
     weight: float = 0.0
+    # Compatibility spelling for ``weight`` when declared inside ``hid``.
+    lambda_hid: float | None = None
+    hidden_target: str = "corrected_teacher"
+    predictor_lr_mult: float = 1.0
     # "target_var": divide the squared error by the target variance (scale-free);
     # "none": plain mean squared error.
     hidden_norm: str = "target_var"
@@ -257,6 +263,24 @@ class HiddenConfig:
 
     def __post_init__(self) -> None:
         _number("weight", self.weight)
+        if self.lambda_hid is not None:
+            _number("lambda_hid", self.lambda_hid)
+            if self.weight != 0.0 and self.weight != self.lambda_hid:
+                raise ValueError("hid.weight and hid.lambda_hid must match")
+            if self.weight == 0.0:
+                object.__setattr__(self, "weight", self.lambda_hid)
+        if self.hidden_target not in HIDDEN_TARGETS:
+            raise ValueError(
+                f"hidden_target must be one of {list(HIDDEN_TARGETS)}, "
+                f"got {self.hidden_target!r}"
+            )
+        if not isinstance(self.predictor_lr_mult, int | float) or (
+            isinstance(self.predictor_lr_mult, bool)
+        ) or self.predictor_lr_mult <= 0:
+            raise ValueError(
+                "predictor_lr_mult must be a number > 0, "
+                f"got {self.predictor_lr_mult!r}"
+            )
         if self.hidden_norm not in HIDDEN_NORMS:
             raise ValueError(
                 f"hidden_norm must be one of {list(HIDDEN_NORMS)}, got {self.hidden_norm!r}"
@@ -268,7 +292,12 @@ class HiddenConfig:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> HiddenConfig:
-        raw = dict(checked_kwargs(cls, data))
+        raw = dict(data)
+        if "lambda_hid" in raw:
+            if "weight" in raw and raw["weight"] != raw["lambda_hid"]:
+                raise ValueError("hid.weight and hid.lambda_hid must match")
+            raw["weight"] = raw["lambda_hid"]
+        raw = dict(checked_kwargs(cls, raw))
         raw["predictor"] = PredictorConfig.from_dict(raw.get("predictor") or {})
         return cls(**raw)
 
@@ -284,7 +313,11 @@ class HiddenConfig:
 
 @dataclass(frozen=True)
 class A2Config:
-    """``objective:`` section of the A2 YAML (nested ``cpc``, ``stab``, ``hid``, ``monitor``)."""
+    """A2 objective configuration.
+
+    ``hid`` is the canonical local-predictor/hidden-prediction configuration.
+    Local predictor/hidden prediction settings are grouped under ``hid``.
+    """
 
     # A1 terms, same names and meaning as A1Config.
     lambda_kl: float = 0.0
@@ -310,7 +343,34 @@ class A2Config:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> A2Config:
-        raw = dict(checked_kwargs(cls, data))
+        raw = dict(data)
+        # Accept the historical flat spelling while keeping nested sections
+        # canonical for new configurations.
+        legacy_hid = {
+            key: raw.pop(key)
+            for key in (
+                "hidden_norm",
+                "skip_first_token",
+                "predictor",
+            )
+            if key in raw
+        }
+        legacy_monitor = raw.pop("stability", None)
+        if legacy_monitor is not None and "monitor" in raw:
+            raise ValueError("give either 'stability' or 'monitor', not both")
+        if legacy_monitor is not None:
+            raw["monitor"] = legacy_monitor
+        if legacy_hid:
+            hid = dict(raw.get("hid") or {})
+            overlap = sorted(set(hid) & set(legacy_hid))
+            if overlap:
+                raise ValueError(
+                    "legacy local-predictor keys overlap with objective.hid: "
+                    f"{overlap}"
+                )
+            hid.update(legacy_hid)
+            raw["hid"] = hid
+        raw = dict(checked_kwargs(cls, raw))
         raw["cpc"] = CPCConfig.from_dict(raw.get("cpc") or {})
         raw["stab"] = StabilityConfig.from_dict(raw.get("stab") or {})
         raw["hid"] = HiddenConfig.from_dict(raw.get("hid") or {})
@@ -320,7 +380,11 @@ class A2Config:
     @property
     def needs_base_states(self) -> bool:
         """Whether the objective needs the base model's hidden states ``h^base``."""
-        return self.cpc.needs_base_states or self.stab.needs_base_states
+        return (
+            self.cpc.needs_base_states
+            or self.stab.needs_base_states
+            or (self.hid.enabled and self.hid.hidden_target == "base_anchor")
+        )
 
     @property
     def aux_enabled(self) -> bool:
@@ -713,11 +777,13 @@ def a2_objective(
     if need_states:
         # One extra forward gives both the base states and (if not given) base logits.
         base_run = substrate.run_with_interception(
-            input_ids, modify_fn=identity_modify, intercept_layers=adapter.layers
+            input_ids,
+            modify_fn=identity_modify,
+            intercept_layers=intercept,
         )
         base_states = {
             layer: jax.lax.stop_gradient(base_run.hidden_state(layer))
-            for layer in adapter.layers
+            for layer in intercept
         }
         base_lg = jax.lax.stop_gradient(base_run.logits if base is None else base)
     elif need_kl:
@@ -788,10 +854,17 @@ def a2_objective(
             terms.update(m)
         if config.hid.enabled:
             assert bank is not None
-            targets = {
-                layer: jax.lax.stop_gradient(run.hidden_state(layer + 1))
-                for layer in bank.layers
-            }
+            if config.hid.hidden_target == "base_anchor":
+                assert base_states is not None
+                targets = {
+                    layer: base_states[layer + 1]
+                    for layer in bank.layers
+                }
+            else:
+                targets = {
+                    layer: jax.lax.stop_gradient(run.hidden_state(layer + 1))
+                    for layer in bank.layers
+                }
             l_hid, m = hid_term(
                 params,
                 config=config.hid,

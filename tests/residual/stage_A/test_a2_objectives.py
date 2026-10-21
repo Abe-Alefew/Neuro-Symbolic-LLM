@@ -25,6 +25,13 @@ from frozenllm.substrate import FrozenSubstrate, identity_modify
 from residual import ResidualAdapter, ResidualConfig, layer_key
 from residual.cpc_heads import a_key, q_key
 from residual.hep import hep_key
+from residual.local_predictor import (
+    LocalPredictorBank,
+    PredictorConfig,
+    merge_params,
+    split_params,
+)
+from residual.stability import StabilityConfig as MonitorConfig, StabilityMonitor
 from stages.results import RunWriter, load_params
 from stages.stage_A.a1 import A1Config, a1_objective
 from stages.stage_A.a2 import (
@@ -32,13 +39,16 @@ from stages.stage_A.a2 import (
     A2Config,
     CPCConfig,
     HEPConfig,
+    HiddenConfig,
     StabilityConfig,
     a2_objective,
     adapter_params,
     apply_arm,
     cpc_term,
+    hid_term,
     init_a2_params,
     param_counts,
+    predictor_bank,
     stability_term,
     token_mask,
 )
@@ -790,6 +800,159 @@ def test_jit_matches_eager(substrate, adapter, input_ids) -> None:
         g_eager,
         g_jit,
     )
+
+
+# --- hidden-state capture / target semantics ----------------------------
+
+
+def test_teacher_target_is_next_block_before_its_own_correction(gpt2, input_ids) -> None:
+    """The predictor target at layer l is block l+1's output *before* that block's
+    own adapter correction is applied, but *after* the correction at l has propagated.
+    """
+    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
+    params = with_random_b(init_a2_params(make_cfg(), adapter))
+    ap = adapter_params(params)
+    sites = tuple(LAYERS) + (LAYERS[-1] + 1,)
+    run = lambda p: gpt2.run_with_interception(  # noqa: E731
+        input_ids, modify_fn=adapter.modify_fn(p), intercept_layers=sites
+    )
+    base = gpt2.run_with_interception(
+        input_ids, modify_fn=identity_modify, intercept_layers=sites
+    )
+    res = run(ap)
+    d = gpt2.architecture.hidden_size
+    layer = LAYERS[0]
+    assert (
+        res.hidden_state(layer).shape
+        == res.hidden_state(layer + 1).shape
+        == (BATCH, SEQ, d)
+    )
+    # The correction at `layer` has reached the next block's output ...
+    assert not jnp.allclose(
+        res.hidden_state(layer + 1), base.hidden_state(layer + 1), atol=1e-6
+    )
+    # ... but the next layer's own adapter does not affect hidden_state(layer+1)
+    # because it is recorded *before* modify_fn.
+    bumped = dict(ap)
+    k = layer_key(layer + 1)
+    bumped[k] = {**bumped[k], "B": bumped[k]["B"] + 1.0}
+    assert jnp.allclose(
+        run(bumped).hidden_state(layer + 1), res.hidden_state(layer + 1), atol=1e-6
+    )
+    # Zero residual: adapted == base trajectory.
+    zero = run(adapter_params(init_a2_params(make_cfg(), adapter)))
+    assert jnp.allclose(
+        zero.hidden_state(layer + 1), base.hidden_state(layer + 1), atol=1e-5
+    )
+
+
+def test_hidden_prediction_matches_at_init_and_diverges_with_correction(
+    gpt2, input_ids
+) -> None:
+    """At B = 0, the hidden prediction loss is the same regardless of hidden_norm;
+    with a non-zero residual the predictor and copy-baseline diverge."""
+    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
+    terms_per_norm: dict[str, dict[str, Any]] = {}
+    for norm in ("target_var", "none"):
+        hid = HiddenConfig(weight=0.5, hidden_norm=norm, predictor=PredictorConfig(ff_dim=16))
+        cfg = make_cfg()
+        cfg = replace(cfg, hid=hid)
+        params = init_a2_params(cfg, adapter)  # B = 0
+        _, terms = run_objective(gpt2, adapter, cfg, params, input_ids)
+        terms_per_norm[norm] = terms
+    # At init (B = 0, P_l untrained) the hid loss is identical for both norms.
+    assert "hid" in terms_per_norm["target_var"] and "hid" in terms_per_norm["none"]
+    # With a non-zero residual the hidden-prediction mse should differ from copying.
+    hid_cfg = HiddenConfig(
+        weight=0.5, hidden_norm="target_var", predictor=PredictorConfig(ff_dim=16)
+    )
+    cfg = replace(make_cfg(), hid=hid_cfg)
+    params = with_random_b(init_a2_params(cfg, adapter))
+    _, terms = run_objective(gpt2, adapter, cfg, params, input_ids)
+    assert float(terms["hid_rel"]) != pytest.approx(float(terms["hid_copy_rel"]), rel=0.1)
+
+
+def test_stability_monitor_never_changes_the_loss_or_gradients(
+    gpt2, input_ids
+) -> None:
+    """The StabilityMonitor is measurement-only: switching it on/off must leave
+    the loss total and every gradient unchanged."""
+    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
+    cfg_off = make_cfg(cpc=0.2, stab=0.2)
+    cfg_on = replace(cfg_off, monitor=MonitorConfig(mode="diagnostic"))
+    params = with_random_b(init_a2_params(cfg_on, adapter))
+    loss_off, terms_off = run_objective(gpt2, adapter, cfg_off, params, input_ids)
+    loss_on, terms_on = run_objective(gpt2, adapter, cfg_on, params, input_ids)
+    assert float(loss_off) == float(loss_on)
+    g_off = grads_of(gpt2, adapter, cfg_off, params, input_ids)
+    g_on = grads_of(gpt2, adapter, cfg_on, params, input_ids)
+    for x, y in zip(
+        jax.tree_util.tree_leaves(g_off), jax.tree_util.tree_leaves(g_on), strict=True
+    ):
+        assert jnp.allclose(x, y, atol=1e-7)
+    # Monitor-on logs extra keys that monitor-off does not.
+    assert "res_smooth" in terms_on and "res_smooth" not in terms_off
+
+
+def test_hidden_prediction_diagnostics_after_training(gpt2, tmp_path) -> None:
+    """After a short training run with L_hid, the predictor params move,
+    and per-layer diagnostics (hid_rel, hid_copy_rel) are produced by hid_term."""
+    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
+    hid = HiddenConfig(
+        weight=1.0,
+        predictor=PredictorConfig(ff_dim=16, detach_input=False),
+    )
+    cfg = replace(make_cfg(cpc=0.0, stab=0.0), hid=hid)
+    params = init_a2_params(cfg, adapter)
+    rng = np.random.default_rng(3)
+    blocks = rng.integers(0, NUM_TOKENS, (8, SEQ)).astype(np.int32)
+    domain = Domain(
+        name="toy",
+        train_blocks=blocks,
+        eval_set=make_eval_set(blocks, BATCH, 1),
+        epochs=2,
+    )
+    training = TrainingConfig(batch_size=BATCH, learning_rate=1e-2, log_every=1)
+    before = jax.tree_util.tree_map(np.asarray, params)
+    with RunWriter(tmp_path, "run") as writer:
+        new, summary = run_sequential(
+            gpt2, adapter, params, [domain], a2_objective, cfg, training, writer
+        )
+    a_new, p_new = split_params(new)
+    a_old, p_old = split_params(before)
+    moved = lambda x, y: max_abs(jax.tree_util.tree_map(  # noqa: E731
+        lambda a, b: jnp.abs(a - b), x, y
+    ))
+    assert moved(a_new, a_old) > 0 and moved(p_new, p_old) > 0
+    assert gpt2.params_unchanged()
+    # Checkpoint round-trip: predictor weights survive next to the adapter's.
+    ckpt = tmp_path / "run" / "params" / "task_0_toy.npz"
+    loaded = load_params(ckpt)
+    assert set(loaded) == set(new)
+    for k in new:
+        for kk in new[k]:
+            np.testing.assert_allclose(loaded[k][kk], np.asarray(new[k][kk]))
+    # Per-layer diagnostics from hid_term.
+    bank = predictor_bank(cfg.hid, adapter)
+    eval_ids = domain.eval_set[0]
+    ap = adapter_params(new)
+    intercept = tuple(sorted(set(adapter.layers) | {i + 1 for i in bank.layers}))
+    eval_run = gpt2.run_with_interception(
+        eval_ids, modify_fn=adapter.modify_fn(ap), intercept_layers=intercept
+    )
+    corrected = {
+        layer: adapter.apply(ap, eval_run.hidden_state(layer), layer)
+        for layer in adapter.layers
+    }
+    targets = {
+        layer: jax.lax.stop_gradient(eval_run.hidden_state(layer + 1))
+        for layer in bank.layers
+    }
+    _, hid_metrics = hid_term(
+        new, config=cfg.hid, bank=bank, corrected=corrected, targets=targets
+    )
+    assert {"hid_mse", "hid_rel", "hid_copy_rel"} <= set(hid_metrics)
+    assert all(bool(jnp.isfinite(v)) for v in hid_metrics.values())
 
 
 # --- training with the objective --------------------------------------------------------------

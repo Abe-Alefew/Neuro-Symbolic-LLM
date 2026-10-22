@@ -1,5 +1,4 @@
 """The four stability losses of A2: anchor, HEP nudge, residual smoothness and step loss.
-
 """
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ import optax
 import pytest
 
 from residual import ResidualAdapter, ResidualConfig
-from residual.a2_losses import residual_smoothness_loss, step_loss
 from stages.stage_A.a2 import (
     A2Config,
     HEPConfig,
@@ -24,7 +22,9 @@ from stages.stage_A.a2 import (
     apply_arm,
     audit_ok,
     init_a2_params,
+    residual_smoothness_loss,
     stability_term,
+    step_loss,
 )
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, make_substrate
 

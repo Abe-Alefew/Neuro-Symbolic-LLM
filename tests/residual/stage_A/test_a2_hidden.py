@@ -25,7 +25,6 @@ import pytest
 
 from frozenllm.substrate import FrozenSubstrate
 from residual import ResidualAdapter, ResidualConfig, layer_key
-from residual.a2_losses import hidden_prediction_loss
 from residual.local_predictor import (
     LocalPredictorBank,
     PredictorConfig,
@@ -49,6 +48,7 @@ from stages.stage_A.a2 import (
     apply_arm,
     audit_ok,
     hid_term,
+    hidden_prediction_loss,
     init_a2_params,
     param_counts,
     predictor_bank,

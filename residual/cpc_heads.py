@@ -14,19 +14,18 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from fabricpc.core.inference import InferenceSGD
-from fabricpc.core.topology import Edge
 from fabricpc.core.types import GraphParams, NodeParams
-from fabricpc.graph_assembly import TaskMap, graph
-from fabricpc.graph_initialization import initialize_graph_state
 from fabricpc.nodes import Linear
-from fabricpc.training.trainer import build_clamps
+
+from fabricpc.builder import Edge, TaskMap, graph
+from fabricpc.graph import initialize_graph_state
 
 CPCParams = dict[str, dict[str, jax.Array]]
 
 Q_PREFIX = "cpcq_"
 A_PREFIX = "cpca_"
 
-# Separates the head PRNG stream from the adapter's ``fold_in(PRNGKey(seed), layer)``.
+
 _STREAM = 0xA2
 _KIND_Q = 1
 _KIND_A = 2
@@ -52,10 +51,6 @@ def init_cpc_heads(
     a_noise_std: float = 0.01,
 ) -> CPCParams:
     """Initial heads for every ``layer`` and ``offset``.
-
-    ``W ~ N(0, 1/d)``. ``M = I + N(0, a_noise_std^2)``: never zero (a zero head
-    has no gradient to the projection) and different for every offset. The
-    stream is derived from ``seed`` but is disjoint from the adapter's.
     """
     if hidden_size < 1 or dim < 1:
         raise ValueError(f"hidden_size and dim must be >= 1, got {hidden_size}, {dim}")
@@ -84,8 +79,7 @@ def init_cpc_heads(
 
 
 def _layer_norm(x: jax.Array) -> jax.Array:
-    # Parameter-free, float32: hidden states of pretrained LMs have a few huge
-    # outlier dimensions that would otherwise dominate a random projection.
+    
     x = x.astype(jnp.float32)
     mu = jnp.mean(x, axis=-1, keepdims=True)
     var = jnp.var(x, axis=-1, keepdims=True)
@@ -109,10 +103,6 @@ def predict_future_reference(
     return c @ a_params["M"]
 
 
-# --- FabricPC heads ---------------------------------------------------------------------------
-# Tokens are folded into the batch axis, so a node has shape ``(features,)`` and the
-# graphs do not depend on the sequence length. The graphs have no target and no
-# inference step: only the feed-forward value ``z_mu`` of the output node is read.
 
 _Q_EDGE = "x->q:in"
 _A_EDGE = "c->A:in"
@@ -143,7 +133,7 @@ def _run_head(
             dst: NodeParams({edge: weight.astype(jnp.float32)}, {}),
         }
     )
-    clamps = build_clamps({"x": flat}, structure, clamp_target=False)
+    clamps = {structure.task_map["x"]: flat}
     state = initialize_graph_state(
         structure, flat.shape[0], jax.random.PRNGKey(0), clamps=clamps, params=params
     )

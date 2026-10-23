@@ -1,5 +1,4 @@
 """Squared-error energies of the A2 stability terms, computed by FabricPC nodes.
-
 """
 
 from __future__ import annotations
@@ -10,13 +9,11 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from fabricpc.core.inference import InferenceSGD
-from fabricpc.core.topology import Edge
 from fabricpc.core.types import GraphParams, NodeParams
-from fabricpc.graph_assembly import TaskMap, graph
-from fabricpc.graph_initialization import initialize_graph_state
 from fabricpc.nodes import IdentityNode, Linear
-from fabricpc.training.trainer import build_clamps
 
+from fabricpc.builder import Edge, TaskMap, graph
+from fabricpc.graph import initialize_graph_state
 from residual.hep import Highway
 
 BACKENDS = ("fabricpc", "jax")
@@ -67,7 +64,7 @@ def _per_token_energy(
     structure: Any, params: GraphParams, x: jax.Array, y: jax.Array, node: str
 ) -> jax.Array:
     """Per-sample energy of ``node`` with ``x`` and ``y`` clamped, as a flat vector."""
-    clamps = build_clamps({"x": x, "y": y}, structure, clamp_target=True)
+    clamps = {structure.task_map["x"]: x, structure.task_map["y"]: y}
     state = initialize_graph_state(
         structure, x.shape[0], jax.random.PRNGKey(0), clamps=clamps, params=params
     )

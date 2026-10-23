@@ -975,7 +975,7 @@ def _a2_objective(
         if need_states:
             base_states = {
                 layer: jax.lax.stop_gradient(base_run.hidden_state(layer))
-                for layer in intercept
+                for layer in adapter.layers 
             }
         if need_targets:
             base_targets = {

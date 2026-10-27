@@ -21,7 +21,7 @@ site, ``pred_layer_<l>``) so they can sit in the same dict as the adapter parame
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import jax
@@ -96,14 +96,16 @@ class PredictorConfig:
     def from_dict(cls, data: Mapping[str, Any]) -> PredictorConfig:
         return cls(**_checked_kwargs(cls, data))
 
+
 def _checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
-    known = set(cls.__dataclass_fields__)
+    known = {f.name for f in fields(cls)}
     unknown = sorted(set(data) - known)
     if unknown:
         raise ValueError(
             f"Unknown {cls.__name__} keys: {unknown}. Allowed: {sorted(known)}."
         )
     return dict(data)
+
 
 def split_params(params: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Split a combined A2 PyTree into ``(adapter_params, predictor_params)``."""
@@ -117,7 +119,9 @@ def merge_params(
 ) -> dict[str, Any]:
     clash = set(adapter_params) & set(predictor_params)
     if clash:
-        raise ValueError(f"Adapter and predictor parameter keys overlap: {sorted(clash)}")
+        raise ValueError(
+            f"Adapter and predictor parameter keys overlap: {sorted(clash)}"
+        )
     return {**adapter_params, **predictor_params}
 
 
@@ -143,11 +147,12 @@ class LocalPredictorBank:
                 f"model has {architecture.num_layers} blocks."
             )
         if not usable:
-            raise ValueError("No predictor layers: every requested site is the last block.")
+            raise ValueError(
+                "No predictor layers: every requested site is the last block."
+            )
         self.layers = usable
         self.structure = self._build_structure()
 
-    
     def _build_structure(self) -> GraphStructure:
         s, d, ff = self.seq_len, self.hidden_size, self.config.ff_dim
         pred_input = IdentityNode(shape=(s, d), name=INPUT_NODE)
@@ -160,7 +165,10 @@ class LocalPredictorBank:
                 mean=0.0, std=self.config.out_init_std
             )
         pred_output = Linear(
-            shape=(s, d), name=OUTPUT_NODE, activation=IdentityActivation(), **out_kwargs
+            shape=(s, d),
+            name=OUTPUT_NODE,
+            activation=IdentityActivation(),
+            **out_kwargs,
         )
         return graph(
             nodes=[pred_input, pred_hidden, pred_output],
@@ -173,7 +181,7 @@ class LocalPredictorBank:
             graph_state_initializer=FeedforwardStateInit(),
         )
 
-    #parameters
+    # parameters
     def _flatten(self, gp: GraphParams) -> dict[str, jax.Array]:
         flat: dict[str, jax.Array] = {}
         for node_name, node_params in gp.nodes.items():
@@ -214,7 +222,7 @@ class LocalPredictorBank:
     def num_params(params: Mapping[str, Any]) -> int:
         return sum(int(leaf.size) for leaf in jax.tree_util.tree_leaves(dict(params)))
 
-    #forward
+    # forward
 
     def predict(
         self, params: Mapping[str, Any], layer_idx: int, u: jax.Array
@@ -237,7 +245,7 @@ class LocalPredictorBank:
         state = initialize_graph_state(
             self.structure,
             u32.shape[0],
-            jax.random.PRNGKey(0),  
+            jax.random.PRNGKey(0),
             clamps={INPUT_NODE: u32},
             state_init=FeedforwardStateInit(),
             params=self._unflatten(params[key]),

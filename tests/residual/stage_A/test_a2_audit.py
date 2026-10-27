@@ -223,7 +223,7 @@ def setup(runner, substrate, tmp_path, monkeypatch) -> Path:
     blocks = np.random.default_rng(0).integers(0, 64, (4, SEQ)).astype(np.int32)
     monkeypatch.setattr(runner, "FrozenSubstrate", lambda _name: substrate)
     monkeypatch.setattr(runner, "load_token_blocks", lambda *a, **k: blocks)
-    return cfg
+    return Path(cfg)
 
 
 def test_audit_only_prints_json_and_does_not_train(

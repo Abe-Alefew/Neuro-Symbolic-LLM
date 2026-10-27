@@ -1,5 +1,4 @@
-"""Squared-error energies of the A2 stability terms, computed by FabricPC nodes.
-"""
+"""Squared-error energies of the A2 stability terms, computed by FabricPC nodes."""
 
 from __future__ import annotations
 
@@ -8,12 +7,12 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from fabricpc.builder import Edge, TaskMap, graph
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.core.types import GraphParams, NodeParams
+from fabricpc.graph import initialize_graph_state
 from fabricpc.nodes import IdentityNode, Linear
 
-from fabricpc.builder import Edge, TaskMap, graph
-from fabricpc.graph import initialize_graph_state
 from residual.hep import Highway
 
 BACKENDS = ("fabricpc", "jax")

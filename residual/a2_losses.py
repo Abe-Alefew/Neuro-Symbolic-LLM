@@ -1,20 +1,18 @@
-""" auxiliary losses on residual-corrected hidden states.
-"""
+"""auxiliary losses on residual-corrected hidden states."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 
+from residual import AdapterParams, ResidualAdapter
 from residual.cpc_heads import predict_future, project
 from residual.fpc_energy import anchor_sq_distance, check_backend, highway_sq_norm
 from residual.hep import Highway, apply_highway
-from residual import ResidualAdapter
 from residual.stability import (
     STEP_KEYS,
     StabilityMonitor,
@@ -34,16 +32,13 @@ STABILITY_METRIC_KEYS = (
 _NEG = -1e30
 _EPS = 1e-8
 
-from residual import adapter
-
 
 def _l2_normalize(x: jax.Array) -> jax.Array:
     return x / jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + _EPS)
 
 
 def anchor_positions(num_positions: int, max_anchors: int | None) -> tuple[int, ...]:
-    """Deterministic anchor subsampling: every ``stride``-th position from 0.
-    """
+    """Deterministic anchor subsampling: every ``stride``-th position from 0."""
     if num_positions < 1:
         raise ValueError(f"num_positions must be >= 1, got {num_positions}")
     if max_anchors is None:
@@ -74,7 +69,7 @@ def contrastive_future_loss(
         positive   y_{b,t} = normalize( stop_gradient( q(targets[b, t + offset]) ) )
 
         L = mean_{b,t}  -log  exp(z.y_pos / tau) / ( exp(z.y_pos / tau) + sum_neg exp(z.y_neg / tau) )
-    
+
     """
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
         raise ValueError(f"offset must be an integer >= 1, got {offset!r}")
@@ -172,6 +167,7 @@ def contrastive_future_loss(
     }
     return loss.astype(jnp.float32), metrics
 
+
 def hidden_prediction_loss(
     pred: jax.Array, target: jax.Array, source: jax.Array, config: Any
 ) -> dict[str, jax.Array]:
@@ -194,7 +190,7 @@ def hidden_prediction_loss(
 def collect_stability_metrics(
     monitor: StabilityMonitor,
     adapter: ResidualAdapter,
-    adapter_params: Mapping[str, Any],
+    adapter_params: AdapterParams,
     site_inputs: Mapping[int, jax.Array],
     corrected: Mapping[int, jax.Array] | None = None,
 ) -> dict[str, jax.Array]:
@@ -206,7 +202,8 @@ def collect_stability_metrics(
         corrected=corrected,
     )
 
-# --- stability: anchor loss and HEP nudge 
+
+# --- stability: anchor loss and HEP nudge
 
 
 def _masked_mean(x: jax.Array, mask: jax.Array | None) -> jax.Array:
@@ -227,8 +224,8 @@ def anchor_loss(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Anchor loss ``L_zanch``: keep the state ``z`` close to its feed-forward anchor.
 
-        L = mean_{...,b,t} || z - sg(z_anchor) ||^2        (``normalize="none"``)
-        L = that / ( mean || sg(z_anchor) ||^2 + eps )     (``normalize="relative"``)
+    L = mean_{...,b,t} || z - sg(z_anchor) ||^2        (``normalize="none"``)
+    L = that / ( mean || sg(z_anchor) ||^2 + eps )     (``normalize="relative"``)
     """
     if normalize not in ("relative", "none"):
         raise ValueError(f"normalize must be 'relative' or 'none', got {normalize!r}")
@@ -260,8 +257,7 @@ def anchor_loss(
 
 
 def output_error(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Output error ``eps_y = softmax(logits) - onehot(next token)``.
-    """
+    """Output error ``eps_y = softmax(logits) - onehot(next token)``."""
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError(
             f"expected logits [B, T, V] and labels [B, T], got {logits.shape}, {labels.shape}"
@@ -294,8 +290,8 @@ def hep_nudge_loss(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """HEP-nudge penalty ``L_hep-nudge``: the squared size of the injected nudge.
 
-        L = mean_{...,b,t} || alpha * sg(eps) @ V ||^2
-        L = that / ( mean || sg(reference) ||^2 + eps ) 
+    L = mean_{...,b,t} || alpha * sg(eps) @ V ||^2
+    L = that / ( mean || sg(reference) ||^2 + eps )
     """
     if eps.ndim < 3:
         raise ValueError(f"expected eps [..., B, T, d_y], got shape {eps.shape}")
@@ -322,7 +318,6 @@ def hep_nudge_loss(
         loss = mean_sq / (ref_sq + _EPS)
         metrics["hep_nudge_ratio"] = jnp.sqrt(mean_sq / (ref_sq + _EPS))
     return loss, metrics
-
 
 
 __all__ = [

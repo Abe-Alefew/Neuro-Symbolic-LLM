@@ -6,10 +6,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fabricpc.graph import initialize_params
 from fabricpc.nodes import Linear
 
 from residual import cpc_heads
-from fabricpc.graph import initialize_params
 from residual.cpc_heads import (
     BACKENDS,
     a_key,

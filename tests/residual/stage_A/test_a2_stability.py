@@ -124,10 +124,10 @@ def test_init_hep_params_only_for_enabled_trainable_highways() -> None:
 # --- reduction over sites ----------------------------------------------------------------------
 
 
-def _states(seed: int, layers=(5, 6), d: int = 16):
+def _states(seed: int, layers=(5, 6), d: int = 16, shape=(3, 8)):
     keys = jax.random.split(jax.random.PRNGKey(seed), len(layers))
     return {
-        layer: jax.random.normal(k, (3, 8, d))
+        layer: jax.random.normal(k, (*shape, d))
         for layer, k in zip(layers, keys, strict=True)
     }
 
@@ -468,14 +468,6 @@ def test_backend_setting_is_validated_and_defaults_to_fabricpc() -> None:
             StabLossConfig(backend=bad)  # type: ignore[arg-type]
 
 
-def _states(seed: int, layers=(5, 6), d: int = 16, shape=(3, 8)):
-    keys = jax.random.split(jax.random.PRNGKey(seed), len(layers))
-    return {
-        layer: jax.random.normal(k, (*shape, d))
-        for layer, k in zip(layers, keys, strict=True)
-    }
-
-
 @pytest.mark.parametrize("kind", [None, "dense", "lowrank", "fixed_random", "tied"])
 def test_term_agrees_across_backends(kind) -> None:
     d, v = 16, 24
@@ -581,11 +573,12 @@ def test_the_config_backend_reaches_the_energies(monkeypatch, backend, expect) -
 
     calls = []
     real = fpc_energy._per_token_energy
-    monkeypatch.setattr(
-        fpc_energy,
-        "_per_token_energy",
-        lambda *a, **k: (calls.append(a[-1]), real(*a, **k))[1],
-    )
+
+    def mock(*a, **k):
+        calls.append(a[-1])
+        return real(*a, **k)
+
+    monkeypatch.setattr(fpc_energy, "_per_token_energy", mock)
     cfg = StabLossConfig(weight=1.0, backend=backend, hep=HEPConfig(kind="dense"))
     d, v = 16, 24
     hp = init_hep_params(cfg, 0, (5, 6), v, d)

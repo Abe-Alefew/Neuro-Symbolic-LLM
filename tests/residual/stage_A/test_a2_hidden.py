@@ -1035,6 +1035,7 @@ def test_optimising_lowers_the_hidden_prediction_error(gpt2, input_ids, detach) 
     for _ in range(40):
         params, state, terms = step(params, state)
         first = terms if first is None else first
+    assert first is not None
     assert float(terms["hid"]) < 0.8 * float(first["hid"])
     moved = {
         g: max_abs(jax.tree_util.tree_map(lambda a, b: a - b, fn(params), fn(start)))

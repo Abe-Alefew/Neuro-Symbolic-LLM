@@ -4,7 +4,7 @@ A2 keeps the A1 setup (a small trainable residual on the hidden states of a froz
 
 
 
-> **Status.** Built and tested: the objective wiring, the contrastive future loss, the stability loss, the hidden-prediction loss `L_hid` with its local predictors, the stability monitor (residual smoothness, settling-step metrics), the runner, ablation arms and the audit. 
+> **Status.** Built and tested: the objective wiring, the contrastive future loss, the stability loss, the hidden-prediction loss `L_hid` with its local predictors, the stability monitor (residual smoothness, settling-step metrics), the runner, ablation arms and the audit.
 
 ---
 
@@ -304,6 +304,3 @@ Guarantees enforced by tests:
 - **Logged names.** The shared loop prefixes every term with `loss_`, so diagnostics appear as `loss_cpc_top1`.
 - **Cost not measured.** FabricPC builds a small graph state on every head call; it has not been benchmarked against a plain matrix product, and `mean_step_time` per arm has not been recorded. `L_hid` adds one `[B·T, d] → ff_dim → d` MLP per site and intercepts the block after each site.
 - **Hyperparameters are uncalibrated.** A calibration of each term's gradient norm against the task gradient is planned, not written.
-
-
-

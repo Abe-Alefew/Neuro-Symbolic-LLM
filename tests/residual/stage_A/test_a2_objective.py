@@ -9,7 +9,7 @@ import json
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +40,7 @@ from stages.stage_A.a2 import (
 )
 from stages.stage_base import (
     Domain,
+    Objective,
     TrainingConfig,
     base_logits,
     evaluate,
@@ -203,7 +204,7 @@ def test_a2_yaml_shares_every_non_objective_section_with_a1() -> None:
 
 
 def shipped_objective() -> A2Config:
-    return load_configs(SHIPPED, A2Config).objective
+    return cast(A2Config, load_configs(SHIPPED, A2Config).objective)
 
 
 def test_every_arm_gives_a_valid_config_and_unknown_arms_are_rejected() -> None:
@@ -716,11 +717,13 @@ def test_cpc_trains_the_heads_and_the_adapter(substrate, adapter, input_ids) -> 
 def test_a_term_enters_the_gradient_linearly_with_its_weight(
     substrate, adapter, input_ids, term
 ) -> None:
-    kw = {"hep": "fixed_random"} if term == "stab" else {}
-    params = with_random_b(init_a2_params(make_cfg(cpc=1.0, stab=1.0, **kw), adapter))
+    hep = "fixed_random" if term == "stab" else None
+    params = with_random_b(
+        init_a2_params(make_cfg(cpc=1.0, stab=1.0, hep=hep), adapter)
+    )
 
     def grad(w):
-        cfg = make_cfg(**{term: w}, **kw)
+        cfg = make_cfg(cpc=w, hep=hep) if term == "cpc" else make_cfg(stab=w, hep=hep)
         return grads_of(substrate, adapter, cfg, params, input_ids)
 
     g0, g1, g2 = grad(0.0), grad(0.25), grad(0.5)
@@ -813,6 +816,7 @@ def test_optimising_the_objective_lowers_every_enabled_term(gpt2, input_ids) -> 
     for _ in range(40):
         params, state, terms = step(params, state, input_ids)
         first = terms if first is None else first
+    assert first is not None
     assert float(terms["total"]) < float(first["total"])
     assert float(terms["task"]) < float(first["task"])
     assert float(terms["cpc"]) < float(first["cpc"])
@@ -909,7 +913,7 @@ def test_with_aux_terms_off_a_run_is_the_a1_run(gpt2, tmp_path) -> None:
                 adapter,
                 init_a2_params(make_cfg(), adapter),
                 [_domain("a", 5)],
-                objective,
+                cast(Objective, objective),
                 cfg,
                 training,
                 writer,

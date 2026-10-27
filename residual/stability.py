@@ -113,7 +113,9 @@ def step_metrics(trajectory: jax.Array, delta: float = 1e-6) -> dict[str, jax.Ar
     differences) is zero as well.
     """
     if trajectory.ndim != 4:
-        raise ValueError(f"trajectory must be [S+1, B, T, D], got {tuple(trajectory.shape)}")
+        raise ValueError(
+            f"trajectory must be [S+1, B, T, D], got {tuple(trajectory.shape)}"
+        )
     z = jax.lax.stop_gradient(trajectory.astype(jnp.float32))
     n_tokens = float(z.shape[1] * z.shape[2])
     diffs = z[1:] - z[:-1]  # [S, B, T, D]
@@ -185,7 +187,10 @@ class StabilityMonitor:
                 per_site.setdefault(key, []).append(value)
         metrics = {k: jnp.mean(jnp.stack(v)) for k, v in per_site.items()}
         metrics.update(
-            {f"res_smooth_l{i}": v for i, v in zip(self.layers, per_site["res_smooth"], strict=True)}
+            {
+                f"res_smooth_l{i}": v
+                for i, v in zip(self.layers, per_site["res_smooth"], strict=True)
+            }
         )
         return metrics
 

@@ -344,8 +344,8 @@ def test_heads_and_adapter_jointly_decrease_the_loss(
 
 
 def test_offsets_spellings() -> None:
-    assert CPCConfig(offsets=2).offsets == (2,)
-    assert CPCConfig(offsets=[1, 2, 4]).offsets == (1, 2, 4)
+    assert CPCConfig(offsets=2).offsets == (2,)  # type: ignore[arg-type]
+    assert CPCConfig(offsets=[1, 2, 4]).offsets == (1, 2, 4)  # type: ignore[arg-type]
     assert CPCConfig.from_dict({"offsets": [1, 2, 4]}).offsets == (1, 2, 4)
     assert CPCConfig.from_dict({"offset": 2}).offsets == (2,)
     with pytest.raises(ValueError, match="either"):
@@ -409,8 +409,8 @@ def test_offset_longer_than_the_sequence_is_an_error() -> None:
 
 
 def test_fabricpc_and_jax_heads_give_the_same_term() -> None:
-    kw = {"weight": 1.0, "offsets": (1, 2), "dim": 8, "tau": 0.2}
-    cfg_f, cfg_j = CPCConfig(heads="fabricpc", **kw), CPCConfig(heads="jax", **kw)
+    cfg_f = CPCConfig(heads="fabricpc", weight=1.0, offsets=(1, 2), dim=8, tau=0.2)
+    cfg_j = CPCConfig(heads="jax", weight=1.0, offsets=(1, 2), dim=8, tau=0.2)
     params = init_cpc_params(cfg_f, 0, (5, 6), 16)
     corrected, base = _states(1), _states(2)
 
@@ -541,9 +541,12 @@ def test_the_heads_setting_selects_the_backend(
 
     calls = []
     real = cpc_heads._run_head
-    monkeypatch.setattr(
-        cpc_heads, "_run_head", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
-    )
+
+    def mock(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(cpc_heads, "_run_head", mock)
     cfg = CPCConfig(weight=1.0, dim=8, heads=heads_backend)
     params = init_cpc_params(cfg, 0, (5, 6), 16)
     cpc_term(params, config=cfg, corrected=_states(1), base=_states(2))

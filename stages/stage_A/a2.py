@@ -17,6 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import numpy as np
+import optax
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
 from residual import AdapterParams, ResidualAdapter
@@ -63,6 +65,7 @@ from stages.stage_base import base_logits, checked_kwargs
 
 
 POSITIVES = ("base", "corrected")
+HIDDEN_TARGETS = ("corrected_teacher", "base_anchor")
 
 
 @dataclass(frozen=True)
@@ -972,7 +975,7 @@ def _a2_objective(
         if need_states:
             base_states = {
                 layer: jax.lax.stop_gradient(base_run.hidden_state(layer))
-                for layer in adapter.layers
+                for layer in adapter.layers 
             }
         if need_targets:
             base_targets = {
@@ -1056,14 +1059,16 @@ def _a2_objective(
                 )
                 for i in pred_layers
             }
-            targets = (
-                base_targets
-                if base_targets is not None
-                else {
+            # base_anchor: clean-base next-block states (base_targets, built above);
+            # corrected_teacher: the frozen next block on the actual corrected input.
+            if config.hid.hidden_target == "base_anchor":
+                assert base_targets is not None
+                targets = base_targets
+            else:
+                targets = {
                     i: jax.lax.stop_gradient(run.hidden_state(i + 1))
                     for i in pred_layers
                 }
-            )
             l_hid, m = hid_term(
                 params,
                 config=config,

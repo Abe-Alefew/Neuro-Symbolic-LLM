@@ -14,16 +14,27 @@ import jax.numpy as jnp
 from residual.cpc_heads import predict_future, project
 from residual.fpc_energy import anchor_sq_distance, check_backend, highway_sq_norm
 from residual.hep import Highway, apply_highway
+from residual import ResidualAdapter
+from residual.stability import (
+    STEP_KEYS,
+    StabilityMonitor,
+    residual_smoothness,
+    step_metrics,
+)
+
+_VAR_FLOOR = 1e-6
+A2_LOSS_KEYS = ("task", "kl", "wd", "hid")
+STABILITY_METRIC_KEYS = (
+    "res_smooth",
+    "input_smooth",
+    "res_vs_input",
+    *STEP_KEYS,
+)
 
 _NEG = -1e30
 _EPS = 1e-8
 
 from residual import adapter
-
-
-
-A2_LOSS_KEYS = ("task", "kl", "wd", "hid")
-
 
 
 def _l2_normalize(x: jax.Array) -> jax.Array:
@@ -161,6 +172,39 @@ def contrastive_future_loss(
     }
     return loss.astype(jnp.float32), metrics
 
+def hidden_prediction_loss(
+    pred: jax.Array, target: jax.Array, source: jax.Array, config: Any
+) -> dict[str, jax.Array]:
+    target = jax.lax.stop_gradient(target.astype(jnp.float32))
+    source = source.astype(jnp.float32)
+    if config.skip_first_token:
+        pred, target, source = pred[:, 1:], target[:, 1:], source[:, 1:]
+    mse = jnp.mean(jnp.square(pred - target))
+    var = jnp.mean(jnp.var(target, axis=(0, 1))) + _VAR_FLOOR
+    copy_mse = jnp.mean(jnp.square(jax.lax.stop_gradient(source) - target))
+    rel = mse / var
+    return {
+        "loss": rel if config.hidden_norm == "target_var" else mse,
+        "mse": mse,
+        "rel": rel,
+        "copy_rel": copy_mse / var,
+    }
+
+
+def collect_stability_metrics(
+    monitor: StabilityMonitor,
+    adapter: ResidualAdapter,
+    adapter_params: Mapping[str, Any],
+    site_inputs: Mapping[int, jax.Array],
+    corrected: Mapping[int, jax.Array] | None = None,
+) -> dict[str, jax.Array]:
+    """Collect A2 stability metrics without adding them to the loss."""
+    return monitor.metrics(
+        adapter,
+        adapter_params,
+        site_inputs,
+        corrected=corrected,
+    )
 
 # --- stability: anchor loss and HEP nudge 
 
@@ -282,10 +326,16 @@ def hep_nudge_loss(
 
 
 __all__ = [
+    "A2_LOSS_KEYS",
     "anchor_loss",
     "anchor_positions",
     "contrastive_future_loss",
+    "collect_stability_metrics",
     "hep_nudge",
     "hep_nudge_loss",
+    "hidden_prediction_loss",
     "output_error",
+    "residual_smoothness",
+    "STABILITY_METRIC_KEYS",
+    "step_metrics",
 ]

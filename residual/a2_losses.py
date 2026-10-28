@@ -1,29 +1,36 @@
-""" auxiliary losses on residual-corrected hidden states.
-"""
+"""auxiliary losses on residual-corrected hidden states."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 
+from residual import AdapterParams, ResidualAdapter
 from residual.cpc_heads import predict_future, project
 from residual.fpc_energy import anchor_sq_distance, check_backend, highway_sq_norm
 from residual.hep import Highway, apply_highway
+from residual.stability import (
+    STEP_KEYS,
+    StabilityMonitor,
+    residual_smoothness,
+    step_metrics,
+)
+
+_VAR_FLOOR = 1e-6
+A2_LOSS_KEYS = ("task", "kl", "wd", "hid")
+STABILITY_METRIC_KEYS = (
+    "res_smooth",
+    "input_smooth",
+    "res_vs_input",
+    *STEP_KEYS,
+)
 
 _NEG = -1e30
 _EPS = 1e-8
-
-from residual import adapter
-
-
-
-A2_LOSS_KEYS = ("task", "kl", "wd", "hid")
-
 
 
 def _l2_normalize(x: jax.Array) -> jax.Array:
@@ -31,8 +38,7 @@ def _l2_normalize(x: jax.Array) -> jax.Array:
 
 
 def anchor_positions(num_positions: int, max_anchors: int | None) -> tuple[int, ...]:
-    """Deterministic anchor subsampling: every ``stride``-th position from 0.
-    """
+    """Deterministic anchor subsampling: every ``stride``-th position from 0."""
     if num_positions < 1:
         raise ValueError(f"num_positions must be >= 1, got {num_positions}")
     if max_anchors is None:
@@ -63,7 +69,7 @@ def contrastive_future_loss(
         positive   y_{b,t} = normalize( stop_gradient( q(targets[b, t + offset]) ) )
 
         L = mean_{b,t}  -log  exp(z.y_pos / tau) / ( exp(z.y_pos / tau) + sum_neg exp(z.y_neg / tau) )
-    
+
     """
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
         raise ValueError(f"offset must be an integer >= 1, got {offset!r}")
@@ -162,7 +168,42 @@ def contrastive_future_loss(
     return loss.astype(jnp.float32), metrics
 
 
-# --- stability: anchor loss and HEP nudge 
+def hidden_prediction_loss(
+    pred: jax.Array, target: jax.Array, source: jax.Array, config: Any
+) -> dict[str, jax.Array]:
+    target = jax.lax.stop_gradient(target.astype(jnp.float32))
+    source = source.astype(jnp.float32)
+    if config.skip_first_token:
+        pred, target, source = pred[:, 1:], target[:, 1:], source[:, 1:]
+    mse = jnp.mean(jnp.square(pred - target))
+    var = jnp.mean(jnp.var(target, axis=(0, 1))) + _VAR_FLOOR
+    copy_mse = jnp.mean(jnp.square(jax.lax.stop_gradient(source) - target))
+    rel = mse / var
+    return {
+        "loss": rel if config.hidden_norm == "target_var" else mse,
+        "mse": mse,
+        "rel": rel,
+        "copy_rel": copy_mse / var,
+    }
+
+
+def collect_stability_metrics(
+    monitor: StabilityMonitor,
+    adapter: ResidualAdapter,
+    adapter_params: AdapterParams,
+    site_inputs: Mapping[int, jax.Array],
+    corrected: Mapping[int, jax.Array] | None = None,
+) -> dict[str, jax.Array]:
+    """Collect A2 stability metrics without adding them to the loss."""
+    return monitor.metrics(
+        adapter,
+        adapter_params,
+        site_inputs,
+        corrected=corrected,
+    )
+
+
+# --- stability: anchor loss and HEP nudge
 
 
 def _masked_mean(x: jax.Array, mask: jax.Array | None) -> jax.Array:
@@ -183,8 +224,8 @@ def anchor_loss(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Anchor loss ``L_zanch``: keep the state ``z`` close to its feed-forward anchor.
 
-        L = mean_{...,b,t} || z - sg(z_anchor) ||^2        (``normalize="none"``)
-        L = that / ( mean || sg(z_anchor) ||^2 + eps )     (``normalize="relative"``)
+    L = mean_{...,b,t} || z - sg(z_anchor) ||^2        (``normalize="none"``)
+    L = that / ( mean || sg(z_anchor) ||^2 + eps )     (``normalize="relative"``)
     """
     if normalize not in ("relative", "none"):
         raise ValueError(f"normalize must be 'relative' or 'none', got {normalize!r}")
@@ -216,8 +257,7 @@ def anchor_loss(
 
 
 def output_error(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Output error ``eps_y = softmax(logits) - onehot(next token)``.
-    """
+    """Output error ``eps_y = softmax(logits) - onehot(next token)``."""
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError(
             f"expected logits [B, T, V] and labels [B, T], got {logits.shape}, {labels.shape}"
@@ -250,8 +290,8 @@ def hep_nudge_loss(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """HEP-nudge penalty ``L_hep-nudge``: the squared size of the injected nudge.
 
-        L = mean_{...,b,t} || alpha * sg(eps) @ V ||^2
-        L = that / ( mean || sg(reference) ||^2 + eps ) 
+    L = mean_{...,b,t} || alpha * sg(eps) @ V ||^2
+    L = that / ( mean || sg(reference) ||^2 + eps )
     """
     if eps.ndim < 3:
         raise ValueError(f"expected eps [..., B, T, d_y], got shape {eps.shape}")
@@ -280,12 +320,17 @@ def hep_nudge_loss(
     return loss, metrics
 
 
-
 __all__ = [
+    "A2_LOSS_KEYS",
     "anchor_loss",
     "anchor_positions",
     "contrastive_future_loss",
+    "collect_stability_metrics",
     "hep_nudge",
     "hep_nudge_loss",
+    "hidden_prediction_loss",
     "output_error",
+    "residual_smoothness",
+    "STABILITY_METRIC_KEYS",
+    "step_metrics",
 ]

@@ -296,13 +296,38 @@ class HEPConfig:
 
 @dataclass(frozen=True)
 class StabLossConfig:
-    """``objective.stab`` section of the A2 YAML: the stability *loss*."""
+    """``objective.stab`` section of the A2 YAML: the stability *loss*.
+
+    The stability loss has four sub-terms:
+
+    =========== ============================= ================================
+    Sub-term    Weight field                  Status in A2
+    =========== ============================= ================================
+    L_zanch     ``w_anch``                    Active
+    L_hep-nudge ``w_hep``                     Active (needs trainable highway)
+    L_res-smooth``w_smooth``                  Active
+    L_step      ``w_step``                    **Inactive** in A2 — see below
+    =========== ============================= ================================
+
+    ``w_step`` and ``L_step`` in A2
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ``L_step = E_{b,t} sum_{s=0}^{K-1} ||z^(s+1) - z^(s)||^2``.
+    A2 provides only a single feed-forward state (no settling trajectory),
+    so ``K = 0`` and the sum is empty: the loss is *identically zero* with
+    *zero gradient*.  Enabling ``w_step > 0`` in A2 (as the ``stab_all``
+    arm does) is therefore harmless but has **no training effect**.
+
+    The field exists for API compatibility so that ``stab_all`` exercises
+    the step-loss code path, and A3 can reuse ``StabLossConfig`` with a
+    real settling trajectory without any schema changes.
+    """
 
     weight: float = 0.0
     w_anch: float = 1.0
     w_hep: float = 0.0
     w_smooth: float = 0.0
-    # Settling-step loss: exactly 0 in A2 (no settling); used by A3.
+    # Settling-step loss: structurally inactive in A2 (no settling trajectory,
+    # so L_step ≡ 0 with zero gradient).  Retained for A3 API compatibility.
     w_step: float = 0.0
     normalize: str = "relative"
     backend: str = "fabricpc"
@@ -353,7 +378,38 @@ HIDDEN_NORMS = ("target_var", "none")
 
 @dataclass(frozen=True)
 class HiddenConfig:
-    """``objective.hid`` section of the A2 YAML: the hidden-prediction loss ``L_hid``."""
+    """``objective.hid`` section of the A2 YAML: the hidden-prediction loss ``L_hid``.
+
+    Hidden-target semantics (``hidden_target`` field)
+    --------------------------------------------------
+    Two target definitions are supported, corresponding to two interpretations
+    of "predict the next frozen hidden state":
+
+    ``corrected_teacher`` **(Option B — default)**
+        y^hid_{l,t} = F^0_{l→l+1}(h̃_{l,t})  — the next *frozen* block
+        applied to the *corrected* (adapter-modified) input.
+        L_hid = Σ ‖sg(h̃^teacher_{l+1,t}) − P_l(h̃_{l,t})‖²
+        This trains P_l as a local surrogate for the frozen block around the
+        states the residual layer actually visits.
+
+    ``base_anchor`` **(Option A)**
+        y^hid_{l,t} = h^0_{l+1,t}  — the next-block state from a clean,
+        unmodified base forward pass.
+        This anchors the predictor to the original frozen trajectory and
+        requires an additional base forward (sets ``needs_base_targets``).
+
+    **Why ``corrected_teacher`` is the default:**  The paper's recommendation
+    for the A2 hidden-prediction auxiliary loss is Option B
+    (``corrected_teacher``).  Option A (``base_anchor``) is appropriate only
+    when the intended term is explicitly a hidden-state anchor rather than a
+    local predictor.  In both cases, the target is stop-gradiented and the
+    frozen base parameters remain frozen.
+
+    To switch to the base-anchor interpretation::
+
+        hidden_target: base_anchor   # in the YAML
+        --hidden-target base_anchor  # on the CLI
+    """
 
     weight: float = 0.0
     lambda_hid: float | None = None
@@ -783,6 +839,10 @@ def stability_term(
             metrics[name] = jnp.mean(jnp.stack([m[name] for m in parts]))
 
     if config.w_step > 0:
+        # In A2, trajectories is None → traj = h[None] with shape [1,B,T,d].
+        # step_loss returns exactly 0 (no successive states to compare).
+        # This branch is exercised for code-path coverage (stab_all arm)
+        # but has no training effect until A3 supplies a real trajectory.
         losses, parts = [], []
         for layer, h in corrected.items():
             traj = h[None] if trajectories is None else trajectories[layer]
@@ -1208,7 +1268,7 @@ ARMS = (
     "stab_anch",  # anchor only
     "stab_hep",  # anchor + trainable low-rank HEP highway
     "stab_smooth",  # anchor + residual smoothness
-    "stab_all",  # all four: anchor, HEP nudge, residual smoothness, step
+    "stab_all",  # all four: anchor, HEP nudge, residual smoothness, step(step inactive in A2)
     "cpc_base",  # contrastive future, positive from the base state
     "cpc_corrected",  # contrastive future, positive from the corrected state
     "cpc_multi",  # contrastive future, offsets 1, 2, 4

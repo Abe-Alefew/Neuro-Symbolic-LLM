@@ -103,7 +103,7 @@ objective:                  # → A2Config
     w_anch: 1.0
     w_hep: 0.0              # > 0 needs hep.kind: lowrank | dense
     w_smooth: 0.1           # residual smoothness
-    w_step: 1.0             # settling-step loss (exactly 0 in A2)
+    w_step: 1.0             # settling-step loss (structurally inactive in A2 — L_step ≡ 0, no settling trajectory)
     normalize: relative     # relative | none
     backend: fabricpc       # fabricpc | jax
     hep:                    # → HEPConfig
@@ -135,9 +135,19 @@ objective:                  # → A2Config
 | `stab.weight` (λ_stab) | 0.0 (YAML: 0.1) | |
 | `hid.lambda_hid` / `hid.weight` (λ_hid) | 0.0 (YAML: 0.1) | the error is target-variance normalised, so it is about 1 for a copy |
 | `stab.w_anch` / `stab.w_hep` | 1.0 / 0.0 | HEP needs a trainable highway |
-| `stab.w_smooth` / `stab.w_step` | 0.0 / 0.0 (YAML: 0.1 / 1.0) | `w_step` has no effect until a stage has settling |
+| `stab.w_smooth` / `stab.w_step` | 0.0 / 0.0 (YAML: 0.1 / 1.0) | `w_step` is **structurally inactive in A2**: L_step ≡ 0 (no settling trajectory). Included for A3 API compatibility and code-path coverage |
 | `cpc.tau` | 0.1 | 0.05 – 0.2 |
 | `cpc.dim` | 32 | 32 or 64 |
+
+> **Hidden-target default rationale.**  The shipped default for
+> `hid.hidden_target` is `corrected_teacher` (Option B).  This is the
+> paper's recommendation for the A2 hidden-prediction auxiliary loss: it
+> trains each predictor P_l as a local surrogate for the next frozen block
+> around the corrected states the adapter actually visits.
+> `base_anchor` (Option A) is supported but is appropriate only when the
+> intended term is explicitly an anchor to the original frozen trajectory.
+> Both options apply stop-gradient to the target and keep frozen base
+> parameters frozen.
 
 
 ## Ablation arms
@@ -150,7 +160,7 @@ An arm chooses which terms run and their variant; `λ_kl`, `λ_wd`, data, optimi
 | `stab_anch` | anchor only |
 | `stab_hep` | anchor + trainable low-rank HEP highway |
 | `stab_smooth` | anchor + residual smoothness |
-| `stab_all` | all four stability losses (anchor, HEP nudge on a trainable low-rank highway, residual smoothness, step) |
+| `stab_all` | all four stability losses (anchor, HEP nudge on a trainable low-rank highway, residual smoothness, step); **note:** `w_step` is structurally inactive in A2 (L_step ≡ 0) — it exercises the code path but has no training effect until A3 supplies a settling trajectory |
 | `cpc_base` | contrastive future, positive from the base state |
 | `cpc_corrected` | contrastive future, positive from the corrected state |
 | `cpc_multi` | contrastive future, offsets 1, 2, 4 |

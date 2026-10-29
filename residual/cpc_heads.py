@@ -1,8 +1,8 @@
 """Contrastive-future (CPC) heads for Stage A2: a projection ``q_l`` and a per-offset predictor ``A_{l,k}``.
 
 
-    c_t = q_l(h~_t) = LN(h~_t) @ W        W: [d, m]
-    z_t = A_{l,k}(c_t) = c_t @ M          M: [m, m]   (predicts the code k steps ahead)
+c_t = q_l(h~_t) = LN(h~_t) @ W        W: [d, m]
+z_t = A_{l,k}(c_t) = c_t @ M          M: [m, m]   (predicts the code k steps ahead)
 """
 
 from __future__ import annotations
@@ -13,12 +13,11 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from fabricpc.builder import Edge, TaskMap, graph
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.core.types import GraphParams, NodeParams
-from fabricpc.nodes import Linear
-
-from fabricpc.builder import Edge, TaskMap, graph
 from fabricpc.graph import initialize_graph_state
+from fabricpc.nodes import Linear
 
 CPCParams = dict[str, dict[str, jax.Array]]
 
@@ -50,8 +49,7 @@ def init_cpc_heads(
     offsets: Iterable[int] = (1,),
     a_noise_std: float = 0.01,
 ) -> CPCParams:
-    """Initial heads for every ``layer`` and ``offset``.
-    """
+    """Initial heads for every ``layer`` and ``offset``."""
     if hidden_size < 1 or dim < 1:
         raise ValueError(f"hidden_size and dim must be >= 1, got {hidden_size}, {dim}")
     if not a_noise_std >= 0:
@@ -79,7 +77,6 @@ def init_cpc_heads(
 
 
 def _layer_norm(x: jax.Array) -> jax.Array:
-    
     x = x.astype(jnp.float32)
     mu = jnp.mean(x, axis=-1, keepdims=True)
     var = jnp.var(x, axis=-1, keepdims=True)
@@ -101,7 +98,6 @@ def predict_future_reference(
 ) -> jax.Array:
     """Pure-JAX ``A_{l,k}``: ``c @ M``. The oracle for the FabricPC head."""
     return c @ a_params["M"]
-
 
 
 _Q_EDGE = "x->q:in"

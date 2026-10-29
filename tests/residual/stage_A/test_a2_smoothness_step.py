@@ -1,5 +1,4 @@
-"""The four stability losses of A2: anchor, HEP nudge, residual smoothness and step loss.
-"""
+"""The four stability losses of A2: anchor, HEP nudge, residual smoothness and step loss."""
 
 from __future__ import annotations
 
@@ -197,12 +196,17 @@ def test_step_loss_input_errors() -> None:
 def test_the_new_weights_default_to_off_and_are_validated() -> None:
     cfg = StabLossConfig()
     assert (cfg.w_smooth, cfg.w_step) == (0.0, 0.0)
-    for name in ("w_smooth", "w_step"):
-        with pytest.raises(ValueError, match=name):
-            StabLossConfig(**{name: -0.1})
-        with pytest.raises(ValueError, match=name):
-            StabLossConfig(**{name: True})
-        assert getattr(StabLossConfig(**{name: 0.5}), name) == 0.5
+    with pytest.raises(ValueError, match="w_smooth"):
+        StabLossConfig(w_smooth=-0.1)
+    with pytest.raises(ValueError, match="w_smooth"):
+        StabLossConfig(w_smooth=True)
+    assert StabLossConfig(w_smooth=0.5).w_smooth == 0.5
+
+    with pytest.raises(ValueError, match="w_step"):
+        StabLossConfig(w_step=-0.1)
+    with pytest.raises(ValueError, match="w_step"):
+        StabLossConfig(w_step=True)
+    assert StabLossConfig(w_step=0.5).w_step == 0.5
 
 
 def test_from_dict_reads_the_new_weights_and_round_trips() -> None:

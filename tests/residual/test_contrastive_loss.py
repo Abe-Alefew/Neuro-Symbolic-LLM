@@ -644,9 +644,12 @@ def test_the_backend_choice_reaches_the_heads(
 
     calls = []
     real = cpc_heads._run_head
-    monkeypatch.setattr(
-        cpc_heads, "_run_head", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
-    )
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(cpc_heads, "_run_head", spy)
     q, a = _heads()
     contrastive_future_loss(
         q,

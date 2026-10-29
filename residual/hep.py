@@ -1,5 +1,4 @@
-""" Highway error propagation (HEP) matrices ``V_{y -> i}`` for the stability loss.
-"""
+"""Highway error propagation (HEP) matrices ``V_{y -> i}`` for the stability loss."""
 
 from __future__ import annotations
 

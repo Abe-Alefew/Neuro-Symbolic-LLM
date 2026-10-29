@@ -47,8 +47,7 @@ def residual_norm_ratio(
     mask: jax.Array | None = None,
     eps: float = 1e-8,
 ) -> jax.Array:
-    """Mean over tokens of ``||h~ - h|| / ||h||``: how large the residual ``R`` is.
-    """
+    """Mean over tokens of ``||h~ - h|| / ||h||``: how large the residual ``R`` is."""
     if h.shape != h_corrected.shape:
         raise ValueError(f"shape mismatch: {h.shape} vs {h_corrected.shape}")
     if eps < 0:
@@ -65,8 +64,7 @@ def residual_norm_ratio(
 
 
 def direction_redundancy(vectors: jax.Array, eps: float = 1e-8) -> jax.Array:
-    """Mean ``|cos|`` over the pairs of distinct rows of ``vectors`` ``[n, d]``.
-    """
+    """Mean ``|cos|`` over the pairs of distinct rows of ``vectors`` ``[n, d]``."""
     if vectors.ndim != 2:
         raise ValueError(f"expected a 2-D [n, d] matrix, got shape {vectors.shape}")
     if eps < 0:
@@ -82,16 +80,14 @@ def direction_redundancy(vectors: jax.Array, eps: float = 1e-8) -> jax.Array:
 
 
 def residual_redundancy(a: jax.Array, b: jax.Array) -> dict[str, jax.Array]:
-    """Redundancy of one adapter block ``h~ = h + s * sigma(h A) B``.
-    """
+    """Redundancy of one adapter block ``h~ = h + s * sigma(h A) B``."""
     if a.ndim != 2 or b.ndim != 2 or a.shape != b.shape[::-1]:
         raise ValueError(f"expected A [d, r] and B [r, d], got {a.shape} and {b.shape}")
     return {"read": direction_redundancy(a.T), "write": direction_redundancy(b)}
 
 
 def gradient_conflict(grad_a: Any, grad_b: Any, eps: float = 1e-12) -> jax.Array:
-    """``[-cos(g_a, g_b)]_+`` of two gradient PyTrees with the same structure.
-    """
+    """``[-cos(g_a, g_b)]_+`` of two gradient PyTrees with the same structure."""
     if eps < 0:
         raise ValueError(f"eps must be >= 0, got {eps!r}")
     leaves_a = jax.tree_util.tree_leaves(grad_a)

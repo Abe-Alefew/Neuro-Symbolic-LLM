@@ -64,40 +64,40 @@ def test_highway_for_each_kind() -> None:
     dense = init_hep("dense", 0, [5], DY, DI)
     low = init_hep("lowrank", 0, [5], DY, DI, rank=R)
     tied = jnp.ones((DY, DI))
-    kw = {"d_out": DY, "d_hidden": DI, "rank": R}
-    assert highway_for("dense", 5, params=dense, **kw) is dense["hep_5"]["V"]
-    u, w = highway_for("lowrank", 5, params=low, **kw)
+    assert (
+        highway_for("dense", 5, params=dense, d_out=DY, d_hidden=DI, rank=R)
+        is dense["hep_5"]["V"]
+    )
+    u, w = highway_for("lowrank", 5, params=low, d_out=DY, d_hidden=DI, rank=R)
     assert u is low["hep_5"]["U"] and w is low["hep_5"]["W"]
-    assert highway_for("tied", 5, tied=tied, **kw) is tied
-    fu, fw = highway_for("fixed_random", 5, seed=3, **kw)
+    assert highway_for("tied", 5, tied=tied, d_out=DY, d_hidden=DI, rank=R) is tied
+    fu, fw = highway_for("fixed_random", 5, seed=3, d_out=DY, d_hidden=DI, rank=R)
     assert fu.shape == (DY, R) and fw.shape == (R, DI)
-    fu2, _ = highway_for("fixed_random", 5, seed=3, **kw)
-    fu3, _ = highway_for("fixed_random", 6, seed=3, **kw)
+    fu2, _ = highway_for("fixed_random", 5, seed=3, d_out=DY, d_hidden=DI, rank=R)
+    fu3, _ = highway_for("fixed_random", 6, seed=3, d_out=DY, d_hidden=DI, rank=R)
     np.testing.assert_array_equal(fu, fu2)  # reproducible
     assert not np.array_equal(fu, fu3)  # per layer
 
 
 def test_fixed_random_equals_the_trainable_lowrank_init() -> None:
     # Same generator: a fixed-random highway is the lowrank init frozen.
-    kw = {"d_out": DY, "d_hidden": DI, "rank": R}
     low = init_hep("lowrank", 7, [5], DY, DI, rank=R)
-    fu, fw = highway_for("fixed_random", 5, seed=7, **kw)
+    fu, fw = highway_for("fixed_random", 5, seed=7, d_out=DY, d_hidden=DI, rank=R)
     np.testing.assert_array_equal(fu, low["hep_5"]["U"])
     np.testing.assert_array_equal(fw, low["hep_5"]["W"])
 
 
 def test_highway_for_errors() -> None:
-    kw = {"d_out": DY, "d_hidden": DI}
     with pytest.raises(KeyError, match="hep_5"):
-        highway_for("dense", 5, params={}, **kw)
+        highway_for("dense", 5, params={}, d_out=DY, d_hidden=DI)
     with pytest.raises(KeyError):
-        highway_for("lowrank", 5, params=None, **kw)
+        highway_for("lowrank", 5, params=None, d_out=DY, d_hidden=DI)
     with pytest.raises(ValueError, match="tied"):
-        highway_for("tied", 5, **kw)
+        highway_for("tied", 5, d_out=DY, d_hidden=DI)
     with pytest.raises(ValueError, match="shape"):
-        highway_for("tied", 5, tied=jnp.ones((DY, DI + 1)), **kw)
+        highway_for("tied", 5, tied=jnp.ones((DY, DI + 1)), d_out=DY, d_hidden=DI)
     with pytest.raises(ValueError, match="kind"):
-        highway_for("sparse", 5, **kw)
+        highway_for("sparse", 5, d_out=DY, d_hidden=DI)
 
 
 def test_apply_highway_dense_and_lowrank_agree() -> None:

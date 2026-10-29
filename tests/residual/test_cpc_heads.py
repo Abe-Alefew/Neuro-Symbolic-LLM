@@ -149,6 +149,7 @@ def test_split_cpc_selects_only_head_entries() -> None:
 # FabricPC backend against the pure-JAX reference
 # ----------------------------------------------------------------------
 
+
 def _heads(seed: int = 0):
     p = init_cpc_heads(seed, [3], D, M, offsets=(1,), a_noise_std=0.1)
     return p[q_key(3)], p[a_key(3, 1)]

@@ -136,9 +136,9 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
         ),
         stab=replace(
             obj.stab,
-            weight=args.lambda_stab
-            if args.lambda_stab is not None
-            else obj.stab.weight,
+            weight=(
+                args.lambda_stab if args.lambda_stab is not None else obj.stab.weight
+            ),
         ),
     )
     if args.epochs is not None:
@@ -181,7 +181,9 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
         ),
         monitor=replace(obj.monitor, **stab),
     )
-    return replace(cfg, adapter=adapter, objective=obj, training=training, domains=domains)
+    return replace(
+        cfg, adapter=adapter, objective=obj, training=training, domains=domains
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -202,7 +204,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"seq_len={train_cfg.seq_len} exceeds {max_pos} positions.")
 
     adapter = ResidualAdapter(cfg.adapter, arch)
-    bank = predictor_bank(obj, adapter, train_cfg.seq_len) if obj.uses_hidden_pred else None
+    bank = (
+        predictor_bank(obj, adapter, train_cfg.seq_len)
+        if obj.uses_hidden_pred
+        else None
+    )
     monitor = (
         StabilityMonitor(obj.stability, adapter.layers)
         if obj.stability.enabled
@@ -233,7 +239,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     if args.eval_checkpoint is not None:
-        log.info("Evaluating checkpoint %s on split=%s", args.eval_checkpoint, args.split)
+        log.info(
+            "Evaluating checkpoint %s on split=%s", args.eval_checkpoint, args.split
+        )
         results = evaluate_checkpoint(
             substrate,
             adapter,
@@ -250,22 +258,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Load data before creating the run directory, so bad datasets fail fast.
     domains = []
-    for d in cfg.domains:
-        train_blocks = load_token_blocks(substrate, d, d.train_split, train_cfg.seq_len)
-        eval_blocks = load_token_blocks(substrate, d, d.eval_split, train_cfg.seq_len)
+    for d_cfg in cfg.domains:
+        train_blocks = load_token_blocks(
+            substrate, d_cfg, d_cfg.train_split, train_cfg.seq_len
+        )
+        eval_blocks = load_token_blocks(
+            substrate, d_cfg, d_cfg.eval_split, train_cfg.seq_len
+        )
         domains.append(
             Domain(
-                name=d.name,
+                name=d_cfg.name,
                 train_blocks=train_blocks,
                 eval_set=make_eval_set(
                     eval_blocks, train_cfg.batch_size, train_cfg.eval_batches
                 ),
-                epochs=train_cfg.epochs if d.epochs is None else d.epochs,
+                epochs=train_cfg.epochs if d_cfg.epochs is None else d_cfg.epochs,
             )
         )
         log.info(
             "domain=%s train_blocks=%d eval_batches=%d",
-            d.name,
+            d_cfg.name,
             len(train_blocks),
             len(domains[-1].eval_set),
         )
@@ -286,8 +298,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if bank is None:
             return {}
         return a2_diagnostics(
-            substrate, adapter, bank, obj, p,
-            domain.eval_set, jit=train_cfg.jit,
+            substrate,
+            adapter,
+            bank,
+            obj,
+            p,
+            domain.eval_set,
+            jit=train_cfg.jit,
         )
 
     run_name = args.run_name or default_run_name("a2")
@@ -335,9 +352,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary["params_unchanged"] = frozen["params_unchanged"]
 
         final_diag = {}
-        for d in domains:
-            final_diag[d.name] = diagnostics(params, d)
-            writer.log("a2_diagnostics", when="final", domain=d.name, **final_diag[d.name])
+        for domain in domains:
+            final_diag[domain.name] = diagnostics(params, domain)
+            writer.log(
+                "a2_diagnostics",
+                when="final",
+                domain=domain.name,
+                **final_diag[domain.name],
+            )
         summary["a2_diagnostics"] = {
             "init": {domains[0].name: init_diag},
             "final": final_diag,
@@ -345,13 +367,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         # Final test-set evaluation across domains for paper-table results
         test_results = {}
-        for d in cfg.domains:
-            test_blocks = load_token_blocks(substrate, d, d.test_split, train_cfg.seq_len)
-            test_set = make_eval_set(test_blocks, train_cfg.batch_size, train_cfg.eval_batches)
-            test_results[d.name] = evaluate(
+        for d_cfg in cfg.domains:
+            test_blocks = load_token_blocks(
+                substrate, d_cfg, d_cfg.test_split, train_cfg.seq_len
+            )
+            test_set = make_eval_set(
+                test_blocks, train_cfg.batch_size, train_cfg.eval_batches
+            )
+            test_results[d_cfg.name] = evaluate(
                 substrate, adapter, params, test_set, jit=train_cfg.jit
             )
-            writer.log("test", domain=d.name, **test_results[d.name])
+            writer.log("test", domain=d_cfg.name, **test_results[d_cfg.name])
         summary["test"] = test_results
         writer.write_json("results.json", summary)
 

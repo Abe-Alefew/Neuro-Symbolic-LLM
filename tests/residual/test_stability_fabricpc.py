@@ -230,11 +230,12 @@ def test_output_error_feeds_the_highway_energy_like_the_reference() -> None:
 def test_the_backend_choice_reaches_fabricpc(monkeypatch, backend, expect) -> None:
     calls = []
     real = fpc_energy._per_token_energy
-    monkeypatch.setattr(
-        fpc_energy,
-        "_per_token_energy",
-        lambda *a, **k: (calls.append(a[-1]), real(*a, **k))[1],
-    )
+
+    def spy(*a, **k):
+        calls.append(a[-1])
+        return real(*a, **k)
+
+    monkeypatch.setattr(fpc_energy, "_per_token_energy", spy)
     z, anchor = _x(3, 6, D, seed=25), _x(3, 6, D, seed=26)
     anchor_loss(z, anchor, backend=backend)
     eps, v = _x(3, 6, V, seed=27), _x(V, D, seed=28)

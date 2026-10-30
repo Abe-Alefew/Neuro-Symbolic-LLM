@@ -41,6 +41,7 @@ from stages.stage_A.a2 import (
     hid_term,
     hidden_prediction_loss,
     init_a2_params,
+    make_a2_optimizer,
     param_counts,
     predictor_bank,
     predictor_params,
@@ -1134,3 +1135,123 @@ def test_evaluation_ignores_the_predictors(gpt2) -> None:
     full = evaluate(gpt2, adapter, params, eval_set)
     only = evaluate(gpt2, adapter, adapter_params(params), eval_set)
     assert full == pytest.approx(only)
+
+
+
+# --- predictor_lr_mult via make_a2_optimizer ---------------------------------------------------
+
+
+def test_predictor_lr_mult_produces_different_updates(gpt2) -> None:
+    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
+    cfg_m1 = make_cfg(hid=0.2, detach=False, predictor_lr_mult=1.0)
+    cfg_m2 = make_cfg(hid=0.2, detach=False, predictor_lr_mult=2.0)
+    params0 = with_random_predictors(
+        with_random_b(init_a2_params(cfg_m1, adapter))
+    )
+    # Both configs must produce the same initial parameter tree.
+    params0_m2 = with_random_predictors(
+        with_random_b(init_a2_params(cfg_m2, adapter))
+    )
+    for k in params0:
+        for n in params0[k]:
+            np.testing.assert_array_equal(
+                np.asarray(params0[k][n]), np.asarray(params0_m2[k][n])
+            )
+
+    lr = 1e-2
+    opt_m1 = make_a2_optimizer(cfg_m1, lr)
+    opt_m2 = make_a2_optimizer(cfg_m2, lr)
+
+    # Compute a shared gradient.
+    rng = np.random.default_rng(42)
+    ids = jnp.asarray(rng.integers(0, NUM_TOKENS, (BATCH, SEQ)), dtype=jnp.int32)
+
+    def loss_fn(p, cfg):
+        return a2_objective(
+            p, substrate=gpt2, adapter=adapter, config=cfg, input_ids=ids
+        )[0]
+
+    grads = jax.grad(lambda p: loss_fn(p, cfg_m1))(params0)
+
+    # One step with multiplier 1.
+    state_m1 = opt_m1.init(params0)
+    updates_m1, _ = opt_m1.update(grads, state_m1, params0)
+    out_m1 = optax.apply_updates(params0, updates_m1)
+
+    # One step with multiplier 2.
+    state_m2 = opt_m2.init(params0)
+    updates_m2, _ = opt_m2.update(grads, state_m2, params0)
+    out_m2 = optax.apply_updates(params0, updates_m2)
+
+    # 1) Adapter parameters must get identical updates.
+    for k in adapter_params(params0):
+        np.testing.assert_allclose(
+            np.asarray(out_m1[k]["B"]),
+            np.asarray(out_m2[k]["B"]),
+            atol=1e-7,
+            err_msg=f"adapter key {k} should have identical updates",
+        )
+
+    # 2) Predictor parameters must differ.
+    pred_keys = list(predictor_params(params0))
+    assert pred_keys, "expected predictor parameters in the tree"
+    for k in pred_keys:
+        for n in params0[k]:
+            delta_m1 = np.asarray(out_m1[k][n]) - np.asarray(params0[k][n])
+            delta_m2 = np.asarray(out_m2[k][n]) - np.asarray(params0[k][n])
+            # Where the gradient is non-zero, multiplier 2 should produce
+            # updates approximately 2× as large.
+            mask = np.abs(delta_m1) > 1e-12
+            if not mask.any():
+                continue
+            ratio = np.abs(delta_m2[mask]) / np.abs(delta_m1[mask])
+            np.testing.assert_allclose(
+                ratio,
+                2.0,
+                atol=1e-4,
+                err_msg=f"predictor key {k}/{n}: expected update ratio ~2.0",
+            )
+
+
+def test_run_sequential_respects_predictor_lr_mult(gpt2, tmp_path) -> None:
+    """End-to-end: ``run_sequential`` with ``make_a2_optimizer`` actually applies the
+    multiplier, producing different predictor parameters from a run with multiplier 1."""
+    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
+    training = TrainingConfig(batch_size=BATCH, learning_rate=1e-2, log_every=1)
+    domains = [_domain("a", 5)]
+
+    results = {}
+    for mult in (1.0, 2.0):
+        cfg = make_cfg(hid=0.2, detach=False, predictor_lr_mult=mult)
+        params = with_random_predictors(
+            with_random_b(init_a2_params(cfg, adapter))
+        )
+        tag = f"m{mult}"
+        with RunWriter(tmp_path, tag) as writer:
+            out, _ = run_sequential(
+                gpt2,
+                adapter,
+                params,
+                domains,
+                a2_objective,
+                cfg,
+                training,
+                writer,
+                optimizer=make_a2_optimizer(cfg, training.learning_rate),
+            )
+        results[mult] = out
+
+    pred_m1 = predictor_params(results[1.0])
+    pred_m2 = predictor_params(results[2.0])
+    assert pred_m1.keys() == pred_m2.keys()
+    any_diff = False
+    for k in pred_m1:
+        for n in pred_m1[k]:
+            if not np.allclose(
+                np.asarray(pred_m1[k][n]), np.asarray(pred_m2[k][n]), atol=1e-6
+            ):
+                any_diff = True
+    assert any_diff, (
+        "predictor params should differ between multiplier 1.0 and 2.0"
+    )
+    assert gpt2.params_unchanged()

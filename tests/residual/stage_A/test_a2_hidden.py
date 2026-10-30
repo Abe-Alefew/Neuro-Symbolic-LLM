@@ -1137,7 +1137,6 @@ def test_evaluation_ignores_the_predictors(gpt2) -> None:
     assert full == pytest.approx(only)
 
 
-
 # --- predictor_lr_mult via make_a2_optimizer ---------------------------------------------------
 
 
@@ -1145,13 +1144,9 @@ def test_predictor_lr_mult_produces_different_updates(gpt2) -> None:
     adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
     cfg_m1 = make_cfg(hid=0.2, detach=False, predictor_lr_mult=1.0)
     cfg_m2 = make_cfg(hid=0.2, detach=False, predictor_lr_mult=2.0)
-    params0 = with_random_predictors(
-        with_random_b(init_a2_params(cfg_m1, adapter))
-    )
+    params0 = with_random_predictors(with_random_b(init_a2_params(cfg_m1, adapter)))
     # Both configs must produce the same initial parameter tree.
-    params0_m2 = with_random_predictors(
-        with_random_b(init_a2_params(cfg_m2, adapter))
-    )
+    params0_m2 = with_random_predictors(with_random_b(init_a2_params(cfg_m2, adapter)))
     for k in params0:
         for n in params0[k]:
             np.testing.assert_array_equal(
@@ -1215,7 +1210,8 @@ def test_predictor_lr_mult_produces_different_updates(gpt2) -> None:
 
 def test_run_sequential_respects_predictor_lr_mult(gpt2, tmp_path) -> None:
     """End-to-end: ``run_sequential`` with ``make_a2_optimizer`` actually applies the
-    multiplier, producing different predictor parameters from a run with multiplier 1."""
+    multiplier, producing different predictor parameters from a run with multiplier 1.
+    """
     adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
     training = TrainingConfig(batch_size=BATCH, learning_rate=1e-2, log_every=1)
     domains = [_domain("a", 5)]
@@ -1223,9 +1219,7 @@ def test_run_sequential_respects_predictor_lr_mult(gpt2, tmp_path) -> None:
     results = {}
     for mult in (1.0, 2.0):
         cfg = make_cfg(hid=0.2, detach=False, predictor_lr_mult=mult)
-        params = with_random_predictors(
-            with_random_b(init_a2_params(cfg, adapter))
-        )
+        params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
         tag = f"m{mult}"
         with RunWriter(tmp_path, tag) as writer:
             out, _ = run_sequential(
@@ -1251,7 +1245,5 @@ def test_run_sequential_respects_predictor_lr_mult(gpt2, tmp_path) -> None:
                 np.asarray(pred_m1[k][n]), np.asarray(pred_m2[k][n]), atol=1e-6
             ):
                 any_diff = True
-    assert any_diff, (
-        "predictor params should differ between multiplier 1.0 and 2.0"
-    )
+    assert any_diff, "predictor params should differ between multiplier 1.0 and 2.0"
     assert gpt2.params_unchanged()

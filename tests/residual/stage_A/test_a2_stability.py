@@ -10,8 +10,8 @@ import optax
 import pytest
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
+from losses.a2_loss import anchor_loss
 from residual import AdapterParams, ResidualAdapter, ResidualConfig
-from residual.a2_losses import anchor_loss
 from residual.hep import hep_key
 from stages.stage_A.a2 import (
     HEPConfig,

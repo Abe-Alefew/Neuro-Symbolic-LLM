@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 from fabricpc.nodes import IdentityNode, Linear
 
+from losses.a2_loss import anchor_loss, hep_nudge_loss, output_error
 from residual import fpc_energy
-from residual.a2_losses import anchor_loss, hep_nudge_loss, output_error
 from residual.fpc_energy import BACKENDS, anchor_sq_distance, highway_sq_norm
 from residual.hep import init_hep
 

@@ -19,8 +19,7 @@ import numpy as np
 import optax
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
-from residual import AdapterParams, ResidualAdapter
-from residual.a2_losses import (
+from losses.a2_loss import (
     _EPS,
     _VAR_FLOOR,
     _masked_mean,
@@ -30,7 +29,8 @@ from residual.a2_losses import (
     hep_nudge_loss,
     output_error,
 )
-from residual.a2_losses import hidden_prediction_loss as _hidden_loss_unmasked
+from losses.a2_loss import hidden_prediction_loss as _hidden_loss_unmasked
+from residual import AdapterParams, ResidualAdapter
 from residual.cpc_heads import BACKENDS as CPC_BACKENDS
 from residual.cpc_heads import (
     CPCParams,
@@ -227,7 +227,7 @@ def hidden_prediction_loss(
 ) -> dict[str, jax.Array]:
     """The teammate's ``hidden_prediction_loss``, plus an optional padding ``mask``.
 
-    Without ``mask`` this *is* ``residual.a2_losses.hidden_prediction_loss``. With ``mask``
+    Without ``mask`` this *is* ``losses.a2_loss.hidden_prediction_loss``. With ``mask``
     (``[B, S]``, ``False`` = padding or an ignored label) every mean, and the target variance,
     runs over the valid tokens only.
     """

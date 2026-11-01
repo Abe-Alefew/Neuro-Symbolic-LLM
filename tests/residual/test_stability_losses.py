@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from residual.a2_losses import (
+from losses.a2_loss import (
     anchor_loss,
     hep_nudge,
     hep_nudge_loss,

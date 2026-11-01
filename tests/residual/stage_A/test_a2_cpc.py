@@ -10,8 +10,8 @@ import optax
 import pytest
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
+from losses.a2_loss import contrastive_future_loss
 from residual import AdapterParams, ResidualAdapter, ResidualConfig
-from residual.a2_losses import contrastive_future_loss
 from residual.cpc_heads import a_key, init_cpc_heads, project, q_key
 from stages.stage_A.a2 import CPCConfig, cpc_term, init_cpc_params, token_mask
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, make_substrate

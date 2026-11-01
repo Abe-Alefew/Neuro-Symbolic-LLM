@@ -957,7 +957,7 @@ def test_monitor_metrics_are_logged_only_when_enabled(
 def test_monitor_matches_the_manual_residual_smoothness(
     substrate, adapter, input_ids
 ) -> None:
-    from residual.a2_losses import residual_smoothness
+    from losses.a2_loss import residual_smoothness
 
     params = with_random_b(init_a2_params(make_cfg(), adapter))
     ap = adapter_params(params)

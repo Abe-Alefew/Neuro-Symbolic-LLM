@@ -259,7 +259,7 @@ The audit uses the first `batch_size` blocks of the first domain, so it needs th
 | File | Purpose |
 |---|---|
 | [`stages/stage_A/a2.py`](a2.py) | **Everything stage-level**: configs, parameter tree, `cpc_term`, `stability_term`, `hid_term`, `a2_objective`, arms, audit |
-| [`residual/a2_losses.py`](../../residual/a2_losses.py) | Pure losses: `contrastive_future_loss`, `anchor_loss`, `output_error`, `hep_nudge_loss`, `hidden_prediction_loss` |
+| [`losses/a2_loss.py`](../../losses/a2_loss.py) | Pure losses: `contrastive_future_loss`, `anchor_loss`, `output_error`, `hep_nudge_loss`, `hidden_prediction_loss` |
 | [`residual/local_predictor.py`](../../residual/local_predictor.py) | Hidden predictors `P_l` (FabricPC graph) and their pure-JAX reference |
 
 | [`residual/cpc_heads.py`](../../residual/cpc_heads.py) | CPC heads `q` and `A_{l,k}` (FabricPC nodes) and their reference |

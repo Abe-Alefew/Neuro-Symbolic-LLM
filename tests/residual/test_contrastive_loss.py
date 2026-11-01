@@ -1,4 +1,4 @@
-"""Tests for the contrastive future loss (``residual/a2_losses.py``).
+"""Tests for the contrastive future loss (``losses/a2_loss.py``).
 
 it teststhe loss against an independent loop-based reference (value, gradient,
         subsampling, jit).
@@ -18,7 +18,7 @@ import numpy as np
 import optax
 import pytest
 
-from residual.a2_losses import (
+from losses.a2_loss import (
     anchor_positions,
     contrastive_future_loss,
 )

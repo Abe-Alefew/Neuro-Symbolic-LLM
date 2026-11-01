@@ -169,15 +169,41 @@ def contrastive_future_loss(
 
 
 def hidden_prediction_loss(
-    pred: jax.Array, target: jax.Array, source: jax.Array, config: Any
+    pred: jax.Array,
+    target: jax.Array,
+    source: jax.Array,
+    config: Any,
+    mask: jax.Array | None = None,
 ) -> dict[str, jax.Array]:
+    """Next-block hidden prediction loss ``L_hid`` with optional token ``mask``.
+
+    Without ``mask`` statistics run across all tokens.
+    With ``mask`` (``[B, S]``, ``False`` = padding or ignored label) every mean,
+    and the target variance, runs over valid tokens only.
+    """
     target = jax.lax.stop_gradient(target.astype(jnp.float32))
     source = source.astype(jnp.float32)
     if config.skip_first_token:
         pred, target, source = pred[:, 1:], target[:, 1:], source[:, 1:]
-    mse = jnp.mean(jnp.square(pred - target))
-    var = jnp.mean(jnp.var(target, axis=(0, 1))) + _VAR_FLOOR
-    copy_mse = jnp.mean(jnp.square(jax.lax.stop_gradient(source) - target))
+        if mask is not None:
+            mask = mask[:, 1:]
+    sq = jnp.square(pred - target)
+    copy_sq = jnp.square(jax.lax.stop_gradient(source) - target)
+    if mask is None:
+        mse = jnp.mean(sq)
+        copy_mse = jnp.mean(copy_sq)
+        var = jnp.mean(jnp.var(target, axis=(0, 1))) + _VAR_FLOOR
+    else:
+        w = mask.astype(jnp.float32)[..., None]  # [B, S, 1]
+        n = jnp.maximum(jnp.sum(w), 1.0)
+        d = target.shape[-1]
+        mse = jnp.sum(w * sq) / (n * d)
+        copy_mse = jnp.sum(w * copy_sq) / (n * d)
+        mean = jnp.sum(w * target, axis=(0, 1)) / n  # [D]
+        var = (
+            jnp.mean(jnp.sum(w * jnp.square(target - mean), axis=(0, 1)) / n)
+            + _VAR_FLOOR
+        )
     rel = mse / var
     return {
         "loss": rel if config.hidden_norm == "target_var" else mse,

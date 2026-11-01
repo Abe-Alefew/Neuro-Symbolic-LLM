@@ -21,15 +21,14 @@ import optax
 from frozenllm.substrate import FrozenSubstrate, identity_modify
 from losses.a2_loss import (
     _EPS,
-    _VAR_FLOOR,
     _masked_mean,
     anchor_loss,
     collect_stability_metrics,
     contrastive_future_loss,
     hep_nudge_loss,
+    hidden_prediction_loss,
     output_error,
 )
-from losses.a2_loss import hidden_prediction_loss as _hidden_loss_unmasked
 from residual import AdapterParams, ResidualAdapter
 from residual.cpc_heads import BACKENDS as CPC_BACKENDS
 from residual.cpc_heads import (
@@ -216,44 +215,6 @@ def step_loss(
     scale = _masked_mean(jnp.sum(jnp.square(jax.lax.stop_gradient(z[0])), -1), mask)
     loss = raw / (scale + _EPS) if normalize == "relative" else raw
     return loss, {"step_sq": raw}
-
-
-def hidden_prediction_loss(
-    pred: jax.Array,
-    target: jax.Array,
-    source: jax.Array,
-    config: Any,
-    mask: jax.Array | None = None,
-) -> dict[str, jax.Array]:
-    """The teammate's ``hidden_prediction_loss``, plus an optional padding ``mask``.
-
-    Without ``mask`` this *is* ``losses.a2_loss.hidden_prediction_loss``. With ``mask``
-    (``[B, S]``, ``False`` = padding or an ignored label) every mean, and the target variance,
-    runs over the valid tokens only.
-    """
-    if mask is None:
-        return _hidden_loss_unmasked(pred, target, source, config)
-    target = jax.lax.stop_gradient(target.astype(jnp.float32))
-    source = source.astype(jnp.float32)
-    if config.skip_first_token:
-        pred, target, source = pred[:, 1:], target[:, 1:], source[:, 1:]
-        mask = mask[:, 1:]
-    sq = jnp.square(pred - target)
-    copy_sq = jnp.square(jax.lax.stop_gradient(source) - target)
-    w = mask.astype(jnp.float32)[..., None]  # [B, S, 1]
-    n = jnp.maximum(jnp.sum(w), 1.0)
-    d = target.shape[-1]
-    mse = jnp.sum(w * sq) / (n * d)
-    copy_mse = jnp.sum(w * copy_sq) / (n * d)
-    mean = jnp.sum(w * target, axis=(0, 1)) / n  # [D]
-    var = jnp.mean(jnp.sum(w * jnp.square(target - mean), axis=(0, 1)) / n) + _VAR_FLOOR
-    rel = mse / var
-    return {
-        "loss": rel if config.hidden_norm == "target_var" else mse,
-        "mse": mse,
-        "rel": rel,
-        "copy_rel": copy_mse / var,
-    }
 
 
 def _number(name: str, value: Any) -> None:

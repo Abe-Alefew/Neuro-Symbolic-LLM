@@ -22,7 +22,7 @@ from stages.stage_A.a2 import (
     apply_arm,
 )
 from stages.stage_base import load_configs
-from tests.residual.stage_A.a2.conftest import FF, SHIPPED, PredictorConfig
+from tests.residual.stage_A.conftest import FF, SHIPPED, PredictorConfig
 
 # --- Defaults & Flags -------------------------------------------------------------------------
 

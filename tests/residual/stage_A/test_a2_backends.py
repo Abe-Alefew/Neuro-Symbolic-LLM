@@ -31,7 +31,7 @@ from stages.stage_A.a2 import (
     step_loss,
 )
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.stage_A.conftest import (
     LAYERS,
     SEQ,
     make_cfg,

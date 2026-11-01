@@ -21,7 +21,7 @@ from stages.stage_A.a2 import (
     audit_to_dict,
     format_audit,
 )
-from tests.residual.stage_A.a2.conftest import by_name, full_cfg, make_cfg
+from tests.residual.stage_A.conftest import by_name, full_cfg, make_cfg
 
 
 @pytest.mark.parametrize("arm", ARMS)

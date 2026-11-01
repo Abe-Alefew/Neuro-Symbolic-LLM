@@ -31,7 +31,7 @@ from stages.stage_A.a2 import (
 from stages.stage_base import Domain, make_eval_set
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, make_substrate
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SHIPPED = REPO_ROOT / "configs" / "stage_A" / "a2_pc_inspired.yaml"
 
 SEQ = 12

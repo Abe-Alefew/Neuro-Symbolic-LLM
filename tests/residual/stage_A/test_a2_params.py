@@ -32,7 +32,7 @@ from stages.stage_A.a2 import (
     predictor_bank,
     predictor_params,
 )
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.stage_A.conftest import (
     BATCH,
     FF,
     LAYERS,

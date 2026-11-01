@@ -31,7 +31,7 @@ from stages.stage_A.a2 import (
     step_loss,
     token_mask,
 )
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.stage_A.conftest import (
     BATCH,
     LAYERS,
     SEQ,

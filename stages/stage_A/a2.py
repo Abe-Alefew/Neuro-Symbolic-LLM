@@ -162,8 +162,11 @@ def residual_smoothness_loss(
     L = that / ( mean_{b, t>1} || sg(h_t - h_{t-1}) ||^2 + eps )          (``"relative"``)
 
     """
-    if normalize not in NORMALIZATIONS:
-        raise ValueError(f"normalize must be 'relative' or 'none', got {normalize!r}")
+    if normalize not in (*NORMALIZATIONS, "input"):
+        raise ValueError(
+            "normalize must be 'relative', 'input', or 'none', "
+            f"got {normalize!r}"
+        )
     check_backend(backend)
     if correction.ndim < 3 or correction.shape != inputs.shape:
         raise ValueError(
@@ -179,7 +182,7 @@ def residual_smoothness_loss(
     res = _masked_mean(_sq_norm(r[..., 1:, :] - r[..., :-1, :], backend), pair)
     inp = _masked_mean(_sq_norm(h[..., 1:, :] - h[..., :-1, :], backend), pair)
     ratio = res / (inp + _EPS)
-    loss = ratio if normalize == "relative" else res
+    loss = ratio if normalize in ("relative", "input") else res
     return loss, {"smooth_res": res, "smooth_ratio": ratio}
 
 
@@ -199,8 +202,11 @@ def step_loss(
     ``[1, B, T, d]``: no differences, so the loss is exactly 0 with zero gradient. Stage A3
     passes its real trajectory. Returns ``(loss, {"step_sq"})``.
     """
-    if normalize not in NORMALIZATIONS:
-        raise ValueError(f"normalize must be 'relative' or 'none', got {normalize!r}")
+    if normalize not in (*NORMALIZATIONS, "initial"):
+        raise ValueError(
+            "normalize must be 'relative', 'initial', or 'none', "
+            f"got {normalize!r}"
+        )
     check_backend(backend)
     if trajectory.ndim != 4:
         raise ValueError(
@@ -213,7 +219,7 @@ def step_loss(
     sq = jnp.sum(_sq_norm(z[1:] - z[:-1], backend), axis=0)  # [B, T]
     raw = _masked_mean(sq, mask)
     scale = _masked_mean(jnp.sum(jnp.square(jax.lax.stop_gradient(z[0])), -1), mask)
-    loss = raw / (scale + _EPS) if normalize == "relative" else raw
+    loss = raw / (scale + _EPS) if normalize in ("relative", "initial") else raw
     return loss, {"step_sq": raw}
 
 
@@ -1125,7 +1131,12 @@ def make_a2_objective(
         input_ids: jax.Array,
         labels: jax.Array | None = None,
         base: jax.Array | None = None,
+        precomputed_base_logits: jax.Array | None = None,
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        if base is not None and precomputed_base_logits is not None:
+            raise ValueError(
+                "base and precomputed_base_logits are mutually exclusive"
+            )
         return _a2_objective(
             params,
             substrate=substrate,
@@ -1133,7 +1144,11 @@ def make_a2_objective(
             config=config,
             input_ids=input_ids,
             labels=labels,
-            base=base,
+            base=(
+                precomputed_base_logits
+                if precomputed_base_logits is not None
+                else base
+            ),
             bank=bank,
             monitor=monitor,
         )
@@ -1411,7 +1426,12 @@ def a2_audit(
     for label, p in (("init", params0), ("probe", probe)):
         _, terms = run(p)
         bad = sorted(k for k, v in terms.items() if not bool(jnp.isfinite(v)))
-        add(f"finite_{label}", not bad, {k: _f(v) for k, v in terms.items()}, str(bad))
+        add(
+            "finite_init" if label == "init" else "probe_terms_finite",
+            not bad,
+            {k: _f(v) for k, v in terms.items()},
+            str(bad),
+        )
 
     total, t = run(probe)
     expected = (
@@ -1497,7 +1517,7 @@ def a2_audit(
         "stab_step" in probe_terms
     ):  # no settling in A2: one state, no steps, no gradient
         routed["stab_step"] = ("stab_step", set())
-    if "stab_hep" in probe_terms:
+    if "stab_hep" in probe_terms and config.stab.hep.trainable:
         routed["stab_hep"] = (
             "stab_hep",
             {"hep"} if config.stab.hep.trainable else set(),
@@ -1591,9 +1611,10 @@ def format_audit(checks: list[Check]) -> str:
                 for k, v in c.value.items()
                 if not isinstance(v, dict)
             )
-        lines.append(f"[{status:4s}] {c.name:28s} {value}")
         if c.ok is False and c.detail:
-            lines.append(f"         -> {c.detail}")
+            lines.append(f"[FAIL] {c.name}: {c.detail}")
+        else:
+            lines.append(f"[{status:4s}] {c.name:28s} {value}")
     return "\n".join(lines)
 
 

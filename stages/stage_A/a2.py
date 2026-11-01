@@ -164,8 +164,7 @@ def residual_smoothness_loss(
     """
     if normalize not in (*NORMALIZATIONS, "input"):
         raise ValueError(
-            "normalize must be 'relative', 'input', or 'none', "
-            f"got {normalize!r}"
+            "normalize must be 'relative', 'input', or 'none', " f"got {normalize!r}"
         )
     check_backend(backend)
     if correction.ndim < 3 or correction.shape != inputs.shape:
@@ -204,8 +203,7 @@ def step_loss(
     """
     if normalize not in (*NORMALIZATIONS, "initial"):
         raise ValueError(
-            "normalize must be 'relative', 'initial', or 'none', "
-            f"got {normalize!r}"
+            "normalize must be 'relative', 'initial', or 'none', " f"got {normalize!r}"
         )
     check_backend(backend)
     if trajectory.ndim != 4:
@@ -1134,9 +1132,7 @@ def make_a2_objective(
         precomputed_base_logits: jax.Array | None = None,
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         if base is not None and precomputed_base_logits is not None:
-            raise ValueError(
-                "base and precomputed_base_logits are mutually exclusive"
-            )
+            raise ValueError("base and precomputed_base_logits are mutually exclusive")
         return _a2_objective(
             params,
             substrate=substrate,
@@ -1145,9 +1141,7 @@ def make_a2_objective(
             input_ids=input_ids,
             labels=labels,
             base=(
-                precomputed_base_logits
-                if precomputed_base_logits is not None
-                else base
+                precomputed_base_logits if precomputed_base_logits is not None else base
             ),
             bank=bank,
             monitor=monitor,

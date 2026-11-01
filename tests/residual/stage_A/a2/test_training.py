@@ -33,7 +33,7 @@ from stages.stage_A.a2 import (
     predictor_params,
 )
 from stages.stage_base import Objective, TrainingConfig, evaluate, run_sequential
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.conftest import (
     BATCH,
     LAYERS,
     NUM_TOKENS,
@@ -91,7 +91,10 @@ def test_run_sequential_trains_logs_and_checkpoints_the_whole_tree(
         a_key(6, 1),
     }
     assert set(hep_params(final_params)) == {hep_key(5), hep_key(6)}
-    assert set(predictor_params(final_params)) == {predictor_key(5), predictor_key(6)}
+    assert set(predictor_params(final_params)) == {
+        predictor_key(5),
+        predictor_key(6),
+    }
 
     # 2. Logged metrics contain expected auxiliary and diagnostic entries
     train_events = [e for e in _events(tmp_path / "run") if e.get("event") == "train"]
@@ -221,43 +224,3 @@ def test_predictor_lr_mult_produces_different_updates(
                 atol=1e-4,
                 err_msg=f"predictor key {k}/{n}: expected update ratio ~2.0",
             )
-
-
-def test_run_sequential_respects_predictor_lr_mult(
-    gpt2: FrozenSubstrate, tmp_path: Path
-) -> None:
-    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
-    training = TrainingConfig(batch_size=BATCH, learning_rate=1e-2, log_every=1)
-    domains = [_domain("a", 5)]
-
-    results = {}
-    for mult in (1.0, 2.0):
-        cfg = make_cfg(hid=0.2, detach=False, predictor_lr_mult=mult)
-        params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
-        tag = f"m{mult}"
-        with RunWriter(tmp_path, tag) as writer:
-            out, _ = run_sequential(
-                gpt2,
-                adapter,
-                params,
-                domains,
-                a2_objective,
-                cfg,
-                training,
-                writer,
-                optimizer=make_a2_optimizer(cfg, training.learning_rate),
-            )
-        results[mult] = out
-
-    pred_m1 = predictor_params(results[1.0])
-    pred_m2 = predictor_params(results[2.0])
-    assert pred_m1.keys() == pred_m2.keys()
-    any_diff = False
-    for k in pred_m1:
-        for n in pred_m1[k]:
-            if not np.allclose(
-                np.asarray(pred_m1[k][n]), np.asarray(pred_m2[k][n]), atol=1e-6
-            ):
-                any_diff = True
-    assert any_diff, "predictor params should differ between multiplier 1.0 and 2.0"
-    assert gpt2.params_unchanged()

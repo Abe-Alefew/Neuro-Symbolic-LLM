@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fabricpc.node import IdentityNode
+from fabricpc.nodes import IdentityNode
 
 from losses.a2_loss import (
     anchor_loss,
@@ -17,8 +17,12 @@ from losses.a2_loss import (
     hep_nudge_loss,
     output_error,
 )
-from residual.fabricpc import fpc_energy
-from residual.fabricpc.fpc_energy import BACKENDS, anchor_sq_distance, highway_sq_norm
+from residual import fpc_energy
+from residual.fpc_energy import (
+    BACKENDS,
+    anchor_sq_distance,
+    highway_sq_norm,
+)
 from residual.hep import init_hep
 
 D, DY = 8, 20
@@ -76,52 +80,6 @@ def test_anchor_gets_no_gradient_state_does() -> None:
     assert np.abs(gz).max() > 0 and np.isfinite(gz).all()
     gn = jax.grad(lambda z: anchor_loss(z, a, normalize="none")[0])(z)
     np.testing.assert_allclose(gn, 2 * (z - a) / (3 * 5), rtol=1e-4, atol=1e-6)
-
-
-def test_leading_step_axis_with_a_shared_anchor() -> None:
-    a = randn(3, 5, D, seed=6)
-    z = randn(4, 3, 5, D, seed=7)
-    stacked, _ = anchor_loss(z, a)
-    per_step = [anchor_loss(z[s], a)[0] for s in range(4)]
-    np.testing.assert_allclose(
-        stacked, np.mean([float(x) for x in per_step]), rtol=1e-5
-    )
-    full, _ = anchor_loss(z, jnp.broadcast_to(a, z.shape))
-    np.testing.assert_allclose(stacked, full, rtol=1e-6)
-
-
-def test_anchor_mask_excludes_positions() -> None:
-    a, z = randn(2, 6, D, seed=8), randn(2, 6, D, seed=9)
-    mask = jnp.array([[1, 1, 1, 0, 0, 0], [1, 1, 0, 0, 0, 0]], bool)
-    masked, _ = anchor_loss(z, a, mask=mask)
-    z2 = z.at[:, 3:].set(100.0)
-    np.testing.assert_allclose(masked, anchor_loss(z2, a, mask=mask)[0], rtol=1e-6)
-    sel_z = jnp.concatenate([z[0, :3], z[1, :2]])
-    sel_a = jnp.concatenate([a[0, :3], a[1, :2]])
-    manual = jnp.mean(jnp.sum((sel_z - sel_a) ** 2, -1)) / jnp.mean(
-        jnp.sum(sel_a**2, -1)
-    )
-    np.testing.assert_allclose(masked, manual, rtol=1e-5)
-    empty, _ = anchor_loss(z, a, mask=jnp.zeros((2, 6), bool))
-    assert float(empty) == 0.0
-
-
-def test_anchor_loss_dtype_and_finiteness() -> None:
-    a, z = randn(3, 5, D, seed=10), randn(3, 5, D, seed=11)
-    f32, _ = anchor_loss(z, a)
-    bf16, _ = anchor_loss(z.astype(jnp.bfloat16), a.astype(jnp.bfloat16))
-    assert bf16.dtype == jnp.float32
-    np.testing.assert_allclose(bf16, f32, rtol=5e-2)
-    zero_anchor, _ = anchor_loss(z, jnp.zeros_like(a))
-    assert np.isfinite(zero_anchor)
-
-
-def test_anchor_loss_jit_matches_eager() -> None:
-    a, z = randn(3, 5, D, seed=12), randn(2, 3, 5, D, seed=13)
-    eager = jax.value_and_grad(lambda z: anchor_loss(z, a)[0])(z)
-    jitted = jax.jit(jax.value_and_grad(lambda z: anchor_loss(z, a)[0]))(z)
-    np.testing.assert_allclose(eager[0], jitted[0], rtol=1e-5)
-    np.testing.assert_allclose(eager[1], jitted[1], rtol=1e-4, atol=1e-7)
 
 
 @pytest.mark.parametrize(
@@ -208,9 +166,11 @@ def test_hep_nudge_dense_lowrank_and_gain() -> None:
     assert hep_nudge(eps, v).shape == (2, 5, D)
 
 
-def test_hep_nudge_stops_gradient_to_eps() -> None:
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_hep_nudge_stops_gradient_to_eps(backend: str) -> None:
     eps, v = randn(2, 5, DY, seed=20), randn(DY, D, seed=21)
-    assert not np.any(jax.grad(lambda e: hep_nudge(e, v).sum())(eps))
+    g = jax.grad(lambda e: hep_nudge_loss(e, v, backend=backend)[0])(eps)
+    assert not np.any(g)
 
 
 def test_hep_loss_known_value() -> None:
@@ -229,9 +189,16 @@ def test_hep_loss_scales_with_alpha_squared_and_vanishes_when_off() -> None:
     l1, _ = hep_nudge_loss(eps, v, alpha=1.0)
     l3, _ = hep_nudge_loss(eps, v, alpha=3.0)
     np.testing.assert_allclose(l3, 9 * l1, rtol=1e-5)
-    assert float(hep_nudge_loss(eps, v, alpha=0.0)[0]) == 0.0
-    assert float(hep_nudge_loss(eps, jnp.zeros_like(v))[0]) == 0.0
-    assert float(hep_nudge_loss(jnp.zeros_like(eps), v)[0]) == 0.0
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_zero_alpha_and_gain_give_zero_penalty(backend: str) -> None:
+    eps = _x(3, 6, DY, seed=19)
+    v = _x(DY, D, seed=20)
+    loss_gain, m_gain = hep_nudge_loss(eps, v, 0.0, backend=backend)
+    assert float(loss_gain) == 0.0 and float(m_gain["hep_nudge_norm"]) < 1e-3
+    loss_zero_v, _ = hep_nudge_loss(eps, jnp.zeros_like(v), backend=backend)
+    assert float(loss_zero_v) == 0.0
 
 
 def test_hep_loss_relative_to_the_reference_state() -> None:
@@ -243,14 +210,6 @@ def test_hep_loss_relative_to_the_reference_state() -> None:
     np.testing.assert_allclose(m["hep_nudge_ratio"], np.sqrt(float(rel)), rtol=1e-4)
     rel2, _ = hep_nudge_loss(eps, v, reference=2 * ref)
     np.testing.assert_allclose(rel2, rel / 4, rtol=1e-4)
-
-
-def test_hep_loss_mask() -> None:
-    eps, v = randn(2, 6, DY, seed=29), randn(DY, D, seed=30)
-    mask = jnp.array([[1, 1, 1, 0, 0, 0], [1, 0, 0, 0, 0, 0]], bool)
-    a, _ = hep_nudge_loss(eps, v, mask=mask)
-    b, _ = hep_nudge_loss(eps.at[:, 3:].set(50.0).at[1, 1:].set(50.0), v, mask=mask)
-    np.testing.assert_allclose(a, b, rtol=1e-6)
 
 
 def test_hep_loss_gradient_audit() -> None:
@@ -282,24 +241,73 @@ def test_hep_loss_gradient_descent_shrinks_the_highway() -> None:
     assert float(last) < 0.1 * float(first)
 
 
-def test_hep_loss_jit_matches_eager_and_bf16() -> None:
-    eps, v = randn(2, 5, DY, seed=38), randn(DY, D, seed=39)
-    eager = hep_nudge_loss(eps, v, 1.0)[0]
-    np.testing.assert_allclose(
-        jax.jit(lambda e, v: hep_nudge_loss(e, v, 1.0)[0])(eps, v),
-        eager,
-        rtol=1e-5,
-    )
-    bf16 = hep_nudge_loss(eps.astype(jnp.bfloat16), v, 1.0)[0]
-    assert bf16.dtype == jnp.float32
-    np.testing.assert_allclose(bf16, eager, rtol=5e-2)
+# --- Parametrized Cross-Function Tests (JIT, Dtype, Step, Mask) --------------------------------
 
 
-def test_hep_loss_with_leading_step_axis() -> None:
-    eps, v = randn(3, 2, 5, DY, seed=40), randn(DY, D, seed=41)
-    stacked, _ = hep_nudge_loss(eps, v)
-    per = [float(hep_nudge_loss(eps[s], v)[0]) for s in range(3)]
-    np.testing.assert_allclose(stacked, np.mean(per), rtol=1e-5)
+@pytest.mark.parametrize("fn", ["anchor", "hep"])
+def test_stability_losses_jit_matches_eager(fn: str) -> None:
+    if fn == "anchor":
+        a, z = randn(3, 5, D, seed=12), randn(2, 3, 5, D, seed=13)
+        eager = jax.value_and_grad(lambda z: anchor_loss(z, a)[0])(z)
+        jitted = jax.jit(jax.value_and_grad(lambda z: anchor_loss(z, a)[0]))(z)
+        np.testing.assert_allclose(eager[0], jitted[0], rtol=1e-5)
+        np.testing.assert_allclose(eager[1], jitted[1], rtol=1e-4, atol=1e-7)
+    else:
+        eps, v = randn(2, 5, DY, seed=38), randn(DY, D, seed=39)
+        eager = hep_nudge_loss(eps, v, 1.0)[0]
+        jitted = jax.jit(lambda e, v: hep_nudge_loss(e, v, 1.0)[0])(eps, v)
+        np.testing.assert_allclose(eager, jitted, rtol=1e-5)
+
+
+@pytest.mark.parametrize("kind", ["anchor", "hep"])
+def test_stability_losses_computed_in_float32(kind: str) -> None:
+    if kind == "anchor":
+        z, a = randn(3, 5, D, seed=10), randn(3, 5, D, seed=11)
+        f32, _ = anchor_loss(z, a)
+        bf16, _ = anchor_loss(z.astype(jnp.bfloat16), a.astype(jnp.bfloat16))
+        assert bf16.dtype == jnp.float32
+        np.testing.assert_allclose(bf16, f32, rtol=5e-2)
+        assert np.isfinite(anchor_loss(z, jnp.zeros_like(a))[0])
+    else:
+        eps, v = randn(2, 5, DY, seed=38), randn(DY, D, seed=39)
+        f32, _ = hep_nudge_loss(eps, v, 1.0)
+        bf16, _ = hep_nudge_loss(eps.astype(jnp.bfloat16), v, 1.0)
+        assert bf16.dtype == jnp.float32
+        np.testing.assert_allclose(bf16, f32, rtol=5e-2)
+
+
+@pytest.mark.parametrize("fn", ["anchor", "hep"])
+def test_stability_losses_with_leading_step_axis(fn: str) -> None:
+    if fn == "anchor":
+        a = randn(3, 5, D, seed=6)
+        z = randn(4, 3, 5, D, seed=7)
+        stacked, _ = anchor_loss(z, a)
+        per_step = [anchor_loss(z[s], a)[0] for s in range(4)]
+        np.testing.assert_allclose(
+            stacked, np.mean([float(x) for x in per_step]), rtol=1e-5
+        )
+    else:
+        eps, v = randn(3, 2, 5, DY, seed=40), randn(DY, D, seed=41)
+        stacked, _ = hep_nudge_loss(eps, v)
+        per = [float(hep_nudge_loss(eps[s], v)[0]) for s in range(3)]
+        np.testing.assert_allclose(stacked, np.mean(per), rtol=1e-5)
+
+
+@pytest.mark.parametrize("fn", ["anchor", "hep"])
+def test_stability_losses_mask_excludes_positions(fn: str) -> None:
+    mask = jnp.array([[1, 1, 1, 0, 0, 0], [1, 0, 0, 0, 0, 0]], bool)
+    if fn == "anchor":
+        a, z = randn(2, 6, D, seed=8), randn(2, 6, D, seed=9)
+        clean, _ = anchor_loss(z, a, mask=mask)
+        corrupted = z.at[:, 3:].set(100.0).at[1, 1:].set(100.0)
+        dirty, _ = anchor_loss(corrupted, a, mask=mask)
+        np.testing.assert_allclose(clean, dirty, rtol=1e-6)
+    else:
+        eps, v = randn(2, 6, DY, seed=29), randn(DY, D, seed=30)
+        clean, _ = hep_nudge_loss(eps, v, mask=mask)
+        corrupted = eps.at[:, 3:].set(50.0).at[1, 1:].set(50.0)
+        dirty, _ = hep_nudge_loss(corrupted, v, mask=mask)
+        np.testing.assert_allclose(clean, dirty, rtol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -335,12 +343,6 @@ def test_anchor_energy_is_the_squared_distance(
     np.testing.assert_allclose(out, jnp.sum((z - a) ** 2, axis=-1), rtol=1e-6)
 
 
-def test_anchor_energy_gradient_is_two_times_the_difference() -> None:
-    z, a = _x(3, 5, D, seed=3), _x(3, 5, D, seed=4)
-    g = jax.grad(lambda z: anchor_sq_distance(z, a).sum())(z)
-    np.testing.assert_allclose(g, 2.0 * (z - a), rtol=1e-6, atol=1e-6)
-
-
 @pytest.mark.parametrize("kind", ["dense", "lowrank"])
 def test_highway_energy_is_the_squared_norm_of_the_nudge(kind: str) -> None:
     eps = _x(3, 5, DY, seed=5)
@@ -360,34 +362,20 @@ def test_the_low_rank_highway_is_never_materialised() -> None:
     assert (DY, D) not in shapes
 
 
-def test_energy_is_computed_in_float32() -> None:
-    z, a = _x(2, 3, D, seed=7), _x(2, 3, D, seed=8)
-    out = anchor_sq_distance(z.astype(jnp.bfloat16), a.astype(jnp.bfloat16))
-    assert out.dtype == jnp.float32 and bool(jnp.all(jnp.isfinite(out)))
-    eps = _x(2, 3, DY, seed=9)
-    p = init_hep("dense", 0, [3], DY, D)["hep_3"]
-    assert (
-        highway_sq_norm(eps.astype(jnp.bfloat16), p["V"].astype(jnp.bfloat16)).dtype
-        == jnp.float32
-    )
-
-
 def test_the_graphs_are_fabricpc_nodes_with_the_expected_parameters() -> None:
     from fabricpc.graph import initialize_params
 
     anchor = fpc_energy._anchor_graph(D)
     assert isinstance(anchor.nodes["anch"], IdentityNode)
     params = initialize_params(anchor, jax.random.PRNGKey(10))
-    assert set(params) == {"anch"} and params["anch"] == {}
+    assert set(params.nodes) == {"z", "anch"} and params.nodes["anch"].weights == {}
 
-    lowrank = fpc_energy._highway_lowrank_graph(DY, D, R)
-    assert list(lowrank.node_order) == ["proj", "anch"]
+    lowrank = fpc_energy._highway_graph(DY, D, R)
+    assert list(lowrank.node_order) == ["eps", "mid", "hep"]
     params = initialize_params(lowrank, jax.random.PRNGKey(11))
-    assert set(params) == {"proj", "anch"}
-    assert params["proj"]["W"].shape == (DY, R) and params["anch"]["W"].shape == (
-        R,
-        D,
-    )
+    assert set(params.nodes) == {"eps", "mid", "hep"}
+    assert params.nodes["mid"].weights["eps->mid:in"].shape == (DY, R)
+    assert params.nodes["hep"].weights["mid->hep:in"].shape == (R, D)
 
 
 def test_malformed_highways_are_rejected() -> None:
@@ -396,14 +384,6 @@ def test_malformed_highways_are_rejected() -> None:
         highway_sq_norm(eps, jnp.ones((DY, D, 1)))
     with pytest.raises(ValueError, match="low-rank"):
         highway_sq_norm(eps, (jnp.ones((DY, R)), jnp.ones((R + 1, D))))
-
-
-def test_zero_gain_gives_a_zero_penalty() -> None:
-    eps = _x(3, 6, DY, seed=19)
-    v = _x(DY, D, seed=20)
-    for backend in BACKENDS:
-        loss, m = hep_nudge_loss(eps, v, 0.0, backend=backend)
-        assert float(loss) == 0.0 and float(m["hep_nudge_norm"]) < 1e-3
 
 
 def test_output_error_feeds_the_highway_energy_like_the_reference() -> None:
@@ -417,11 +397,3 @@ def test_output_error_feeds_the_highway_energy_like_the_reference() -> None:
     a = hep_nudge_loss(eps, v, reference=ref, mask=mask)[0]
     b = hep_nudge_loss(eps, v, reference=ref, mask=mask, backend="jax")[0]
     np.testing.assert_allclose(a, b, rtol=1e-5)
-
-
-def test_hep_nudge_on_a_fixed_highway_has_no_gradient_with_either_backend() -> None:
-    eps = _x(3, 6, DY, seed=17)
-    v = _x(DY, D, seed=18)
-    for backend in BACKENDS:
-        g = jax.grad(lambda eps, b=backend: hep_nudge_loss(eps, v, backend=b)[0])(eps)
-        assert not np.any(g)

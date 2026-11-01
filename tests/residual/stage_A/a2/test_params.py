@@ -32,7 +32,7 @@ from stages.stage_A.a2 import (
     predictor_bank,
     predictor_params,
 )
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.conftest import (
     BATCH,
     FF,
     LAYERS,
@@ -178,42 +178,42 @@ def test_param_counts(substrate: FrozenSubstrate, adapter: ResidualAdapter) -> N
     assert counts["total"] == sum(counts[g] for g in ("adapter", "cpc", "hep", "pred"))
 
 
-def test_seed_controls_the_heads_and_not_the_adapter(
-    substrate: FrozenSubstrate, adapter: ResidualAdapter
+@pytest.mark.parametrize("group", ["cpc_heads", "predictors", "objective_seed"])
+def test_seed_controls_isolated_parameter_groups(
+    substrate: FrozenSubstrate, adapter: ResidualAdapter, group: str
 ) -> None:
-    a = init_a2_params(make_cfg(cpc=0.1, seed=0), adapter)
-    b = init_a2_params(make_cfg(cpc=0.1, seed=0), adapter)
-    c = init_a2_params(make_cfg(cpc=0.1, seed=1), adapter)
-    np.testing.assert_array_equal(a[q_key(5)]["W"], b[q_key(5)]["W"])
-    assert not np.allclose(a[q_key(5)]["W"], c[q_key(5)]["W"])
-    np.testing.assert_array_equal(a[layer_key(5)]["A"], c[layer_key(5)]["A"])
+    pred_leaf = "pred_hidden.w.W_ff1"
+    if group == "cpc_heads":
+        a = init_a2_params(make_cfg(cpc=0.1, seed=0), adapter)
+        b = init_a2_params(make_cfg(cpc=0.1, seed=0), adapter)
+        c = init_a2_params(make_cfg(cpc=0.1, seed=1), adapter)
+        np.testing.assert_array_equal(a[q_key(5)]["W"], b[q_key(5)]["W"])
+        assert not np.allclose(a[q_key(5)]["W"], c[q_key(5)]["W"])
+        np.testing.assert_array_equal(a[layer_key(5)]["A"], c[layer_key(5)]["A"])
+    elif group == "predictors":
 
+        def cfg(seed: int) -> A2Config:
+            return replace(
+                make_cfg(hid=0.1),
+                hid=HiddenConfig(
+                    weight=0.1, predictor=PredictorConfig(ff_dim=FF, seed=seed)
+                ),
+            )
 
-def test_predictor_seed_controls_the_predictors_and_not_the_adapter(
-    substrate: FrozenSubstrate, adapter: ResidualAdapter
-) -> None:
-    def cfg(seed: int) -> A2Config:
-        return replace(
-            make_cfg(hid=0.1),
-            hid=HiddenConfig(
-                weight=0.1, predictor=PredictorConfig(ff_dim=FF, seed=seed)
-            ),
+        a, b, c = (init_a2_params(cfg(s), adapter) for s in (0, 0, 1))
+        np.testing.assert_array_equal(
+            a[predictor_key(5)][pred_leaf], b[predictor_key(5)][pred_leaf]
         )
-
-    a, b, c = (init_a2_params(cfg(s), adapter) for s in (0, 0, 1))
-    name = "pred_hidden.w.W_ff1"
-    np.testing.assert_array_equal(a[predictor_key(5)][name], b[predictor_key(5)][name])
-    assert not np.allclose(a[predictor_key(5)][name], c[predictor_key(5)][name])
-    np.testing.assert_array_equal(a[layer_key(5)]["A"], c[layer_key(5)]["A"])
-
-
-def test_the_objective_seed_does_not_move_the_predictors(
-    substrate: FrozenSubstrate, adapter: ResidualAdapter
-) -> None:
-    name = "pred_hidden.w.W_ff1"
-    a = init_a2_params(make_cfg(hid=0.1, seed=0), adapter)
-    b = init_a2_params(make_cfg(hid=0.1, seed=3), adapter)
-    np.testing.assert_array_equal(a[predictor_key(5)][name], b[predictor_key(5)][name])
+        assert not np.allclose(
+            a[predictor_key(5)][pred_leaf], c[predictor_key(5)][pred_leaf]
+        )
+        np.testing.assert_array_equal(a[layer_key(5)]["A"], c[layer_key(5)]["A"])
+    elif group == "objective_seed":
+        a = init_a2_params(make_cfg(hid=0.1, seed=0), adapter)
+        b = init_a2_params(make_cfg(hid=0.1, seed=3), adapter)
+        np.testing.assert_array_equal(
+            a[predictor_key(5)][pred_leaf], b[predictor_key(5)][pred_leaf]
+        )
 
 
 def test_the_seed_reaches_the_fixed_random_highway(

@@ -17,12 +17,12 @@ from frozenllm.substrate import FrozenSubstrate
 from losses.a2_loss import (
     anchor_loss,
     check_backend,
+    contrastive_future_loss,
     hep_nudge_loss,
 )
-from residual import ResidualAdapter, ResidualConfig
-from residual.cpc_heads import project
-from residual.fabricpc import fpc_energy
-from residual.fabricpc.fpc_energy import BACKENDS
+from residual import ResidualAdapter, ResidualConfig, cpc_heads, fpc_energy
+from residual.cpc_heads import init_cpc_heads, predict_future, project
+from residual.fpc_energy import BACKENDS
 from residual.hep import init_hep
 from stages.stage_A.a2 import (
     A2Config,
@@ -31,7 +31,7 @@ from stages.stage_A.a2 import (
     step_loss,
 )
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.conftest import (
     LAYERS,
     SEQ,
     make_cfg,
@@ -42,10 +42,16 @@ from tests.residual.stage_A.a2.conftest import (
 D = 16
 V = 32
 R = 4
+M = 8
 
 
 def _x(*shape: int, seed: int = 0) -> jax.Array:
     return jnp.asarray(np.random.default_rng(seed).normal(size=shape), jnp.float32)
+
+
+def _heads(seed: int = 0) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+    raw = init_cpc_heads(seed, [1], D, M, offsets=(1,))
+    return {"W": raw["cpcq_1"]["W"]}, {"W": raw["cpca_1_1"]["W"]}
 
 
 def _mask(b: int = 3, s: int = 6) -> jax.Array:
@@ -67,10 +73,19 @@ def test_backends_are_listed_and_checked() -> None:
 
 @pytest.mark.parametrize(
     "fn_name",
-    ["anchor", "hep", "smoothness", "step", "cpc_project"],
+    [
+        "anchor",
+        "hep",
+        "smoothness",
+        "step",
+        "cpc_project",
+        "cpc_predict",
+        "contrastive",
+    ],
 )
 def test_unknown_backend_is_rejected(fn_name: str) -> None:
     bad = "torch"
+    q, a = _heads()
     with pytest.raises(ValueError, match="backend"):
         if fn_name == "anchor":
             anchor_loss(_x(3, 6, D), _x(3, 6, D, seed=1), backend=bad)
@@ -81,7 +96,19 @@ def test_unknown_backend_is_rejected(fn_name: str) -> None:
         elif fn_name == "step":
             step_loss(_x(2, 3, 6, D), backend=bad)
         elif fn_name == "cpc_project":
-            project(_x(3, 6, D), {"W": _x(D, 8)}, backend=bad)
+            project(q, _x(2, D), backend=bad)
+        elif fn_name == "cpc_predict":
+            predict_future(a, _x(2, M), backend=bad)
+        elif fn_name == "contrastive":
+            contrastive_future_loss(
+                q,
+                a,
+                _x(3, 7, D),
+                _x(3, 7, D, seed=1),
+                offset=1,
+                tau=0.1,
+                backend=bad,
+            )
 
 
 # --- Primitive Agreement ----------------------------------------------------------------------
@@ -175,20 +202,29 @@ def test_step_loss_backends_agree() -> None:
     assert fpc_g == pytest.approx(jax_g, rel=1e-5)
 
 
-def test_cpc_project_backends_agree() -> None:
-    x = _x(3, 6, D, seed=20)
-    w = {"W": _x(D, 8, seed=21)}
+def test_contrastive_loss_backends_agree() -> None:
+    q, a = _heads()
+    anchors = _x(3, 7, D, seed=20)
+    targets = _x(3, 7, D, seed=21)
 
-    def run(backend: str) -> tuple[jax.Array, jax.Array]:
-        val, grad = jax.value_and_grad(
-            lambda p: jnp.sum(project(x, p, backend=backend) ** 2)
-        )(w)
-        return val, grad["W"]
+    def run(backend: str) -> tuple[float, float, float]:
+        def f(qp: dict, ap: dict) -> jax.Array:
+            return contrastive_future_loss(
+                qp, ap, anchors, targets, offset=1, tau=0.1, backend=backend
+            )[0]
 
-    fpc_v, fpc_g = run("fabricpc")
-    jax_v, jax_g = run("jax")
-    np.testing.assert_allclose(fpc_v, jax_v, rtol=1e-5)
-    np.testing.assert_allclose(fpc_g, jax_g, rtol=1e-5)
+        val, (gq, ga) = jax.value_and_grad(f, argnums=(0, 1))(q, a)
+        return (
+            float(val),
+            float(jnp.max(jnp.abs(gq["W"]))),
+            float(jnp.max(jnp.abs(ga["W"]))),
+        )
+
+    f_val, f_gq, f_ga = run("fabricpc")
+    j_val, j_gq, j_ga = run("jax")
+    assert f_val == pytest.approx(j_val, rel=1e-5)
+    assert f_gq == pytest.approx(j_gq, rel=1e-5)
+    assert f_ga == pytest.approx(j_ga, rel=1e-5)
 
 
 # --- Through-the-Model Agreement --------------------------------------------------------------
@@ -238,19 +274,43 @@ def test_through_model_backends_agree(gpt2: FrozenSubstrate, term: str) -> None:
             )
 
 
-def test_the_backend_choice_reaches_fabricpc(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-    real = fpc_energy._per_token_energy
+# --- Backend Dispatch / Spy Tests -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dispatch_kind,spy_target",
+    [
+        ("energy", "_per_token_energy"),
+        ("cpc_heads", "_run_head"),
+    ],
+)
+def test_backend_selection_dispatches_to_fabricpc(
+    monkeypatch: pytest.MonkeyPatch,
+    dispatch_kind: str,
+    spy_target: str,
+) -> None:
+    calls: list[Any] = []
+    mod = fpc_energy if dispatch_kind == "energy" else cpc_heads
+    real = getattr(mod, spy_target)
 
     def spy(*a: Any, **k: Any) -> Any:
-        calls.append(a[-1])
+        calls.append(1)
         return real(*a, **k)
 
-    monkeypatch.setattr(fpc_energy, "_per_token_energy", spy)
+    monkeypatch.setattr(mod, spy_target, spy)
+
+    q, a = _heads()
     z, anchor = _x(3, 6, D, seed=25), _x(3, 6, D, seed=26)
 
-    anchor_loss(z, anchor, backend="fabricpc")
-    assert len(calls) == 1
+    def invoke(b: str) -> None:
+        if dispatch_kind == "energy":
+            anchor_loss(z, anchor, backend=b)
+        else:
+            project(q, _x(2, D), backend=b)
 
-    anchor_loss(z, anchor, backend="jax")
-    assert len(calls) == 1
+    invoke("fabricpc")
+    assert len(calls) > 0, f"{dispatch_kind}: fabricpc did not invoke spy target"
+    prev_calls = len(calls)
+
+    invoke("jax")
+    assert len(calls) == prev_calls, f"{dispatch_kind}: jax invoked fabricpc spy target"

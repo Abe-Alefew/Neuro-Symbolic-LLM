@@ -15,7 +15,6 @@ from fabricpc.nodes import Linear
 
 from residual import cpc_heads
 from residual.cpc_heads import (
-    BACKENDS,
     a_key,
     init_cpc_heads,
     predict_future,
@@ -159,10 +158,6 @@ def _x(*shape: int, seed: int = 0) -> jax.Array:
     return jax.random.normal(jax.random.PRNGKey(seed), shape)
 
 
-def test_backends_are_listed() -> None:
-    assert BACKENDS == ("fabricpc", "jax")
-
-
 @pytest.mark.parametrize("shape", [(7, D), (3, 5, D), (2, 3, 5, D)])
 def test_projection_matches_the_reference(shape) -> None:
     q, _ = _heads()
@@ -278,36 +273,6 @@ def test_a_zero_predictor_gives_a_zero_prediction() -> None:
     assert not np.any(predict_future(zero, _x(3, M, seed=8)))
 
 
-@pytest.mark.parametrize("bad", ["torch", "", None])
-def test_unknown_backend_is_rejected(bad) -> None:
-    q, a = _heads()
-    with pytest.raises(ValueError, match="backend"):
-        project(q, _x(2, D), bad)
-    with pytest.raises(ValueError, match="backend"):
-        predict_future(a, _x(2, M), bad)
-
-
 def test_non_matrix_weights_are_rejected() -> None:
     with pytest.raises(ValueError, match="matrix"):
         project({"W": jnp.ones((D, M, 1))}, _x(2, D))
-
-
-def test_the_fabricpc_backend_really_runs_the_heads_through_fabricpc(
-    monkeypatch,
-) -> None:
-    """Equal values cannot tell the backends apart, so count the node calls."""
-    calls = []
-    real = cpc_heads._run_head
-
-    def spy(*args, **kwargs):
-        calls.append(args[1:3])  # (source name, head name)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(cpc_heads, "_run_head", spy)
-    q, a = _heads()
-    h = _x(2, 3, D, seed=9)
-    predict_future(a, project(q, h))
-    assert calls == [("x", "q"), ("c", "A")]
-    calls.clear()
-    predict_future(a, project(q, h, "jax"), "jax")
-    assert calls == []

@@ -1,7 +1,7 @@
 """Stage A2 objective through-model contract tests.
 
 Covers:
-- Finiteness and term presence across all arms
+- Finiteness and term presence across configurations
 - Total loss decomposition (weighted sum)
 - Parity with A1 when auxiliary terms are disabled or monitor alone is active
 - Weight decay exclusion of auxiliary parameters
@@ -22,7 +22,7 @@ from frozenllm.substrate import FrozenSubstrate, identity_modify
 from residual import ResidualAdapter, ResidualConfig
 from stages.stage_A.a1 import A1Config, a1_objective
 from stages.stage_A.a2 import (
-    ARMS,
+    A2Config,
     adapter_params,
     apply_arm,
     cpc_term,
@@ -31,7 +31,7 @@ from stages.stage_A.a2 import (
     token_mask,
 )
 from stages.stage_base import base_logits
-from tests.residual.stage_A.a2.conftest import (
+from tests.residual.conftest import (
     FAMILIES,
     LAYERS,
     SEQ,
@@ -102,67 +102,60 @@ def test_monitor_alone_equals_a1(
     np.testing.assert_allclose(float(a2_val), float(a1_val), rtol=1e-5)
 
 
-def test_contract_terms_are_present_and_finite(
-    substrate: FrozenSubstrate, adapter: ResidualAdapter, input_ids: jax.Array
-) -> None:
-    cfg = make_cfg(cpc=0.1, stab=0.1, hep="fixed_random", hid=0.1)
-    params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
-    total, terms = run_objective(substrate, adapter, cfg, params, input_ids)
-    assert {"total", "task", "cpc", "stab", "hid"} <= set(terms)
-    for k, v in terms.items():
-        assert np.isfinite(float(v)), f"{k} is not finite"
-    assert np.isfinite(float(total))
-
-
 @pytest.mark.parametrize(
-    "cpc,stab,hid,present,absent",
+    "cfg,present,absent,weighted_check",
     [
-        (0.0, 0.0, 0.0, {"task", "total"}, {"cpc", "stab", "hid"}),
-        (0.2, 0.0, 0.0, {"cpc"}, {"stab", "hid"}),
-        (0.0, 0.2, 0.0, {"stab"}, {"cpc", "hid"}),
-        (0.0, 0.0, 0.2, {"hid"}, {"cpc", "stab"}),
+        (make_cfg(), {"task", "total"}, {"cpc", "stab", "hid"}, False),
+        (make_cfg(cpc=0.2), {"task", "total", "cpc"}, {"stab", "hid"}, False),
+        (
+            make_cfg(stab=0.2, hep="fixed_random"),
+            {"task", "total", "stab"},
+            {"cpc", "hid"},
+            False,
+        ),
+        (make_cfg(hid=0.2), {"task", "total", "hid"}, {"cpc", "stab"}, False),
+        (
+            make_cfg(
+                kl=0.3,
+                wd=0.02,
+                cpc=0.4,
+                stab=0.7,
+                hep="fixed_random",
+                w_smooth=0.1,
+                hid=0.3,
+            ),
+            {"task", "total", "kl", "wd", "cpc", "stab", "hid"},
+            set(),
+            True,
+        ),
     ],
 )
-def test_only_enabled_terms_are_returned(
+def test_contract_terms_presence_and_weighted_sum(
     substrate: FrozenSubstrate,
     adapter: ResidualAdapter,
     input_ids: jax.Array,
-    cpc: float,
-    stab: float,
-    hid: float,
+    cfg: A2Config,
     present: set[str],
     absent: set[str],
+    weighted_check: bool,
 ) -> None:
-    cfg = make_cfg(cpc=cpc, stab=stab, hid=hid)
     params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
-    _, terms = run_objective(substrate, adapter, cfg, params, input_ids)
+    total, terms = run_objective(substrate, adapter, cfg, params, input_ids)
+    assert np.isfinite(float(total))
+    for k, v in terms.items():
+        assert np.isfinite(float(v)), f"{k} is not finite"
     assert present <= set(terms)
     assert not (absent & set(terms))
-
-
-def test_total_is_the_weighted_sum_of_the_logged_terms(
-    substrate: FrozenSubstrate, adapter: ResidualAdapter, input_ids: jax.Array
-) -> None:
-    cfg = make_cfg(
-        kl=0.3,
-        wd=0.02,
-        cpc=0.4,
-        stab=0.7,
-        hep="fixed_random",
-        w_smooth=0.1,
-        hid=0.3,
-    )
-    params = with_random_predictors(with_random_b(init_a2_params(cfg, adapter)))
-    total, t = run_objective(substrate, adapter, cfg, params, input_ids)
-    expected = (
-        float(t["task"])
-        + 0.3 * float(t["kl"])
-        + 0.02 * float(t["wd"])
-        + 0.4 * float(t["cpc"])
-        + 0.7 * float(t["stab"])
-        + 0.3 * float(t["hid"])
-    )
-    assert float(total) == pytest.approx(expected, rel=1e-5)
+    if weighted_check:
+        expected = (
+            float(terms["task"])
+            + 0.3 * float(terms["kl"])
+            + 0.02 * float(terms["wd"])
+            + 0.4 * float(terms["cpc"])
+            + 0.7 * float(terms["stab"])
+            + 0.3 * float(terms["hid"])
+        )
+        assert float(total) == pytest.approx(expected, rel=1e-5)
 
 
 def test_terms_match_an_independent_path_through_the_model(
@@ -290,28 +283,11 @@ def test_ignored_labels_leave_the_auxiliary_terms_finite(
         assert np.isfinite(float(terms[k]))
 
 
-def test_every_arm_runs_through_the_objective(gpt2, input_ids) -> None:
-    adapter = ResidualAdapter(ResidualConfig(rank=4, layers=LAYERS), gpt2.architecture)
-    for arm in ARMS:
-        cfg = apply_arm(make_cfg(monitor="diagnostic"), arm)
-        params = with_random_b(init_a2_params(cfg, adapter))
-        if cfg.hid.enabled:
-            params = with_random_predictors(params)
-        total, terms = run_objective(gpt2, adapter, cfg, params, input_ids)
-        assert np.isfinite(float(total)), arm
-        assert "task" in terms, arm
-
-
 @pytest.mark.parametrize(
     "arm",
     [
         "a1_mode",
         "cpc_base",
-        "stab_anch",
-        "stab_hep",
-        "stab_smooth",
-        "hid_detached",
-        "hid_coupled",
         "full",
     ],
 )

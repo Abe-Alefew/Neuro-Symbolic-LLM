@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 
 from frozenllm.substrate import FrozenSubstrate
-from stages.config import load_configs
 from stages.stage_A.a2 import A2Config, Check
+from stages.stage_base import load_configs
 from tests.residual.stage_A.a2.conftest import NUM_TOKENS, SEQ, SHIPPED
 
 

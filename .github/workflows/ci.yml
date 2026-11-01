@@ -85,7 +85,7 @@ jobs:
           fi
 
       - name: Run Stage A tests
-        run: pytest tests/residual/stage_A/ -v --tb=short
+        run: pytest tests/residual/ -v --tb=short
 
       - name: Run grammar integration tests
         run: |

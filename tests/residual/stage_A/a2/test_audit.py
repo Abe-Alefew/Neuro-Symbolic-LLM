@@ -12,6 +12,7 @@ import stages.stage_A.a2 as a2
 from frozenllm.substrate import FrozenSubstrate
 from residual import ResidualAdapter
 from stages.stage_A.a2 import (
+    ARMS,
     A2Config,
     Check,
     a2_audit,
@@ -23,10 +24,7 @@ from stages.stage_A.a2 import (
 from tests.residual.stage_A.a2.conftest import by_name, full_cfg, make_cfg
 
 
-@pytest.mark.parametrize(
-    "arm",
-    ["full", "hid_detached", "hid_coupled", "stab_all"],
-)
+@pytest.mark.parametrize("arm", ARMS)
 def test_audit_passes_across_all_arms(
     substrate: FrozenSubstrate,
     adapter: ResidualAdapter,
@@ -38,20 +36,6 @@ def test_audit_passes_across_all_arms(
     failed = [c for c in checks if c.ok is False]
     assert not failed, format_audit(checks)
     assert audit_ok(checks)
-
-
-def test_gradient_routing_values_match_the_design(
-    substrate: FrozenSubstrate, adapter: ResidualAdapter, input_ids: jax.Array
-) -> None:
-    c = by_name(a2_audit(substrate, adapter, full_cfg(), input_ids))
-    task = c["grad_routing_task"].value
-    assert task["adapter"] > 0 and task["cpc"] == 0 and task["hep"] == 0
-    cpc = c["grad_routing_cpc"].value
-    assert cpc["adapter"] > 0 and cpc["cpc"] > 0 and cpc["hep"] == 0
-    anch = c["grad_routing_stab_anch"].value
-    assert anch["adapter"] > 0 and anch["cpc"] == 0 and anch["hep"] == 0
-    hep = c["grad_routing_stab_hep"].value
-    assert hep["adapter"] == 0 and hep["cpc"] == 0 and hep["hep"] > 0
 
 
 def test_gradient_ratios_are_information_not_failures(

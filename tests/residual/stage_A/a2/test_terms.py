@@ -77,14 +77,22 @@ def test_cpc_term_is_mean_over_sites_of_pure_loss() -> None:
     corrected, base = _states(1), _states(2)
     loss, metrics = cpc_term(params, config=cfg, corrected=corrected, base=base)
 
-    from losses.contrastive import info_nce_loss
+    from losses.a2_loss import contrastive_future_loss
 
-    per_site = []
-    for layer in (5, 6):
-        c, b = corrected[layer], base[layer]
-        q = project(c[:, :-2, :], params[q_key(layer)])
-        k_pos = project(b[:, 2:, :], params[a_key(layer, 2)])
-        per_site.append(float(info_nce_loss(q, k_pos, tau=0.2)[0]))
+    per_site = [
+        float(
+            contrastive_future_loss(
+                params[q_key(layer)],
+                params[a_key(layer, 2)],
+                corrected[layer],
+                base[layer],
+                offset=2,
+                tau=0.2,
+                max_anchors_per_seq=cfg.max_anchors_per_seq,
+            )[0]
+        )
+        for layer in (5, 6)
+    ]
     assert float(loss) == pytest.approx(float(np.mean(per_site)), rel=1e-5)
     for layer in (5, 6):
         assert f"cpc/site_{layer}" in metrics

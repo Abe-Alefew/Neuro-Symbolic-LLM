@@ -94,6 +94,11 @@ class ResidualConfig:
     def scale(self) -> float:
         return 1.0 if self.alpha is None else float(self.alpha) / self.rank
 
+    @property
+    def residual_seed(self) -> int:
+        """Backward-compatible name for the adapter initialization seed."""
+        return self.seed
+
 
 def _checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
     known = {f.name for f in fields(cls)}

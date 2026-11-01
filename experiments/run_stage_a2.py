@@ -109,6 +109,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--predictor-lr-mult", type=float, default=None)
     # Stability
     parser.add_argument("--stability-mode", choices=("off", "diagnostic"), default=None)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        default=False,
+        help="Prepare the run and evaluate without training.",
+    )
     parser.add_argument("--audit", action="store_true", default=False)
     parser.add_argument("--audit-only", action="store_true", default=False)
     return parser.parse_args(argv)
@@ -192,6 +198,14 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
         ),
         monitor=replace(obj.monitor, **stab),
     )
+    if args.stability_mode == "off":
+        obj = replace(obj, stab=replace(obj.stab, weight=0.0))
+    if args.eval_only:
+        training = replace(
+            training,
+            epochs=0,
+        )
+        domains = tuple(replace(d, epochs=0) for d in domains)
     return replace(
         cfg, adapter=adapter, objective=obj, training=training, domains=domains
     )

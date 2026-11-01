@@ -143,8 +143,8 @@ class LocalPredictorBank:
         unusable = tuple(i for i in layers if i + 1 >= architecture.num_layers)
         if unusable:
             raise ValueError(
-                f"Predictor layers {list(layers)} need a following block; "
-                f"model has {architecture.num_layers} blocks."
+                f"Predictor layers {list(unusable)} include the last block and "
+                f"need a following block; model has {architecture.num_layers} blocks."
             )
         usable = layers
         if not usable:

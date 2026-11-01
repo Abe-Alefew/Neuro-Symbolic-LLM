@@ -826,7 +826,6 @@ def stability_term(
         if logits is None or labels is None:
             raise ValueError("HEP needs the adapted logits and the labels.")
         eps, eps_mask = output_error(logits, labels)
-        n_pos = eps.shape[-2]
         losses, parts = [], []
         for layer, h in corrected.items():
             v = highway_for(
@@ -844,7 +843,7 @@ def stability_term(
                 eps,
                 v,
                 config.hep.alpha,
-                reference=h[..., :n_pos, :],
+                reference=h,
                 mask=eps_mask,
                 backend=config.backend,
             )

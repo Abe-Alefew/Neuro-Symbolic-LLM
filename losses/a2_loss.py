@@ -283,18 +283,16 @@ def anchor_loss(
 
 
 def output_error(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Output error ``eps_y = softmax(logits) - onehot(next token)``."""
+    """Output error ``eps_y = softmax(logits) - onehot(labels)``."""
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError(
-            f"expected logits [B, T, V] and labels [B, T], got {logits.shape}, {labels.shape}"
+            "expected logits [B, T, V] and labels shape [B, T], "
+            f"got {logits.shape}, {labels.shape}"
         )
-    p = jax.nn.softmax(
-        jax.lax.stop_gradient(logits[:, :-1]).astype(jnp.float32), axis=-1
-    )
-    target = labels[:, 1:]
-    mask = target != -100
+    p = jax.nn.softmax(jax.lax.stop_gradient(logits).astype(jnp.float32), axis=-1)
+    mask = labels != -100
     onehot = jax.nn.one_hot(
-        jnp.where(mask, target, 0), logits.shape[-1], dtype=jnp.float32
+        jnp.where(mask, labels, 0), logits.shape[-1], dtype=jnp.float32
     )
     eps = (p - onehot) * mask[..., None]
     return eps, mask

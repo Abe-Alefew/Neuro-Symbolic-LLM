@@ -140,12 +140,13 @@ class LocalPredictorBank:
         requested = config.layers if config.layers is not None else default_layers
         layers = validate_interception_layers(requested, architecture.num_layers)
         # P_l predicts block l+1, which must exist.
-        usable = tuple(i for i in layers if i + 1 < architecture.num_layers)
-        if config.layers is not None and usable != layers:
+        unusable = tuple(i for i in layers if i + 1 >= architecture.num_layers)
+        if unusable:
             raise ValueError(
                 f"Predictor layers {list(layers)} need a following block; "
                 f"model has {architecture.num_layers} blocks."
             )
+        usable = layers
         if not usable:
             raise ValueError(
                 "No predictor layers: every requested site is the last block."

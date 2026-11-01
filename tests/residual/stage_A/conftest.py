@@ -94,6 +94,7 @@ def make_cfg(
     positive: str = "base",
     cpc_heads: str = "fabricpc",
     hep: str | None = None,
+    w_anch: float = 1.0,
     w_hep: float = 0.0,
     w_smooth: float = 0.0,
     w_step: float = 0.0,
@@ -117,6 +118,7 @@ def make_cfg(
     )
     stab_cfg = StabLossConfig(
         weight=stab,
+        w_anch=w_anch,
         w_hep=w_hep,
         w_smooth=w_smooth,
         w_step=w_step,

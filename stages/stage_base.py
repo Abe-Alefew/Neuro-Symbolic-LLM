@@ -330,6 +330,58 @@ def evaluate_checkpoint(
     return results
 
 
+def prepare_domains(
+    substrate: FrozenSubstrate,
+    domains: Sequence[DomainConfig],
+    training: TrainingConfig,
+    loader_fn: Any = None,
+) -> list[Domain]:
+    """Prepare training blocks and evaluation sets across all domains."""
+    log.info("Preparing datasets across %d domain(s)...", len(domains))
+    fn = loader_fn or load_token_blocks
+    result = []
+    for d in domains:
+        train_blocks = fn(substrate, d, d.train_split, training.seq_len)
+        eval_blocks = fn(substrate, d, d.eval_split, training.seq_len)
+        result.append(
+            Domain(
+                name=d.name,
+                train_blocks=train_blocks,
+                eval_set=make_eval_set(
+                    eval_blocks, training.batch_size, training.eval_batches
+                ),
+                epochs=training.epochs if d.epochs is None else d.epochs,
+            )
+        )
+    return result
+
+
+def evaluate_test_domains(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    params: Any,
+    domain_configs: Sequence[DomainConfig],
+    training: TrainingConfig,
+    eval_batches: int | None = None,
+    writer: RunWriter | None = None,
+    loader_fn: Any = None,
+) -> dict[str, dict[str, float]]:
+    """Evaluate final test sets across all domains for paper-table results."""
+    num_eval = eval_batches if eval_batches is not None else training.eval_batches
+    log.info("Running final test evaluation across %d domains...", len(domain_configs))
+    fn = loader_fn or load_token_blocks
+    test_results = {}
+    for d in domain_configs:
+        test_blocks = fn(substrate, d, d.test_split, training.seq_len)
+        test_set = make_eval_set(test_blocks, training.batch_size, num_eval)
+        test_results[d.name] = evaluate(
+            substrate, adapter, params, test_set, jit=training.jit
+        )
+        if writer is not None:
+            writer.log("test", domain=d.name, **test_results[d.name])
+    return test_results
+
+
 def summarize(
     names: Sequence[str],
     init: Mapping[str, Mapping[str, float]],
@@ -702,6 +754,8 @@ def log_experiment_header(
     run_dir: Any,
     domains: Sequence[Domain],
     start_time: str | None = None,
+    stage_name: str = "A1",
+    extra_info: Mapping[str, Any] | None = None,
 ) -> None:
     """Log structured initialization banner and experiment hyperparameters."""
     train_cfg = cfg.training
@@ -709,7 +763,7 @@ def log_experiment_header(
     ts = start_time or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     logger.info("=" * 78)
-    logger.info("STAGE A1: SEQUENTIAL RESIDUAL ADAPTER TRAINING")
+    logger.info("STAGE %s: SEQUENTIAL RESIDUAL ADAPTER TRAINING", stage_name)
     logger.info("=" * 78)
     logger.info("Started At         : %s", ts)
     logger.info(
@@ -724,6 +778,9 @@ def log_experiment_header(
         cfg.adapter.rank,
         cfg.adapter.alpha,
     )
+    if extra_info:
+        for k, v in extra_info.items():
+            logger.info("%-19s: %s", k, v)
     logger.info(
         "Parameters         : %s trainable | %s frozen (%.3f%% trainable)",
         f"{n_trainable:,}",
@@ -833,11 +890,13 @@ __all__ = [
     "configure_logging",
     "evaluate",
     "evaluate_checkpoint",
+    "evaluate_test_domains",
     "load_configs",
     "load_token_blocks",
     "log_experiment_header",
     "log_final_summary",
     "make_eval_set",
+    "prepare_domains",
     "resolve_split",
     "run_sequential",
     "summarize",

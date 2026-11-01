@@ -32,16 +32,15 @@ from residual import ResidualAdapter  # noqa: E402
 from stages.results import RunWriter, default_run_name, run_metadata  # noqa: E402
 from stages.stage_A.a1 import A1Config, a1_objective  # noqa: E402
 from stages.stage_base import (  # noqa: E402
-    Domain,
     RunConfig,
     configure_logging,
-    evaluate,
     evaluate_checkpoint,
+    evaluate_test_domains,
     load_configs,
     load_token_blocks,
     log_experiment_header,
     log_final_summary,
-    make_eval_set,
+    prepare_domains,
     run_sequential,
 )
 
@@ -170,21 +169,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     # Load data before creating the run directory, so bad datasets fail fast.
-    log.info("Preparing datasets across %d domain(s)...", len(cfg.domains))
-    domains = []
-    for d in cfg.domains:
-        train_blocks = load_token_blocks(substrate, d, d.train_split, train_cfg.seq_len)
-        eval_blocks = load_token_blocks(substrate, d, d.eval_split, train_cfg.seq_len)
-        domains.append(
-            Domain(
-                name=d.name,
-                train_blocks=train_blocks,
-                eval_set=make_eval_set(
-                    eval_blocks, train_cfg.batch_size, train_cfg.eval_batches
-                ),
-                epochs=train_cfg.epochs if d.epochs is None else d.epochs,
-            )
-        )
+    domains = prepare_domains(
+        substrate, cfg.domains, train_cfg, loader_fn=load_token_blocks
+    )
 
     run_name = args.run_name or default_run_name("a1")
     with RunWriter(train_cfg.output_dir, run_name) as writer:
@@ -228,25 +215,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary["params_unchanged"] = frozen["params_unchanged"]
 
         # Final test-set evaluation across domains for paper-table results
-        test_eval_batches = (
-            args.eval_batches
-            if args.eval_batches is not None
-            else train_cfg.eval_batches
+        summary["test"] = evaluate_test_domains(
+            substrate,
+            adapter,
+            params,
+            cfg.domains,
+            train_cfg,
+            eval_batches=args.eval_batches,
+            writer=writer,
+            loader_fn=load_token_blocks,
         )
-        log.info("Running final test evaluation across %d domains...", len(cfg.domains))
-        test_results = {}
-        for d in cfg.domains:
-            test_blocks = load_token_blocks(
-                substrate, d, d.test_split, train_cfg.seq_len
-            )
-            test_set = make_eval_set(
-                test_blocks, train_cfg.batch_size, test_eval_batches
-            )
-            test_results[d.name] = evaluate(
-                substrate, adapter, params, test_set, jit=train_cfg.jit
-            )
-            writer.log("test", domain=d.name, **test_results[d.name])
-        summary["test"] = test_results
         writer.write_json("results.json", summary)
 
     log_final_summary(log, summary, frozen, start_time=start_time)

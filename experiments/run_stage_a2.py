@@ -10,10 +10,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+
+# Silence verbose C++ runtime warnings before JAX initializes
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Run as a script: put the repo root on sys.path.
@@ -42,11 +50,14 @@ from stages.stage_A.a2 import (  # noqa: E402
 from stages.stage_base import (  # noqa: E402
     Domain,
     RunConfig,
-    evaluate,
+    configure_logging,
     evaluate_checkpoint,
+    evaluate_test_domains,
     load_configs,
     load_token_blocks,
-    make_eval_set,
+    log_experiment_header,
+    log_final_summary,
+    prepare_domains,
     run_sequential,
 )
 
@@ -187,15 +198,12 @@ def apply_overrides(cfg: RunConfig, args: argparse.Namespace) -> RunConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    start_time = time.time()
+    configure_logging(level=logging.INFO)
     args = parse_args(argv)
     cfg = apply_overrides(load_configs(args.config, A2Config), args)
     train_cfg = cfg.training
     obj: A2Config = cfg.objective
-    log.info("adapter=%s", cfg.adapter)
-    log.info("objective=%s", obj)
-    log.info("training=%s", train_cfg)
-    log.info("domains=%s", [d.name for d in cfg.domains])
 
     substrate = FrozenSubstrate(train_cfg.model)
     arch = substrate.architecture
@@ -219,19 +227,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     n_adapter = counts["adapter"]
     n_pred = counts["pred"]
     n_frozen = sum(p.numel() for p in substrate.params.values())
-    log.info(
-        "model=%s L=%d d=%d adapter_layers=%s predictor_layers=%s rank=%d "
-        "adapter_params=%d predictor_params=%d frozen=%d",
-        train_cfg.model,
-        arch.num_layers,
-        arch.hidden_size,
-        list(adapter.layers),
-        list(bank.layers) if bank else [],
-        cfg.adapter.rank,
-        n_adapter,
-        n_pred,
-        n_frozen,
-    )
 
     frozen = substrate.verify_frozen()
     if not frozen["params_unchanged"]:
@@ -242,6 +237,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.info(
             "Evaluating checkpoint %s on split=%s", args.eval_checkpoint, args.split
         )
+        eval_batches = (
+            args.eval_batches
+            if args.eval_batches is not None
+            else train_cfg.eval_batches
+        )
         results = evaluate_checkpoint(
             substrate,
             adapter,
@@ -250,37 +250,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             split=args.split,
             seq_len=train_cfg.seq_len,
             batch_size=train_cfg.batch_size,
-            eval_batches=train_cfg.eval_batches,
+            eval_batches=eval_batches,
             jit=train_cfg.jit,
         )
         print(json.dumps(results, indent=2))
         return 0
 
     # Load data before creating the run directory, so bad datasets fail fast.
-    domains = []
-    for d_cfg in cfg.domains:
-        train_blocks = load_token_blocks(
-            substrate, d_cfg, d_cfg.train_split, train_cfg.seq_len
-        )
-        eval_blocks = load_token_blocks(
-            substrate, d_cfg, d_cfg.eval_split, train_cfg.seq_len
-        )
-        domains.append(
-            Domain(
-                name=d_cfg.name,
-                train_blocks=train_blocks,
-                eval_set=make_eval_set(
-                    eval_blocks, train_cfg.batch_size, train_cfg.eval_batches
-                ),
-                epochs=train_cfg.epochs if d_cfg.epochs is None else d_cfg.epochs,
-            )
-        )
-        log.info(
-            "domain=%s train_blocks=%d eval_batches=%d",
-            d_cfg.name,
-            len(train_blocks),
-            len(domains[-1].eval_set),
-        )
+    domains = prepare_domains(
+        substrate, cfg.domains, train_cfg, loader_fn=load_token_blocks
+    )
 
     audit_data = None
     if args.audit or args.audit_only:
@@ -309,7 +288,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     run_name = args.run_name or default_run_name("a2")
     with RunWriter(train_cfg.output_dir, run_name) as writer:
-        log.info("run_dir=%s", writer.dir)
         writer.write_config(cfg.to_dict())
         if audit_data is not None:
             writer.write_json("audit.json", audit_data)
@@ -333,6 +311,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "epochs": {d.name: d.epochs for d in domains},
                 "jit": train_cfg.jit,
             },
+        )
+        log_experiment_header(
+            log,
+            cfg=cfg,
+            arch=arch,
+            adapter=adapter,
+            n_trainable=counts["total"],
+            n_frozen=n_frozen,
+            run_dir=writer.dir,
+            domains=domains,
+            stage_name="A2",
+            extra_info=(
+                {"Predictor Sites   ": f"{list(bank.layers)} ({n_pred:,} params)"}
+                if bank
+                else None
+            ),
         )
         init_diag = diagnostics(params, domains[0])
         writer.log("a2_diagnostics", when="init", domain=domains[0].name, **init_diag)
@@ -366,25 +360,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
 
         # Final test-set evaluation across domains for paper-table results
-        test_results = {}
-        for d_cfg in cfg.domains:
-            test_blocks = load_token_blocks(
-                substrate, d_cfg, d_cfg.test_split, train_cfg.seq_len
-            )
-            test_set = make_eval_set(
-                test_blocks, train_cfg.batch_size, train_cfg.eval_batches
-            )
-            test_results[d_cfg.name] = evaluate(
-                substrate, adapter, params, test_set, jit=train_cfg.jit
-            )
-            writer.log("test", domain=d_cfg.name, **test_results[d_cfg.name])
-        summary["test"] = test_results
+        summary["test"] = evaluate_test_domains(
+            substrate,
+            adapter,
+            params,
+            cfg.domains,
+            train_cfg,
+            eval_batches=args.eval_batches,
+            writer=writer,
+            loader_fn=load_token_blocks,
+        )
         writer.write_json("results.json", summary)
 
-    log.info("mean_seen_loss=%s", summary["mean_seen_loss"])
-    log.info("mean_forgetting=%s", summary["mean_forgetting"])
-    log.info("test_results=%s", summary["test"])
-    log.info("verify_frozen=%s", frozen)
+    log_final_summary(log, summary, frozen, start_time=start_time)
     if not frozen["params_unchanged"]:
         log.error("Base parameters changed during training.")
         return 1

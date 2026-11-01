@@ -33,7 +33,7 @@ from stages.stage_A.a2 import (
     predictor_params,
 )
 from stages.stage_base import Objective, TrainingConfig, evaluate, run_sequential
-from tests.residual.conftest import (
+from tests.residual.stage_A.a2.conftest import (
     BATCH,
     LAYERS,
     NUM_TOKENS,

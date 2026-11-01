@@ -31,7 +31,7 @@ from stages.stage_A.a2 import (
     token_mask,
 )
 from stages.stage_base import base_logits
-from tests.residual.conftest import (
+from tests.residual.stage_A.a2.conftest import (
     FAMILIES,
     LAYERS,
     SEQ,

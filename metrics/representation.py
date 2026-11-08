@@ -97,6 +97,70 @@ def residual_redundancy(a: jax.Array, b: jax.Array) -> dict[str, jax.Array]:
     return {"read": direction_redundancy(a.T), "write": direction_redundancy(b)}
 
 
+def effective_rank(matrix: jax.Array, eps: float = _EPS) -> jax.Array:
+    """Entropy effective rank, invariant to low-rank basis changes."""
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be 2-D")
+    singular = jnp.linalg.svd(matrix.astype(jnp.float32), compute_uv=False)
+    weights = singular / jnp.maximum(jnp.sum(singular), eps)
+    return jnp.exp(-jnp.sum(jnp.where(weights > 0, weights * jnp.log(weights), 0.0)))
+
+
+def invariant_redundancy(a: jax.Array, b: jax.Array, eps: float = _EPS) -> jax.Array:
+    """Function-level redundancy based on the effective rank of ``A @ B``."""
+    if a.ndim != 2 or b.ndim != 2 or a.shape != b.shape[::-1]:
+        raise ValueError("expected A [d,r] and B [r,d]")
+    rank = effective_rank(a @ b, eps)
+    return 1.0 - rank / max(1, min(a.shape))
+
+
+def effective_support(contributions: jax.Array, eps: float = _EPS) -> jax.Array:
+    """Entropy effective support size of non-negative component contributions."""
+    values = jnp.asarray(contributions, dtype=jnp.float32)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("contributions must be a non-empty vector")
+    values = jnp.maximum(values, 0.0)
+    probabilities = values / jnp.maximum(jnp.sum(values), eps)
+    return jnp.exp(
+        -jnp.sum(jnp.where(probabilities > 0, probabilities * jnp.log(probabilities), 0.0))
+    )
+
+
+def fracture_index(contributions: jax.Array, eps: float = _EPS) -> jax.Array:
+    """Normalized effective support; lower values are more localized."""
+    values = jnp.asarray(contributions)
+    return effective_support(values, eps) / values.size
+
+
+def overlap(contributions_a: jax.Array, contributions_b: jax.Array, eps: float = _EPS) -> jax.Array:
+    """Overlap of two component-contribution distributions."""
+    a = jnp.maximum(jnp.asarray(contributions_a, jnp.float32), 0)
+    b = jnp.maximum(jnp.asarray(contributions_b, jnp.float32), 0)
+    if a.ndim != 1 or a.shape != b.shape:
+        raise ValueError("contributions must be equal-length vectors")
+    a = a / jnp.maximum(jnp.sum(a), eps)
+    b = b / jnp.maximum(jnp.sum(b), eps)
+    return jnp.sum(jnp.minimum(a, b))
+
+
+def taylor_delta(
+    gradient: jax.Array, fisher_diag: jax.Array, delta: jax.Array
+) -> jax.Array:
+    """Diagonal-Fisher second-order loss-change approximation."""
+    if gradient.shape != fisher_diag.shape or gradient.shape != delta.shape:
+        raise ValueError("gradient, fisher_diag, and delta must have equal shapes")
+    return jnp.sum(gradient * delta) + 0.5 * jnp.sum(fisher_diag * delta**2)
+
+
+def synergy(
+    delta_a: jax.Array, delta_b: jax.Array, fisher_diag: jax.Array
+) -> jax.Array:
+    """Diagonal-Fisher interaction estimate between two residual changes."""
+    if delta_a.shape != delta_b.shape or delta_a.shape != fisher_diag.shape:
+        raise ValueError("all inputs must have equal shapes")
+    return jnp.sum(fisher_diag * delta_a * delta_b)
+
+
 def gradient_conflict(grad_a: Any, grad_b: Any, eps: float = 1e-12) -> jax.Array:
     """``[-cos(g_a, g_b)]_+`` of two gradient PyTrees with the same structure."""
     if eps < 0:
@@ -263,6 +327,9 @@ def hep_nudge_loss(
 __all__ = [
     "compressibility_curve",
     "direction_redundancy",
+    "effective_rank",
+    "effective_support",
+    "fracture_index",
     "gradient_conflict",
     "hep_nudge",
     "hep_nudge_loss",
@@ -271,6 +338,10 @@ __all__ = [
     "residual_compressibility",
     "residual_norm_ratio",
     "residual_redundancy",
+    "invariant_redundancy",
+    "overlap",
     "settling_loss",
+    "synergy",
+    "taylor_delta",
     "v_hidden_size",
 ]

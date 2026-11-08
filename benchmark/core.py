@@ -571,7 +571,16 @@ def train_manifest(
                 returncode=completed.returncode,
                 log=str(log_path),
             )
-            raise RuntimeError(f"{spec.run_id} failed; see {log_path}")
+            try:
+                log_tail = "\n".join(
+                    log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+                )
+            except OSError as exc:
+                log_tail = f"Unable to read failure log: {exc}"
+            raise RuntimeError(
+                f"{spec.run_id} failed with exit code {completed.returncode}; "
+                f"see {log_path}\n\nLast log lines:\n{log_tail}"
+            )
         if not results.is_file():
             raise RuntimeError(f"{spec.run_id} exited successfully but wrote no results.json")
         _update_manifest(

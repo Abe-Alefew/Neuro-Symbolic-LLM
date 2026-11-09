@@ -1,17 +1,5 @@
 """Consolidated test suite for the Stage A A1/A2/A3 benchmark harness and metrics.
 
-Covers Phase 2 bug fixes and enhanced representation metrics:
-- 2.1: ECE handles empty bins without producing NaN; jits cleanly
-- 2.2: Pooled ECE across batches matches evaluation on concatenated batch
-- 2.3: A3 K-sweep compressibility curves are grouped by (method, seed, k)
-- 2.4: C(r) reports None / N/A when target rank is absent (not 0.0)
-- 2.5: NaN / Inf sanitized to null; written with allow_nan=False
-- 2.6: Resume rematerializes config and records config_sha
-- Requirements 1-4: Per-domain overlap matrices within layer, normalized separately
-- Requirement 5: Semantic / category factor overlap
-- Requirement 6: Metric-weighted synergy proxy Syn_proxy(i,j) = delta_h_i^T G delta_h_j
-- Requirement 7: Measured pairwise ablation interaction S_ij and proxy validation
-- Orchestration: planning, evaluation, and report rendering
 """
 
 from __future__ import annotations

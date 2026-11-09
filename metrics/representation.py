@@ -122,7 +122,9 @@ def effective_support(contributions: jax.Array, eps: float = _EPS) -> jax.Array:
     values = jnp.maximum(values, 0.0)
     probabilities = values / jnp.maximum(jnp.sum(values), eps)
     return jnp.exp(
-        -jnp.sum(jnp.where(probabilities > 0, probabilities * jnp.log(probabilities), 0.0))
+        -jnp.sum(
+            jnp.where(probabilities > 0, probabilities * jnp.log(probabilities), 0.0)
+        )
     )
 
 
@@ -132,7 +134,9 @@ def fracture_index(contributions: jax.Array, eps: float = _EPS) -> jax.Array:
     return effective_support(values, eps) / values.size
 
 
-def overlap(contributions_a: jax.Array, contributions_b: jax.Array, eps: float = _EPS) -> jax.Array:
+def overlap(
+    contributions_a: jax.Array, contributions_b: jax.Array, eps: float = _EPS
+) -> jax.Array:
     """Overlap of two component-contribution distributions."""
     a = jnp.maximum(jnp.asarray(contributions_a, jnp.float32), 0)
     b = jnp.maximum(jnp.asarray(contributions_b, jnp.float32), 0)
@@ -152,13 +156,60 @@ def taylor_delta(
     return jnp.sum(gradient * delta) + 0.5 * jnp.sum(fisher_diag * delta**2)
 
 
+def synergy_proxy(
+    delta_a: jax.Array, delta_b: jax.Array, metric_g: jax.Array
+) -> jax.Array:
+    """Metric-weighted interaction proxy: delta_a^T G delta_b.
+
+    Directly follows the research plan: Syn_proxy(i,j) = delta_h_i^T G delta_h_j.
+    Supports either a 1-D diagonal (such as empirical Fisher diagonal) or a 2-D metric tensor G.
+    """
+    da = jnp.asarray(delta_a, dtype=jnp.float32)
+    db = jnp.asarray(delta_b, dtype=jnp.float32)
+    g = jnp.asarray(metric_g, dtype=jnp.float32)
+    if da.shape != db.shape:
+        raise ValueError(
+            f"delta_a shape {da.shape} must match delta_b shape {db.shape}"
+        )
+    if g.ndim == 1:
+        if g.shape != da.shape:
+            raise ValueError(
+                f"metric_g shape {g.shape} must match delta shape {da.shape}"
+            )
+        return jnp.sum(g * da * db)
+    if g.ndim == 2:
+        if g.shape != (da.shape[-1], db.shape[-1]):
+            raise ValueError(
+                f"metric_g shape {g.shape} must be ({da.shape[-1]}, {db.shape[-1]})"
+            )
+        return da @ g @ db
+    raise ValueError(f"metric_g must be 1-D or 2-D, got ndim={g.ndim}")
+
+
 def synergy(
     delta_a: jax.Array, delta_b: jax.Array, fisher_diag: jax.Array
 ) -> jax.Array:
     """Diagonal-Fisher interaction estimate between two residual changes."""
-    if delta_a.shape != delta_b.shape or delta_a.shape != fisher_diag.shape:
-        raise ValueError("all inputs must have equal shapes")
-    return jnp.sum(fisher_diag * delta_a * delta_b)
+    return synergy_proxy(delta_a, delta_b, fisher_diag)
+
+
+def pairwise_ablation_interaction(
+    loss_full: jax.Array | float,
+    loss_ablate_i: jax.Array | float,
+    loss_ablate_j: jax.Array | float,
+    loss_ablate_ij: jax.Array | float,
+) -> jax.Array:
+    """Measured pairwise ablation interaction between atoms i and j.
+
+    S_ij = L(ablate i,j) - L(ablate i) - L(ablate j) + L(full).
+    Measures non-linear interaction / synergy beyond additive individual contributions.
+    """
+    return (
+        jnp.asarray(loss_ablate_ij, jnp.float32)
+        - jnp.asarray(loss_ablate_i, jnp.float32)
+        - jnp.asarray(loss_ablate_j, jnp.float32)
+        + jnp.asarray(loss_full, jnp.float32)
+    )
 
 
 def gradient_conflict(grad_a: Any, grad_b: Any, eps: float = 1e-12) -> jax.Array:
@@ -335,6 +386,7 @@ __all__ = [
     "hep_nudge_loss",
     "loss_improvement",
     "output_error",
+    "pairwise_ablation_interaction",
     "residual_compressibility",
     "residual_norm_ratio",
     "residual_redundancy",
@@ -342,6 +394,7 @@ __all__ = [
     "overlap",
     "settling_loss",
     "synergy",
+    "synergy_proxy",
     "taylor_delta",
     "v_hidden_size",
 ]

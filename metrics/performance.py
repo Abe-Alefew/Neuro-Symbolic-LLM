@@ -56,29 +56,56 @@ def token_accuracy(logits: jax.Array, labels: jax.Array) -> jax.Array:
     return jnp.sum(correct) / jnp.maximum(jnp.sum(mask), 1)
 
 
-def expected_calibration_error(
+def calibration_stats(
     logits: jax.Array, labels: jax.Array, bins: int = 15
-) -> jax.Array:
-    """Token-level ECE using confidence of the top-1 next-token prediction."""
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Return per-bin (conf_sum, acc_sum, count) for top-1 predictions.
+
+    Uses half-open bins and segment summation so it jits without dynamic shapes
+    and remains finite when some bins are empty.
+    """
     if bins < 1:
         raise ValueError("bins must be >= 1")
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError("expected logits [B,T,V] and labels [B,T]")
     target = labels[:, 1:]
-    mask = target != -100
+    mask = (target != -100).astype(jnp.float32)
     probs = jax.nn.softmax(logits[:, :-1].astype(jnp.float32), axis=-1)
-    confidence = jnp.max(probs, axis=-1)[mask]
-    predicted = jnp.argmax(probs, axis=-1)[mask]
-    correct = (predicted == target[mask]).astype(jnp.float32)
-    edges = jnp.linspace(0.0, 1.0, bins + 1)
-    total = jnp.maximum(confidence.size, 1)
-    return sum(
-        jnp.abs(jnp.mean(confidence[which]) - jnp.mean(correct[which]))
-        * (jnp.sum(which) / total)
-        for i in range(bins)
-        for which in [(confidence >= edges[i]) & (confidence <= edges[i + 1])]
-        if confidence.size
-    )
+    conf = jnp.max(probs, axis=-1)
+    predicted = jnp.argmax(probs, axis=-1)
+    safe_target = jnp.where(target != -100, target, 0)
+    correct = (predicted == safe_target).astype(jnp.float32)
+
+    idx = jnp.clip((conf * bins).astype(jnp.int32), 0, bins - 1)
+    conf_flat = (conf * mask).ravel()
+    acc_flat = (correct * mask).ravel()
+    mask_flat = mask.ravel()
+    idx_flat = idx.ravel()
+
+    conf_sum = jax.ops.segment_sum(conf_flat, idx_flat, num_segments=bins)
+    acc_sum = jax.ops.segment_sum(acc_flat, idx_flat, num_segments=bins)
+    counts = jax.ops.segment_sum(mask_flat, idx_flat, num_segments=bins)
+    return conf_sum, acc_sum, counts
+
+
+def ece_from_stats(
+    conf_sum: jax.Array, acc_sum: jax.Array, counts: jax.Array
+) -> jax.Array:
+    """Compute ECE from pooled per-bin calibration statistics.
+
+    ECE = sum_b |conf_sum_b - acc_sum_b| / max(N, 1).
+    Empty bins contribute 0 (since |0 - 0| = 0) and never produce NaN.
+    """
+    total = jnp.maximum(counts.sum(), 1.0)
+    return jnp.abs(conf_sum - acc_sum).sum() / total
+
+
+def expected_calibration_error(
+    logits: jax.Array, labels: jax.Array, bins: int = 15
+) -> jax.Array:
+    """Token-level ECE using confidence of the top-1 next-token prediction."""
+    conf_sum, acc_sum, counts = calibration_stats(logits, labels, bins=bins)
+    return ece_from_stats(conf_sum, acc_sum, counts)
 
 
 def paired_deltas(
@@ -147,7 +174,9 @@ def training_step_time(
 
 
 __all__ = [
+    "calibration_stats",
     "cross_entropy_loss",
+    "ece_from_stats",
     "expected_calibration_error",
     "kl_to_base",
     "mean_forgetting",

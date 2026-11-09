@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -768,6 +769,8 @@ def train_manifest(
                 config_sha=config_sha,
             )
             continue
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
         run_dir.parent.mkdir(parents=True, exist_ok=True)
         _update_manifest(
             manifest_path,

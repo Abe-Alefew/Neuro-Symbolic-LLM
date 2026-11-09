@@ -216,9 +216,13 @@ def load_token_blocks(
         raise ImportError("The 'datasets' package is required to load token blocks.")
     if substrate.tokenizer is None:
         raise ValueError("The substrate has no tokenizer.")
-    texts = load_dataset(domain.dataset, domain.dataset_config, split=split)[
-        domain.text_field
-    ]
+    try:
+        raw_ds = load_dataset(
+            domain.dataset, domain.dataset_config, split=split, trust_remote_code=True
+        )
+    except TypeError:
+        raw_ds = load_dataset(domain.dataset, domain.dataset_config, split=split)
+    texts = raw_ds[domain.text_field]
     # One contiguous token stream; the ragged tail is dropped.
     ids = substrate.tokenizer(domain.separator.join(texts), return_tensors="np")[
         "input_ids"

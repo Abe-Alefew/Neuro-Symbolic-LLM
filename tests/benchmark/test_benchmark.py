@@ -1,6 +1,4 @@
-"""Consolidated test suite for the Stage A A1/A2/A3 benchmark harness and metrics.
-
-"""
+"""Consolidated test suite for the Stage A A1/A2/A3 benchmark harness and metrics."""
 
 from __future__ import annotations
 

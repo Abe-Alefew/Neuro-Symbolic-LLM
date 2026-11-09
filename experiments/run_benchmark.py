@@ -33,6 +33,7 @@ def main() -> int:
     parser.add_argument("--ranks", nargs="+", type=int, default=[16])
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--report-rank", type=int, default=4)
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
     if args.command == "plan":
@@ -50,9 +51,11 @@ def main() -> int:
         print(f"training complete: {output_dir}")
     elif args.command == "eval":
         evaluation = evaluate_manifest(output_dir)
-        print(f"evaluated {evaluation['completed_runs']}/{evaluation['planned_runs']} runs")
+        print(
+            f"evaluated {evaluation['completed_runs']}/{evaluation['planned_runs']} runs"
+        )
     else:
-        print(report_manifest(output_dir))
+        print(report_manifest(output_dir, report_rank=args.report_rank))
     return 0
 
 

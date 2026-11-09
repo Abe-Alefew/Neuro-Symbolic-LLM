@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -66,26 +67,99 @@ class RunSpec:
     rank: int = 16
 
 
-def _jsonable(value: Any) -> Any:
+def _sanitize_value(value: Any) -> Any:
+    """Recursively sanitize data structure by converting non-finite floats to None."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_jsonable(v) for v in value]
+        return {str(k): _sanitize_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_sanitize_value(v) for v in value]
     return value
+
+
+def _jsonable(value: Any) -> Any:
+    return _sanitize_value(value)
 
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_jsonable(value), indent=2) + "\n", encoding="utf-8")
+    clean = _jsonable(value)
+    path.write_text(
+        json.dumps(clean, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
 
 
-def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+def _spearman_corr(x: list[float] | Any, y: list[float] | Any) -> float:
+    """Compute Spearman rank correlation between two vectors without external dependencies."""
+    import numpy as np
+
+    xa = np.asarray(x, dtype=float)
+    ya = np.asarray(y, dtype=float)
+    if len(xa) < 2 or np.all(xa == xa[0]) or np.all(ya == ya[0]):
+        return 0.0
+    rx = np.argsort(np.argsort(xa)).astype(float)
+    ry = np.argsort(np.argsort(ya)).astype(float)
+    vx = rx - rx.mean()
+    vy = ry - ry.mean()
+    denom = np.sqrt(np.sum(vx**2) * np.sum(vy**2))
+    if denom == 0.0:
+        return 0.0
+    return float(np.sum(vx * vy) / denom)
+
+
+def compute_domain_overlap(
+    domain_atom_effects: dict[str, list[float] | Any],
+    eps: float = 1e-8,
+) -> dict[str, float]:
+    """Calculate overlap between domains within a layer using normalized contributions.
+
+    1. Same residual component definitions across all domains (the atoms).
+    2. Normalize contributions separately for each domain.
+    3. Retain per-domain overlap matrix entries {f'{d1}:{d2}': overlap_val}.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from metrics.representation import overlap
+
+    domain_names = sorted(domain_atom_effects)
+    normalized: dict[str, jax.Array] = {}
+    for name in domain_names:
+        raw = jnp.maximum(
+            jnp.asarray(domain_atom_effects[name], dtype=jnp.float32), 0.0
+        )
+        total = jnp.maximum(jnp.sum(raw), eps)
+        normalized[name] = raw / total
+
+    matrix: dict[str, float] = {}
+    for i, d1 in enumerate(domain_names):
+        for d2 in domain_names[i + 1 :]:
+            matrix[f"{d1}:{d2}"] = float(
+                overlap(normalized[d1], normalized[d2], eps=eps)
+            )
+    return matrix
+
+
+def compute_semantic_overlap(
+    category_atom_effects: dict[str, list[float] | Any],
+    eps: float = 1e-8,
+) -> dict[str, float]:
+    """Calculate overlap between semantic/category factors within a layer."""
+    return compute_domain_overlap(category_atom_effects, eps=eps)
+
+
+def _load_deployed_metrics(
+    run: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
     """Evaluate the final checkpoint with the common deployed function.
 
     Heavy JAX/model imports are intentionally local so ``plan`` remains usable
@@ -97,7 +171,8 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
 
     from frozenllm.substrate import FrozenSubstrate, identity_modify
     from metrics.performance import (
-        expected_calibration_error,
+        calibration_stats,
+        ece_from_stats,
         kl_to_base,
         token_accuracy,
     )
@@ -105,8 +180,8 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
         effective_rank,
         fracture_index,
         invariant_redundancy,
-        overlap,
-        synergy,
+        pairwise_ablation_interaction,
+        synergy_proxy,
         taylor_delta,
     )
     from residual import ResidualAdapter, ResidualConfig
@@ -145,7 +220,9 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
                 ids, modify_fn=identity_modify, intercept_layers=adapter.layers
             )
             adapted_result = substrate.run_with_interception(
-                ids, modify_fn=adapter.modify_fn(params), intercept_layers=adapter.layers
+                ids,
+                modify_fn=adapter.modify_fn(params),
+                intercept_layers=adapter.layers,
             )
             return base_result.logits, adapted_result.logits, adapted_result
         clean = substrate.run_with_interception(
@@ -160,7 +237,9 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
             block = params.get(f"layer_{layer}")
             if block is None:
                 return hidden
-            return hidden + adapter.scale * (latent[layer] @ block["B"]).astype(hidden.dtype)
+            return hidden + adapter.scale * (latent[layer] @ block["B"]).astype(
+                hidden.dtype
+            )
 
         adapted_result = substrate.run_with_interception(
             ids, modify_fn=modify, intercept_layers=adapter.layers
@@ -185,7 +264,9 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
                 block = p.get(f"layer_{layer}")
                 if block is None:
                     return hidden
-                return hidden + adapter.scale * (latent[layer] @ block["B"]).astype(hidden.dtype)
+                return hidden + adapter.scale * (latent[layer] @ block["B"]).astype(
+                    hidden.dtype
+                )
 
             adapted = substrate.run_with_interception(
                 ids, modify_fn=modify, intercept_layers=adapter.layers
@@ -199,35 +280,48 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
         batches = make_eval_set(blocks, training.batch_size, training.eval_batches)
         batches_by_domain[domain.name] = batches
         rows = []
+        conf_sums = []
+        acc_sums = []
+        count_sums = []
         for ids in batches:
             start = time.perf_counter()
             base, adapted, _ = deployed(ids)
             jax.block_until_ready(adapted)
             latency.append(time.perf_counter() - start)
+            c_sum, a_sum, cnt = calibration_stats(adapted, ids)
+            conf_sums.append(c_sum)
+            acc_sums.append(a_sum)
+            count_sums.append(cnt)
             rows.append(
                 (
                     float(substrate.compute_loss(adapted, ids, losses=("CE",))),
                     float(token_accuracy(adapted, ids)),
-                    float(expected_calibration_error(adapted, ids)),
                     float(kl_to_base(base, adapted)),
                 )
             )
         values = np.asarray(rows, dtype=float)
+        if conf_sums:
+            pooled_conf = jnp.sum(jnp.stack(conf_sums), axis=0)
+            pooled_acc = jnp.sum(jnp.stack(acc_sums), axis=0)
+            pooled_cnt = jnp.sum(jnp.stack(count_sums), axis=0)
+            pooled_ece = float(ece_from_stats(pooled_conf, pooled_acc, pooled_cnt))
+        else:
+            pooled_ece = 0.0
         metrics_by_domain[domain.name] = {
-            "loss": float(values[:, 0].mean()),
-            "ppl": float(np.exp(values[:, 0].mean())),
-            "token_accuracy": float(values[:, 1].mean()),
-            "ece": float(values[:, 2].mean()),
-            "kl": float(values[:, 3].mean()),
+            "loss": float(values[:, 0].mean()) if len(values) else 0.0,
+            "ppl": float(np.exp(values[:, 0].mean())) if len(values) else 0.0,
+            "token_accuracy": float(values[:, 1].mean()) if len(values) else 0.0,
+            "ece": pooled_ece,
+            "kl": float(values[:, 2].mean()) if len(values) else 0.0,
         }
 
     gradients = {}
     for name, batches in batches_by_domain.items():
         if not batches:
             continue
-        gradients[name] = jax.grad(
-            lambda p, batch=batches[0]: loss_for(p, batch)
-        )(params)
+        gradients[name] = jax.grad(lambda p, batch=batches[0]: loss_for(p, batch))(
+            params
+        )
     conflict = {}
     names = list(gradients)
     for i, left in enumerate(names):
@@ -243,71 +337,178 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
         "invariant_redundancy": {},
         "fracture_index": {},
         "overlap": {},
+        "overlap_matrices": {},
+        "semantic_overlap": {},
         "taylor_delta": {},
         "synergy": {},
+        "synergy_proxy": {},
+        "measured_synergy": {},
+        "synergy_validation": {},
         "cross_domain_conflict": conflict,
     }
-    ablation_by_domain: dict[str, dict[str, float]] = {}
+    ablation_by_domain: dict[str, dict[str, list[float]]] = {}
     for layer_name, block in params.items():
         if not layer_name.startswith("layer_"):
             continue
         a, b = block["A"], block["B"]
+        num_atoms = int(b.shape[0])
         representation["effective_rank"][layer_name] = float(effective_rank(a @ b))
         representation["invariant_redundancy"][layer_name] = float(
             invariant_redundancy(a, b)
         )
-        atom_effects: dict[str, float] = {}
-        for atom in range(int(b.shape[0])):
+        # 1. Compute per-domain atom ablation effects
+        # Same residual component definitions across all domains (atoms 0..num_atoms-1)
+        layer_domain_effects: dict[str, list[float]] = {d.name: [] for d in domains}
+        for atom in range(num_atoms):
             ablated = {key: dict(value_map) for key, value_map in params.items()}
             ablated[layer_name]["B"] = b.at[atom].set(jnp.zeros_like(b[atom]))
-            effects = []
-            for domain_name, batches in batches_by_domain.items():
+            for domain in domains:
+                batches = batches_by_domain.get(domain.name, ())
                 if batches:
                     full = float(loss_for(params, batches[0]))
                     ablated_loss = float(loss_for(ablated, batches[0]))
-                    effects.append((domain_name, ablated_loss - full))
-            atom_effects[str(atom)] = float(np.mean([effect for _, effect in effects])) if effects else 0.0
-        contributions = jnp.asarray([abs(value) for value in atom_effects.values()])
-        representation["fracture_index"][layer_name] = float(fracture_index(contributions))
+                    layer_domain_effects[domain.name].append(ablated_loss - full)
+                else:
+                    layer_domain_effects[domain.name].append(0.0)
+
+        ablation_by_domain[layer_name] = layer_domain_effects
+
+        # 2. Fracture index per domain and mean across domains
+        # Normalize contributions separately for each domain
+        domain_fractures = [
+            float(fracture_index(jnp.asarray([abs(e) for e in effects])))
+            for effects in layer_domain_effects.values()
+            if effects
+        ]
+        representation["fracture_index"][layer_name] = (
+            float(np.mean(domain_fractures)) if domain_fractures else 0.0
+        )
+
+        # 3. Calculate overlap between domains within each layer
+        # Retain per-domain overlap matrices
+        layer_overlap = compute_domain_overlap(layer_domain_effects)
+        representation["overlap"][layer_name] = layer_overlap
+        representation["overlap_matrices"][layer_name] = layer_overlap
+
+        # 4. Semantic / category label overlap when available
+        semantic_cats = config.get("semantic_categories")
+        if semantic_cats and isinstance(semantic_cats, dict):
+            cat_effects: dict[str, list[float]] = {}
+            for cat_name, dom_list in semantic_cats.items():
+                matching = [
+                    layer_domain_effects[d]
+                    for d in dom_list
+                    if d in layer_domain_effects
+                ]
+                if matching:
+                    cat_effects[cat_name] = list(np.mean(matching, axis=0))
+            if len(cat_effects) >= 2:
+                representation["semantic_overlap"][layer_name] = (
+                    compute_semantic_overlap(cat_effects)
+                )
+            else:
+                representation["semantic_overlap"][layer_name] = {
+                    "status": "unavailable",
+                    "reason": "insufficient categories with matching domains",
+                }
+        else:
+            representation["semantic_overlap"][layer_name] = {
+                "status": "unavailable",
+                "reason": "no category labels provided",
+            }
+
+        # 5. Taylor delta and Fisher
         layer_gradients = [
             gradients[name][layer_name]["B"]
             for name in names
             if layer_name in gradients[name]
         ]
         if layer_gradients:
-            mean_gradient = jnp.mean(jnp.stack(layer_gradients), axis=0)
-            fisher = mean_gradient**2
+            stacked_grads = jnp.stack(layer_gradients)
+            mean_gradient = jnp.mean(stacked_grads, axis=0)
+            fisher = jnp.mean(stacked_grads**2, axis=0)
             atom_taylor = [
                 taylor_delta(mean_gradient[i], fisher[i], -b[i])
-                for i in range(int(b.shape[0]))
+                for i in range(num_atoms)
             ]
-            atom_synergy = [
-                synergy(
-                    -b[i],
-                    -b[(i + 1) % int(b.shape[0])],
-                    fisher[i],
-                )
-                for i in range(int(b.shape[0]))
-            ]
+            metric_g = jnp.mean(fisher, axis=0)
         else:
             atom_taylor = [jnp.asarray(0.0)]
-            atom_synergy = [jnp.asarray(0.0)]
+            metric_g = jnp.ones(int(b.shape[1]), dtype=jnp.float32)
+
         representation["taylor_delta"][layer_name] = float(
             jnp.sum(jnp.asarray(atom_taylor))
         )
-        representation["synergy"][layer_name] = float(
-            jnp.mean(jnp.asarray(atom_synergy))
-        )
-        ablation_by_domain[layer_name] = atom_effects
-    layers = list(ablation_by_domain)
-    for i, left in enumerate(layers):
-        for right in layers[i + 1 :]:
-            representation["overlap"][f"{left}:{right}"] = float(
-                overlap(
-                    jnp.asarray(list(ablation_by_domain[left].values())),
-                    jnp.asarray(list(ablation_by_domain[right].values())),
+
+        # 6. Metric-weighted interaction proxy: Syn_proxy(i, j) = delta_h_i^T G delta_h_j
+        proxy_pairs: dict[str, float] = {}
+        for i in range(num_atoms):
+            for j in range(i + 1, num_atoms):
+                delta_i = -b[i]
+                delta_j = -b[j]
+                proxy_pairs[f"{i}:{j}"] = float(
+                    synergy_proxy(delta_i, delta_j, metric_g)
                 )
-            )
+
+        # 7. Measured pairwise ablation on top atoms (up to 8 atoms -> up to 28 pairs)
+        top_atoms = sorted(
+            range(num_atoms),
+            key=lambda a: float(
+                np.mean([abs(layer_domain_effects[dn][a]) for dn in names])
+            ),
+            reverse=True,
+        )[: min(num_atoms, 8)]
+
+        measured_pairs: dict[str, float] = {}
+        if len(top_atoms) >= 2 and names:
+            eval_batch = batches_by_domain[names[0]][0]
+            loss_full = float(loss_for(params, eval_batch))
+            atom_single_losses: dict[int, float] = {}
+            for atom_i in top_atoms:
+                ab_i = {k: dict(v) for k, v in params.items()}
+                ab_i[layer_name]["B"] = b.at[atom_i].set(jnp.zeros_like(b[atom_i]))
+                atom_single_losses[atom_i] = float(loss_for(ab_i, eval_batch))
+
+            for idx_i, atom_i in enumerate(top_atoms):
+                loss_i = atom_single_losses[atom_i]
+                for atom_j in top_atoms[idx_i + 1 :]:
+                    loss_j = atom_single_losses[atom_j]
+                    ab_ij = {k: dict(v) for k, v in params.items()}
+                    ab_ij[layer_name]["B"] = b.at[atom_i].set(0.0).at[atom_j].set(0.0)
+                    loss_ij = float(loss_for(ab_ij, eval_batch))
+                    s_meas = float(
+                        pairwise_ablation_interaction(
+                            loss_full, loss_i, loss_j, loss_ij
+                        )
+                    )
+                    measured_pairs[f"{atom_i}:{atom_j}"] = s_meas
+
+        # 8. Validate proxy against measured pairwise ablations
+        common_pairs = [k for k in measured_pairs if k in proxy_pairs]
+        if len(common_pairs) >= 3:
+            p_vals = [proxy_pairs[k] for k in common_pairs]
+            m_vals = [measured_pairs[k] for k in common_pairs]
+            val_corr = _spearman_corr(p_vals, m_vals)
+        else:
+            val_corr = None
+
+        representation["synergy_proxy"][layer_name] = {
+            "mean": float(np.mean(list(proxy_pairs.values()))) if proxy_pairs else 0.0,
+            "pairs": proxy_pairs,
+        }
+        representation["measured_synergy"][layer_name] = {
+            "mean": (
+                float(np.mean(list(measured_pairs.values()))) if measured_pairs else 0.0
+            ),
+            "pairs": measured_pairs,
+        }
+        representation["synergy_validation"][layer_name] = {
+            "spearman_correlation": val_corr,
+            "num_pairs": len(common_pairs),
+        }
+        representation["synergy"][layer_name] = (
+            float(np.mean(list(proxy_pairs.values()))) if proxy_pairs else 0.0
+        )
     peak_bytes = None
     for device in jax.devices():
         stats = device.memory_stats()
@@ -319,15 +520,23 @@ def _load_deployed_metrics(run: dict[str, Any], result: dict[str, Any]) -> dict[
         "representation": representation,
         "ops": {
             "inference_latency_mean_s": float(np.mean(latency)) if latency else None,
-            "inference_latency_p95_s": float(np.percentile(latency, 95)) if latency else None,
+            "inference_latency_p95_s": (
+                float(np.percentile(latency, 95)) if latency else None
+            ),
             "peak_memory_bytes": peak_bytes,
         },
-        "anchor_kl": {"status": "unavailable", "reason": "anchor dataset not configured"},
+        "anchor_kl": {
+            "status": "unavailable",
+            "reason": "anchor dataset not configured",
+        },
         "heldout_transfer": {
             "status": "unavailable",
             "reason": "held-out datasets not configured",
         },
-        "joint_gap": {"status": "unavailable", "reason": "joint protocol not implemented"},
+        "joint_gap": {
+            "status": "unavailable",
+            "reason": "joint protocol not implemented",
+        },
         "symbolic_retrieval": {"status": "excluded", "reason": "A4 not implemented"},
     }
 
@@ -384,11 +593,11 @@ def _set_rank(config: dict[str, Any], rank: int) -> None:
 
 def _validate_domains(config: dict[str, Any], source: Path) -> None:
     domains = config.get("domains")
-    names = tuple(
-        domain.get("name")
-        for domain in domains
-        if isinstance(domain, dict)
-    ) if isinstance(domains, list) else ()
+    names = (
+        tuple(domain.get("name") for domain in domains if isinstance(domain, dict))
+        if isinstance(domains, list)
+        else ()
+    )
     if names != EXPECTED_DOMAINS:
         raise ValueError(
             f"{source} must define domains in order {list(EXPECTED_DOMAINS)}, "
@@ -410,7 +619,9 @@ def expand_specs(
         raise ValueError("At least one seed is required.")
     unknown = sorted(set(methods) - set(DEFAULT_CONFIGS))
     if unknown:
-        raise ValueError(f"Unknown methods: {unknown}; choose from {sorted(DEFAULT_CONFIGS)}")
+        raise ValueError(
+            f"Unknown methods: {unknown}; choose from {sorted(DEFAULT_CONFIGS)}"
+        )
     if not k_values or any(k < 0 for k in k_values):
         raise ValueError("k_values must contain non-negative integers.")
     ranks = rank_values or [16]
@@ -419,7 +630,9 @@ def expand_specs(
     specs: list[RunSpec] = []
     for method in methods:
         for seed in seeds:
-            ks = k_values if method == "a3" else [None]
+            ks: list[int | None] = (
+                [int(k) for k in k_values] if method == "a3" else [None]
+            )
             for rank in ranks:
                 for k in ks:
                     suffix = f"-r{rank}" + (f"-k{k}" if k is not None else "")
@@ -540,16 +753,28 @@ def train_manifest(
         )
         run_dir = Path(spec.output_dir) / spec.run_name
         results = run_dir / "results.json"
+        config = _materialize(
+            spec, config_root, epochs if epochs is not None else manifest["epochs"]
+        )
+        config_bytes = config.read_bytes()
+        config_sha = _sha256(config_bytes)
         if resume and results.is_file():
-            _update_manifest(manifest_path, spec.run_id, status="complete", results=str(results))
+            _update_manifest(
+                manifest_path,
+                spec.run_id,
+                status="complete",
+                results=str(results),
+                materialized_config=str(config),
+                config_sha=config_sha,
+            )
             continue
-        config = _materialize(spec, config_root, epochs if epochs is not None else manifest["epochs"])
         run_dir.parent.mkdir(parents=True, exist_ok=True)
         _update_manifest(
             manifest_path,
             spec.run_id,
             status="running",
             materialized_config=str(config),
+            config_sha=config_sha,
             started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
         log_path = output_dir / "logs" / f"{spec.run_id}.log"
@@ -573,7 +798,9 @@ def train_manifest(
             )
             try:
                 log_tail = "\n".join(
-                    log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+                    log_path.read_text(encoding="utf-8", errors="replace").splitlines()[
+                        -40:
+                    ]
                 )
             except OSError as exc:
                 log_tail = f"Unable to read failure log: {exc}"
@@ -582,7 +809,9 @@ def train_manifest(
                 f"see {log_path}\n\nLast log lines:\n{log_tail}"
             )
         if not results.is_file():
-            raise RuntimeError(f"{spec.run_id} exited successfully but wrote no results.json")
+            raise RuntimeError(
+                f"{spec.run_id} exited successfully but wrote no results.json"
+            )
         _update_manifest(
             manifest_path,
             spec.run_id,
@@ -621,9 +850,7 @@ def _result_record(raw: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         "mean_forgetting": (
-            raw.get("mean_forgetting", [])[-1]
-            if raw.get("mean_forgetting")
-            else None
+            raw.get("mean_forgetting", [])[-1] if raw.get("mean_forgetting") else None
         ),
         "steps": raw.get("steps"),
         "tokens": raw.get("tokens"),
@@ -654,15 +881,15 @@ def evaluate_manifest(output_dir: Path) -> dict[str, Any]:
                 "reason": f"{type(exc).__name__}: {exc}",
             }
         records.append(record)
-    by_method_rank_seed: dict[str, dict[int, dict[int, float]]] = {}
+    by_group: dict[tuple[str, int, int | None], dict[int, float]] = {}
     for record in records:
         loss = record.get("loss_improvement")
         if loss is not None:
-            by_method_rank_seed.setdefault(record["method"], {}).setdefault(
-                record["seed"], {}
-            )[record["rank"]] = loss
+            group_key = (record["method"], record["seed"], record.get("k"))
+            by_group.setdefault(group_key, {})[record["rank"]] = loss
     for record in records:
-        curve_data = by_method_rank_seed.get(record["method"], {}).get(record["seed"], {})
+        group_key = (record["method"], record["seed"], record.get("k"))
+        curve_data = by_group.get(group_key, {})
         if len(curve_data) >= 2:
             record["residual_compressibility"] = {
                 str(rank): float(value)
@@ -696,7 +923,7 @@ def evaluate_manifest(output_dir: Path) -> dict[str, Any]:
     return evaluation
 
 
-def report_manifest(output_dir: Path) -> Path:
+def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
     evaluation = _read_json(output_dir / "evaluation.json")
     by_method: dict[str, list[dict[str, Any]]] = {}
     for record in evaluation["records"]:
@@ -711,8 +938,12 @@ def report_manifest(output_dir: Path) -> Path:
         "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for method, records in sorted(by_method.items()):
-        losses = [r["final_mean_loss"] for r in records if r["final_mean_loss"] is not None]
-        forgetting = [r["mean_forgetting"] for r in records if r["mean_forgetting"] is not None]
+        losses = [
+            r["final_mean_loss"] for r in records if r["final_mean_loss"] is not None
+        ]
+        forgetting = [
+            r["mean_forgetting"] for r in records if r["mean_forgetting"] is not None
+        ]
         rates = [
             r["tokens"] / (r["steps"] * r["mean_step_time"])
             for r in records
@@ -723,13 +954,14 @@ def report_manifest(output_dir: Path) -> Path:
             for r in records
             if r.get("residual_compressibility")
         ]
-        c_rank = (
-            sum(float(curve.get("4", 0.0)) for curve in curves) / len(curves)
-            if curves
-            else None
-        )
+        target_rank = str(report_rank)
+        valid_c = [
+            float(curve[target_rank]) for curve in curves if target_rank in curve
+        ]
+        c_rank = sum(valid_c) / len(valid_c) if valid_c else None
         deployed = [
-            r.get("deployed_evaluation", {}) for r in records
+            r.get("deployed_evaluation", {})
+            for r in records
             if r.get("deployed_evaluation", {}).get("status") == "measured"
         ]
         mean = sum(losses) / len(losses) if losses else None

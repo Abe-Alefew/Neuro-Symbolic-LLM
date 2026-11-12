@@ -24,10 +24,10 @@ def _top(retrieved: Sequence[Hashable], m: int) -> list[Hashable]:
 
 def precision_at_m(
     retrieved: Sequence[Hashable], relevant: Collection[Hashable], m: int
-) -> float | None:
+) -> float:
     top = _top(retrieved, m)
     if not top:
-        return None
+        return 0.0
     rel = set(relevant)
     return sum(1 for item in top if item in rel) / len(top)
 
@@ -106,6 +106,7 @@ def retrieval_report(
         "recall": {},
         "f1": {},
         "hit_rate": {},
+        "coverage": {},
         "skipped": {"precision": {}, "recall": {}, "f1": {}, "hit_rate": {}, "mrr": 0},
     }
     functions = {
@@ -120,6 +121,9 @@ def retrieval_report(
             mean, skipped = _mean_skipping_none(values)
             report[name][f"@{m}"] = mean
             report["skipped"][name][f"@{m}"] = skipped
+    for m in cuts:
+        cov = sum(1 for r in retrieved_lists if len(_top(r, m)) > 0) / len(retrieved_lists)
+        report["coverage"][f"@{m}"] = float(cov)
     mrr_values = [reciprocal_rank(r, rel) for r, rel in zip(retrieved_lists, relevant_sets, strict=True)]
     mrr, skipped = _mean_skipping_none(mrr_values)
     report["mrr"] = mrr

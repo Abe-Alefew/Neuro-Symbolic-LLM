@@ -49,9 +49,10 @@ def test_f1_and_hit_and_mrr() -> None:
 
 
 def test_undefined_values_are_none_not_nan() -> None:
-    assert precision_at_m([], RELEVANT, 4) is None
+    assert precision_at_m([], RELEVANT, 4) == 0.0
     assert recall_at_m(RETRIEVED, set(), 4) is None
-    assert f1_at_m([], RELEVANT, 4) is None
+    assert f1_at_m([], RELEVANT, 4) == 0.0
+    assert f1_at_m(RETRIEVED, set(), 4) is None
     assert hit_at_m(RETRIEVED, set(), 4) is None
     assert reciprocal_rank(RETRIEVED, set()) is None
 
@@ -76,11 +77,24 @@ def test_retrieval_report_skips_undefined_and_counts_them() -> None:
     assert report["precision"]["@4"] == pytest.approx((0.5 + 0.0 + 0.5) / 3)
     assert report["recall"]["@4"] == pytest.approx(1.0)
     assert report["skipped"]["recall"]["@4"] == 1
+    assert report["coverage"]["@4"] == pytest.approx(1.0)
     assert all(
         v is None or math.isfinite(v)
-        for metric in ("precision", "recall", "f1", "hit_rate")
+        for metric in ("precision", "recall", "f1", "hit_rate", "coverage")
         for v in report[metric].values()
     )
+
+
+def test_empty_retrievals_score_zero_and_report_coverage() -> None:
+    report = retrieval_report(
+        [RETRIEVED, [], ["x"]],
+        [RELEVANT, RELEVANT, RELEVANT],
+        cutoffs=(1, 4),
+    )
+    assert report["n_examples"] == 3
+    assert report["precision"]["@4"] == pytest.approx((0.5 + 0.0 + 0.0) / 3)
+    assert report["skipped"]["precision"]["@4"] == 0
+    assert report["coverage"]["@4"] == pytest.approx(2 / 3)
 
 
 def test_retrieval_report_validates_inputs() -> None:

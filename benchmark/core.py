@@ -15,35 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import yaml
-
-from frozenllm.substrate import FrozenSubstrate, identity_modify
-from metrics.performance import (
-    calibration_stats,
-    ece_from_stats,
-    kl_to_base,
-    token_accuracy,
-)
-from metrics.representation import (
-    effective_rank,
-    fracture_index,
-    invariant_redundancy,
-    overlap,
-    pairwise_ablation_interaction,
-    synergy_proxy,
-    taylor_delta,
-)
-from residual import ResidualAdapter, ResidualConfig
-from stages.results import load_params
-from stages.stage_base import (
-    DomainConfig,
-    TrainingConfig,
-    load_token_blocks,
-    make_eval_set,
-)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIGS = {
@@ -146,6 +119,11 @@ def compute_domain_overlap(
     domain_atom_effects: dict[str, list[float] | Any],
     eps: float = 1e-8,
 ) -> dict[str, float]:
+    import jax
+    import jax.numpy as jnp
+
+    from metrics.representation import overlap
+
     domain_names = sorted(domain_atom_effects)
     normalized: dict[str, jax.Array] = {}
     for name in domain_names:
@@ -175,6 +153,39 @@ def compute_semantic_overlap(
 def _load_deployed_metrics(
     run: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
+    """Evaluate the final checkpoint with the common deployed function.
+
+    Heavy JAX/model imports are intentionally local so ``plan`` remains usable
+    in lightweight environments.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from frozenllm.substrate import FrozenSubstrate, identity_modify
+    from metrics.performance import (
+        calibration_stats,
+        ece_from_stats,
+        kl_to_base,
+        token_accuracy,
+    )
+    from metrics.representation import (
+        effective_rank,
+        fracture_index,
+        gradient_conflict,
+        invariant_redundancy,
+        pairwise_ablation_interaction,
+        synergy_proxy,
+        taylor_delta,
+    )
+    from residual import ResidualAdapter, ResidualConfig
+    from stages.results import load_params
+    from stages.stage_base import (
+        DomainConfig,
+        TrainingConfig,
+        load_token_blocks,
+        make_eval_set,
+    )
+
     config_path = Path(run.get("materialized_config", run["config"]))
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     training = TrainingConfig.from_dict(config["training"])
@@ -308,8 +319,6 @@ def _load_deployed_metrics(
     names = list(gradients)
     for i, left in enumerate(names):
         for right in names[i + 1 :]:
-            from metrics.representation import gradient_conflict
-
             conflict[f"{left}:{right}"] = float(
                 gradient_conflict(gradients[left], gradients[right])
             )
@@ -998,39 +1007,59 @@ def _report_metric_value(record: dict[str, Any], metric: str, rank: int) -> list
     elif metric == "fracture":
         value = representation.get("fracture_index")
     elif metric == "mixed_curvature":
-        value = representation.get("taylor_delta")
+        value = None
     elif metric == "category_alignment":
         value = representation.get("semantic_overlap")
     elif metric == "ablation_fidelity":
+        value = None
+    elif metric == "taylor_delta":
+        value = representation.get("taylor_delta")
+    elif metric == "synergy_validation":
         value = representation.get("synergy_validation")
+    elif metric == "synergy":
+        value = representation.get("synergy")
     else:
         value = None
     return _numeric_values(value)
+
+
+def _format_config_label(method: str, rank: int | None, k: int | None) -> str:
+    m = method.upper()
+    parts: list[str] = []
+    if rank is not None:
+        parts.append(f"r={rank}")
+    if k is not None:
+        parts.append(f"K={k}")
+    if parts:
+        return f"{m} ({', '.join(parts)})"
+    return m
 
 
 def _append_metric_table(
     lines: list[str],
     title: str,
     metric_specs: list[tuple[str, str]],
-    by_method: dict[str, list[dict[str, Any]]],
+    configs: list[tuple[str, int | None, int | None]],
+    by_config: dict[tuple[str, int | None, int | None], list[dict[str, Any]]],
     report_rank: int,
 ) -> None:
+    labels = [_format_config_label(m, r, k) for m, r, k in configs]
     lines.extend(
         [
             "",
             f"## {title}",
             "",
-            "| Metric | A1 | A2 | A3 | Coverage |",
-            "|---|---:|---:|---:|---|",
+            f"| Metric | {' | '.join(labels)} | Coverage |",
+            f"|---|{'---:|' * len(labels)}---|",
         ]
     )
     for label, key in metric_specs:
         cells: list[str] = []
         measured = False
-        for method in ("a1", "a2", "a3"):
+        for cfg in configs:
             values = [
                 value
-                for record in by_method.get(method, [])
+                for record in by_config.get(cfg, [])
                 for value in _report_metric_value(record, key, report_rank)
             ]
             if values:
@@ -1045,7 +1074,26 @@ def _append_metric_table(
 def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
     evaluation = _read_json(output_dir / "evaluation.json")
     by_method: dict[str, list[dict[str, Any]]] = {}
+    by_config: dict[tuple[str, int | None, int | None], list[dict[str, Any]]] = {}
     for record in evaluation["records"]:
+        by_method.setdefault(record["method"], []).append(record)
+        cfg_key = (
+            str(record.get("method", "unknown")).lower(),
+            record.get("rank"),
+            record.get("k"),
+        )
+        by_config.setdefault(cfg_key, []).append(record)
+
+    def _config_sort_key(
+        cfg: tuple[str, int | None, int | None]
+    ) -> tuple[int, int, int]:
+        m, r, k = cfg
+        m_order = {"a1": 1, "a2": 2, "a3": 3}.get(m, 99)
+        return (m_order, r if r is not None else 0, k if k is not None else 0)
+
+    configs = sorted(by_config.keys(), key=_config_sort_key)
+    if not configs:
+        configs = [("a1", None, None), ("a2", None, None), ("a3", None, None)]
         by_method.setdefault(record["method"], []).append(record)
     lines = [
         "# Stage A A1/A2/A3 Benchmark Report",
@@ -1116,7 +1164,8 @@ def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
             ("Category alignment and naturality", "category_alignment"),
             ("Interpretability and ablation fidelity", "ablation_fidelity"),
         ],
-        by_method,
+        configs,
+        by_config,
         report_rank,
     )
     _append_metric_table(
@@ -1136,7 +1185,8 @@ def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
             ("Symbolic retrieval precision / recall", "unavailable"),
             ("Long-range coherence", "unavailable"),
         ],
-        by_method,
+        configs,
+        by_config,
         report_rank,
     )
     lines.extend(

@@ -38,6 +38,20 @@ def test_mean_forgetting_accuracy() -> None:
     assert float(accuracy_forgetting(ACC, 2)) == pytest.approx((0.30 + 0.05) / 2)
 
 
+def test_mean_forgetting_nan_aware() -> None:
+    acc = np.array(
+        [
+            [np.nan, 0.20, 0.10],
+            [np.nan, 0.80, 0.15],
+            [np.nan, 0.75, 0.90],
+        ]
+    )
+    assert np.isnan(float(mean_forgetting(acc, 1)))
+    assert np.isnan(float(accuracy_forgetting(acc, 1)))
+    assert float(mean_forgetting(acc, 2)) == pytest.approx(0.05)
+    assert float(accuracy_forgetting(acc, 2)) == pytest.approx(0.05)
+
+
 def test_classification_metrics() -> None:
     metrics = classification_metrics(["a", "a", "b", "b"], ["a", "b", "b", "b"])
     assert metrics["accuracy"] == pytest.approx(0.75)

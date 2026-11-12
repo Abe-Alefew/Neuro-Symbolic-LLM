@@ -224,6 +224,40 @@ def test_cr_reports_na_when_target_rank_absent(tmp_path: Path) -> None:
         assert f"| {metric} |" in report
 
 
+def test_report_groups_by_configuration_and_shows_na_for_unimplemented(
+    tmp_path: Path,
+) -> None:
+    evaluation = {
+        "completed_runs": 4,
+        "planned_runs": 4,
+        "domains": ["d1"],
+        "records": [
+            {"method": "a1", "rank": 16, "final_mean_loss": 2.0},
+            {"method": "a2", "rank": 16, "final_mean_loss": 1.9},
+            {"method": "a3", "rank": 16, "k": 1, "final_mean_loss": 1.8},
+            {"method": "a3", "rank": 16, "k": 4, "final_mean_loss": 1.7},
+        ],
+    }
+    _write_json(tmp_path / "evaluation.json", evaluation)
+    report_path = report_manifest(tmp_path, report_rank=16)
+    report = report_path.read_text(encoding="utf-8")
+    assert (
+        "| Metric | A1 (r=16) | A2 (r=16) | A3 (r=16, K=1) | A3 (r=16, K=4) | Coverage |"
+        in report
+    )
+    # Rows not implemented must show N/A and not measured
+    assert (
+        "| Mixed curvature coupling | N/A | N/A | N/A | N/A | not measured |"
+        in report
+    )
+    assert (
+        "| Interpretability and ablation fidelity | N/A | N/A | N/A | N/A | not measured |"
+        in report
+    )
+    # Validation loss should show the values
+    assert "| Validation loss | 2 | 1.9 | 1.8 | 1.7 | measured |" in report
+
+
 def test_summary_reports_task_accuracy_and_accuracy_forgetting() -> None:
     summary = summarize(
         ["d1", "d2"],

@@ -94,6 +94,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--eval-batches", type=int, default=None)
     parser.add_argument("--split", type=str, default="test")
+    parser.add_argument(
+        "--runtime-source",
+        choices=("separate", "stories"),
+        default=None,
+        help="Override runtime.source from the shared dataset configuration.",
+    )
 
     parser.add_argument(
         "--energy-curve",
@@ -548,6 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_data = load_runtime_data(
         config_path=DEFAULT_RUNTIME_CONFIG,
         tokenizer=substrate.tokenizer,
+        source=args.runtime_source,
         sequence_length=train_cfg.seq_len,
         batch_size=train_cfg.batch_size,
         eval_batches=eval_batches,

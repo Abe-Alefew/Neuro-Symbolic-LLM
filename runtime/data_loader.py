@@ -634,6 +634,7 @@ def load_runtime_data(
     config_path: str | Path,
     tokenizer: Any,
     *,
+    source: str | None = None,
     sequence_length: int = 128,
     batch_size: int = 16,
     eval_batches: int = 8,
@@ -646,8 +647,11 @@ def load_runtime_data(
     runtime_config = config["runtime"]
     datasets_config = config["datasets"]
 
-    mode = runtime_config["source"]
+    mode = runtime_config["source"] if source is None else source
     seed = int(runtime_config.get("seed", 42))
+
+    if mode not in {"separate", "stories"}:
+        raise ValueError("source must be 'separate' or 'stories'.")
 
     if sequence_length < 2:
         raise ValueError("sequence_length must be >= 2 for next-token training.")

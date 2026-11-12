@@ -9,14 +9,22 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
+import yaml
 
 from benchmark.core import (
+    BENCHMARK_RUNTIME_SOURCE,
+    DEFAULT_CONFIGS,
+    DEFAULT_RUNTIME_CONFIG,
+    _command,
+    _filter_adapter_params,
+    _materialize,
     _read_json,
     _spearman_corr,
     _write_json,
     compute_domain_overlap,
     compute_semantic_overlap,
     evaluate_manifest,
+    expand_specs,
     make_manifest,
     report_manifest,
     train_manifest,
@@ -31,6 +39,7 @@ from metrics.representation import (
     synergy,
     synergy_proxy,
 )
+from runtime import data_loader
 from stages.stage_base import summarize
 
 
@@ -210,11 +219,9 @@ def test_cr_reports_na_when_target_rank_absent(tmp_path: Path) -> None:
         "Interpretability and ablation fidelity",
         "Validation loss",
         "Perplexity",
-        "Task accuracy",
-        "Task macro-F1",
+        "Task accuracy / F1",
         "Calibration error",
         "Forgetting",
-        "Accuracy-based forgetting",
         "Held-out transfer",
         "Sequential versus joint",
         "Anchor KL drift",
@@ -256,26 +263,6 @@ def test_report_groups_by_configuration_and_shows_na_for_unimplemented(
     )
     # Validation loss should show the values
     assert "| Validation loss | 2 | 1.9 | 1.8 | 1.7 | measured |" in report
-
-
-def test_summary_reports_task_accuracy_and_accuracy_forgetting() -> None:
-    summary = summarize(
-        ["d1", "d2"],
-        {"d1": {"base_loss": 3.0}, "d2": {"base_loss": 3.0}},
-        [
-            {
-                "d1": {"loss": 2.0, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.9, "task_f1": 0.8},
-                "d2": {"loss": 2.0, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.8, "task_f1": 0.7},
-            },
-            {
-                "d1": {"loss": 2.2, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.7, "task_f1": 0.6},
-                "d2": {"loss": 1.8, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.85, "task_f1": 0.75},
-            },
-        ],
-    )
-    assert summary["task_accuracy"] == [[0.9, 0.8], [0.7, 0.85]]
-    assert summary["task_f1"] == [[0.8, 0.7], [0.6, 0.75]]
-    assert summary["accuracy_forgetting"] == [None, pytest.approx(0.2)]
 
 
 def test_summarize_mixed_task_availability_nan_aware() -> None:
@@ -494,6 +481,79 @@ def test_expand_specs_and_make_manifest(tmp_path: Path) -> None:
     )
     assert len(manifest["runs"]) == 6
     assert (tmp_path / "manifest.json").is_file()
+
+
+def test_real_default_configs_materialize(tmp_path: Path) -> None:
+    specs = expand_specs(
+        tmp_path,
+        seeds=[0],
+        methods=["a1", "a2", "a3"],
+        k_values=[4],
+        rank_values=[4],
+    )
+
+    assert {Path(spec.config) for spec in specs} == set(DEFAULT_CONFIGS.values())
+    for spec in specs:
+        materialized = _materialize(spec, tmp_path, epochs=1)
+        config = yaml.safe_load(materialized.read_text(encoding="utf-8"))
+        assert "domains" not in config
+        assert config["adapter"]["rank"] == 4
+        assert config["training"]["epochs"] == 1
+
+
+def test_benchmark_commands_select_legal_runtime_datasets(tmp_path: Path) -> None:
+    specs = expand_specs(
+        tmp_path,
+        seeds=[0],
+        methods=["a1", "a2", "a3"],
+        k_values=[4],
+    )
+
+    for spec in specs:
+        command = _command(spec, tmp_path / "config.yaml")
+        source_index = command.index("--runtime-source") + 1
+        assert command[source_index] == BENCHMARK_RUNTIME_SOURCE == "separate"
+
+
+def test_runtime_source_override_ignores_yaml_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected: list[str] = []
+
+    def fake_separate(datasets, tokenizer, **kwargs):
+        selected.extend(
+            item["name"] for item in datasets if item.get("type") == "separate"
+        )
+        return (), {}, {}
+
+    def fail_stories(*args, **kwargs):
+        pytest.fail("stories loader should not be selected")
+
+    monkeypatch.setattr(data_loader, "build_separate_tasks", fake_separate)
+    monkeypatch.setattr(data_loader, "build_story_tasks", fail_stories)
+
+    runtime_data = data_loader.load_runtime_data(
+        DEFAULT_RUNTIME_CONFIG,
+        tokenizer=object(),
+        source="separate",
+        sequence_length=2,
+        batch_size=1,
+        eval_batches=1,
+    )
+
+    assert runtime_data.metadata["mode"] == "separate"
+    assert selected == ["eurlex", "ledgar", "scotus"]
+
+
+def test_deployed_evaluation_filters_a2_auxiliary_params() -> None:
+    layer_params = {"A": object(), "B": object()}
+    full_a2_params = {
+        "layer_5": layer_params,
+        "cpc_q_5": {"weight": object()},
+        "pred_layer_5": {"weight": object()},
+    }
+
+    assert _filter_adapter_params(full_a2_params) == {"layer_5": layer_params}
 
 
 def test_compressibility_unreliable_when_reference_not_better_than_base(

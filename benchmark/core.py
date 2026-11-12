@@ -19,10 +19,12 @@ import numpy as np
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RUNTIME_CONFIG = ROOT / "configs" / "runtime_datasets.yaml"
+BENCHMARK_RUNTIME_SOURCE = "separate"
 DEFAULT_CONFIGS = {
     "a1": ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml",
     "a2": ROOT / "configs" / "stage_A" / "a2_pc_inspired.yaml",
-    "a3": ROOT / "configs" / "stage_A" / "a3_true_pc.yaml",
+    "a3": ROOT / "configs" / "stage_A" / "a3_hybrid_pc.yaml",
 }
 RUNNERS = {
     "a1": ROOT / "experiments" / "run_stage_a1.py",
@@ -66,6 +68,7 @@ class RunSpec:
     run_name: str
     k: int | None = None
     rank: int = 16
+    runtime_source: str = BENCHMARK_RUNTIME_SOURCE
 
 
 def _sanitize_value(value: Any) -> Any:
@@ -178,31 +181,41 @@ def _load_deployed_metrics(
         taylor_delta,
     )
     from residual import ResidualAdapter, ResidualConfig
+    from runtime.data_loader import load_runtime_data
     from stages.results import load_params
-    from stages.stage_base import (
-        DomainConfig,
-        TrainingConfig,
-        load_token_blocks,
-        make_eval_set,
-    )
+    from stages.stage_base import TrainingConfig
 
     config_path = Path(run.get("materialized_config", run["config"]))
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    training = TrainingConfig.from_dict(config["training"])
-    substrate = FrozenSubstrate(training.model)
-    adapter = ResidualAdapter(
-        ResidualConfig.from_dict(config["adapter"]), substrate.architecture
-    )
+    training = TrainingConfig.from_dict(config.get("training") or {})
     checkpoint_dir = Path(run["output_dir"]) / run["run_name"] / "params"
     checkpoints = sorted(checkpoint_dir.glob("task_*.npz"))
     if not checkpoints:
         return {"status": "unavailable", "reason": "no checkpoint found"}
+    substrate = FrozenSubstrate(training.model)
+    adapter = ResidualAdapter(
+        ResidualConfig.from_dict(config["adapter"]), substrate.architecture
+    )
+    loaded_params = _filter_adapter_params(load_params(checkpoints[-1]))
     params = {
         layer: {name: jnp.asarray(value) for name, value in values.items()}
-        for layer, values in load_params(checkpoints[-1]).items()
+        for layer, values in loaded_params.items()
     }
     adapter.validate_params(params)
-    domains = [DomainConfig.from_dict(item) for item in config["domains"]]
+    runtime_data = load_runtime_data(
+        config_path=DEFAULT_RUNTIME_CONFIG,
+        tokenizer=substrate.tokenizer,
+        source=run.get("runtime_source", BENCHMARK_RUNTIME_SOURCE),
+        sequence_length=training.seq_len,
+        batch_size=training.batch_size,
+        eval_batches=training.eval_batches,
+        default_epochs=training.epochs,
+    )
+    domains = runtime_data.tasks
+    test_sets = runtime_data.get_test_sets(
+        training.batch_size,
+        training.eval_batches,
+    )
     metrics_by_domain: dict[str, dict[str, float]] = {}
     batches_by_domain: dict[str, tuple[jax.Array, ...]] = {}
     latency: list[float] = []
@@ -267,10 +280,7 @@ def _load_deployed_metrics(
         return substrate.compute_loss(adapted, ids, losses=("CE",))
 
     for domain in domains:
-        blocks = load_token_blocks(
-            substrate, domain, domain.test_split, training.seq_len
-        )
-        batches = make_eval_set(blocks, training.batch_size, training.eval_batches)
+        batches = test_sets[domain.name]
         batches_by_domain[domain.name] = batches
         rows = []
         conf_sums = []
@@ -529,6 +539,11 @@ def _config_fingerprint(config: dict[str, Any]) -> str:
     )
 
 
+def _filter_adapter_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Keep only deployable residual-adapter parameter blocks."""
+    return {name: block for name, block in params.items() if name.startswith("layer_")}
+
+
 def _compressibility_curve(deltas: dict[int, float]) -> dict[int, float]:
 
     return _compressibility_detail(deltas)["curve"] or {}
@@ -575,16 +590,25 @@ def _set_rank(config: dict[str, Any], rank: int) -> None:
     config.setdefault("adapter", {})["rank"] = rank
 
 
-def _validate_domains(config: dict[str, Any], source: Path) -> None:
-    domains = config.get("domains")
+def _validate_domains(
+    config: dict[str, Any],
+    source: Path,
+    runtime_source: str = BENCHMARK_RUNTIME_SOURCE,
+) -> None:
+    datasets = config.get("datasets")
     names = (
-        tuple(domain.get("name") for domain in domains if isinstance(domain, dict))
-        if isinstance(domains, list)
+        tuple(
+            dataset.get("name")
+            for dataset in datasets
+            if isinstance(dataset, dict) and dataset.get("type") == runtime_source
+        )
+        if isinstance(datasets, list)
         else ()
     )
     if names != EXPECTED_DOMAINS:
         raise ValueError(
-            f"{source} must define domains in order {list(EXPECTED_DOMAINS)}, "
+            f"{source} must define {runtime_source!r} datasets in order "
+            f"{list(EXPECTED_DOMAINS)}, "
             f"got {list(names)}"
         )
 
@@ -640,7 +664,10 @@ def expand_specs(
 def _materialize(spec: RunSpec, root: Path, epochs: int | None) -> Path:
     source = Path(spec.config)
     config = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
-    _validate_domains(config, source)
+    runtime_config = (
+        yaml.safe_load(DEFAULT_RUNTIME_CONFIG.read_text(encoding="utf-8")) or {}
+    )
+    _validate_domains(runtime_config, DEFAULT_RUNTIME_CONFIG, spec.runtime_source)
     _set_seed(config, spec.method, spec.seed)
     _set_rank(config, spec.rank)
     _set_epochs(config, epochs)
@@ -681,6 +708,8 @@ def make_manifest(
         "rank_values": rank_values or [16],
         "epochs": epochs,
         "domains": list(EXPECTED_DOMAINS),
+        "runtime_config": str(DEFAULT_RUNTIME_CONFIG),
+        "runtime_source": BENCHMARK_RUNTIME_SOURCE,
         "measured_metrics": list(MEASURED_METRICS),
         "runs": [{**asdict(spec), "status": "pending"} for spec in specs],
     }
@@ -709,6 +738,8 @@ def _command(spec: RunSpec, config: Path) -> list[str]:
         spec.output_dir,
         "--run-name",
         spec.run_name,
+        "--runtime-source",
+        spec.runtime_source,
     ]
     if spec.method == "a2":
         command.extend(["--arm", "full"])
@@ -734,6 +765,7 @@ def train_manifest(
             run_name=raw["run_name"],
             k=raw.get("k"),
             rank=raw.get("rank", 16),
+            runtime_source=raw.get("runtime_source", BENCHMARK_RUNTIME_SOURCE),
         )
         run_dir = Path(spec.output_dir) / spec.run_name
         results = run_dir / "results.json"
@@ -1091,10 +1123,14 @@ def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
         m_order = {"a1": 1, "a2": 2, "a3": 3}.get(m, 99)
         return (m_order, r if r is not None else 0, k if k is not None else 0)
 
-    configs = sorted(by_config.keys(), key=_config_sort_key)
-    if not configs:
-        configs = [("a1", None, None), ("a2", None, None), ("a3", None, None)]
-        by_method.setdefault(record["method"], []).append(record)
+    configs = list(by_config)
+    configured_methods = {method for method, _, _ in configs}
+    configs.extend(
+        (method, None, None)
+        for method in ("a1", "a2", "a3")
+        if method not in configured_methods
+    )
+    configs.sort(key=_config_sort_key)
     lines = [
         "# Stage A A1/A2/A3 Benchmark Report",
         "",

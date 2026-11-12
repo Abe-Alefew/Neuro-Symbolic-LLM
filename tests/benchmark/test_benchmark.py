@@ -19,7 +19,6 @@ from benchmark.core import (
     evaluate_manifest,
     make_manifest,
     report_manifest,
-    summarize,
     train_manifest,
 )
 from metrics.performance import (
@@ -32,6 +31,7 @@ from metrics.representation import (
     synergy,
     synergy_proxy,
 )
+from stages.stage_base import summarize
 
 
 def test_ece_finite_when_bins_are_empty() -> None:

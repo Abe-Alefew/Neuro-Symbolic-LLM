@@ -877,7 +877,7 @@ def evaluate_manifest(output_dir: Path) -> dict[str, Any]:
         record = _result_record(raw_result, run)
         try:
             record["deployed_evaluation"] = _load_deployed_metrics(run, raw_result)
-        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        except (ImportError, KeyError, OSError, RuntimeError, ValueError) as exc:
             record["deployed_evaluation"] = {
                 "status": "unavailable",
                 "reason": f"{type(exc).__name__}: {exc}",

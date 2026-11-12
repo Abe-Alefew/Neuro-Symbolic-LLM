@@ -52,6 +52,44 @@ def compressibility_curve(
     return {r: residual_compressibility(deltas[r], reference, eps) for r in ranks}
 
 
+MIN_REFERENCE_IMPROVEMENT = 0.02
+
+
+def guarded_compressibility(
+    deltas: Mapping[int, float],
+    min_reference: float = MIN_REFERENCE_IMPROVEMENT,
+) -> dict:
+    if min_reference <= 0:
+        raise ValueError(f"min_reference must be > 0, got {min_reference!r}")
+    clean = {
+        int(r): float(v)
+        for r, v in deltas.items()
+        if v is not None and float(v) == float(v) and abs(float(v)) != float("inf")
+    }
+    if any(r < 1 for r in clean):
+        raise ValueError("Ranks must be >= 1.")
+    out: dict = {
+        "status": "insufficient_ranks",
+        "reference_rank": None,
+        "reference_improvement": None,
+        "min_reference": min_reference,
+        "negative_ranks": sorted(r for r, v in clean.items() if v < 0),
+        "curve": None,
+    }
+    if len(clean) < 2:
+        return out
+    ref_rank = max(clean)
+    ref = clean[ref_rank]
+    out["reference_rank"] = ref_rank
+    out["reference_improvement"] = ref
+    if ref < min_reference:
+        out["status"] = "unreliable_reference"
+        return out
+    out["status"] = "ok"
+    out["curve"] = {r: clean[r] / ref for r in sorted(clean)}
+    return out
+
+
 def residual_norm_ratio(
     h: jax.Array,
     h_corrected: jax.Array,
@@ -345,7 +383,7 @@ def hep_nudge_loss(
     L = mean_{...,b,t} || alpha * sg(eps) @ V ||^2
     L = that / ( mean || sg(reference) ||^2 + eps )
     """
-    # Keep FabricPC imports out of ordinary representation-metric imports.
+
     from residual.fpc_energy import check_backend, highway_sq_norm
 
     if eps.ndim < 3:
@@ -358,8 +396,7 @@ def hep_nudge_loss(
             f"reference {reference.shape} must match the nudge positions {eps.shape[:-1]}"
         )
     if backend == "fabricpc":
-        # ||alpha * sg(eps) @ V||^2 = ||(alpha * sg(eps)) @ V||^2
-        sq = highway_sq_norm(alpha * jax.lax.stop_gradient(eps), v)  # [..., B, T]
+        sq = highway_sq_norm(alpha * jax.lax.stop_gradient(eps), v)
     else:
         sq = jnp.sum(jnp.square(hep_nudge(eps, v, alpha)), axis=-1)
     mean_sq = _masked_mean(sq, mask) / v_hidden_size(v)
@@ -377,6 +414,8 @@ def hep_nudge_loss(
 
 __all__ = [
     "compressibility_curve",
+    "guarded_compressibility",
+    "MIN_REFERENCE_IMPROVEMENT",
     "direction_redundancy",
     "effective_rank",
     "effective_support",

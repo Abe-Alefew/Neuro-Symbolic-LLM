@@ -35,7 +35,6 @@ def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
 
 
 def kl_to_base(base_logits: jax.Array, adapted_logits: jax.Array) -> jax.Array:
-    # float32 log-space for stability; sum over vocab, mean over batch and positions.
     log_p = jax.nn.log_softmax(base_logits.astype(jnp.float32), axis=-1)
     log_q = jax.nn.log_softmax(adapted_logits.astype(jnp.float32), axis=-1)
     return jnp.mean(jnp.sum(jnp.exp(log_p) * (log_p - log_q), axis=-1))
@@ -54,6 +53,65 @@ def token_accuracy(logits: jax.Array, labels: jax.Array) -> jax.Array:
     predicted = jnp.argmax(logits[:, :-1], axis=-1)
     correct = (predicted == jnp.where(mask, target, 0)) & mask
     return jnp.sum(correct) / jnp.maximum(jnp.sum(mask), 1)
+
+
+def classification_metrics(
+    targets: Any, predictions: Any, *, labels: Any | None = None
+) -> dict[str, float]:
+    target_array = np.asarray(targets)
+    prediction_array = np.asarray(predictions)
+    if target_array.shape != prediction_array.shape:
+        raise ValueError(
+            f"targets and predictions must have equal shapes, got "
+            f"{target_array.shape} and {prediction_array.shape}"
+        )
+    if target_array.ndim != 1 or target_array.size == 0:
+        raise ValueError("targets and predictions must be non-empty 1-D arrays")
+    classes = list(labels) if labels is not None else sorted(
+        set(target_array.tolist()) | set(prediction_array.tolist()), key=str
+    )
+    if not classes:
+        raise ValueError("labels must contain at least one class")
+    true_positive = []
+    false_positive = []
+    false_negative = []
+    for label in classes:
+        target_mask = target_array == label
+        prediction_mask = prediction_array == label
+        true_positive.append(int(np.count_nonzero(target_mask & prediction_mask)))
+        false_positive.append(int(np.count_nonzero(~target_mask & prediction_mask)))
+        false_negative.append(int(np.count_nonzero(target_mask & ~prediction_mask)))
+    precision = [
+        tp / (tp + fp) if tp + fp else 0.0
+        for tp, fp in zip(true_positive, false_positive, strict=True)
+    ]
+    recall = [
+        tp / (tp + fn) if tp + fn else 0.0
+        for tp, fn in zip(true_positive, false_negative, strict=True)
+    ]
+    f1 = [
+        2 * p * r / (p + r) if p + r else 0.0
+        for p, r in zip(precision, recall, strict=True)
+    ]
+    return {
+        "accuracy": float(np.mean(target_array == prediction_array)),
+        "macro_f1": float(np.mean(f1)),
+        "macro_precision": float(np.mean(precision)),
+        "macro_recall": float(np.mean(recall)),
+    }
+
+
+def classification_predictions(
+    logits: jax.Array, positions: jax.Array, label_token_ids: jax.Array
+) -> jax.Array:
+    if logits.ndim != 3 or positions.ndim != 1 or label_token_ids.ndim != 2:
+        raise ValueError("invalid logits, positions, or label-token shapes")
+    if logits.shape[0] != positions.shape[0]:
+        raise ValueError("one position is required for each example")
+    if label_token_ids.shape[1] < 1:
+        raise ValueError("each class must have at least one label token")
+    scores = logits[jnp.arange(logits.shape[0]), positions][:, label_token_ids]
+    return jnp.argmax(jnp.max(scores, axis=-1), axis=-1)
 
 
 def calibration_stats(
@@ -154,8 +212,6 @@ def mean_forgetting(acc: Any, t: int, *, higher_is_better: bool = True) -> jax.A
     a = _task_matrix(acc, t)
     if t == 0:
         raise ValueError("Forgetting is undefined at t=0: there are no earlier tasks.")
-    # Negate losses so "best" is always the max. The peak spans s >= j only
-    # (Chaudhry et al., 2018), so negative transfer is not counted as forgetting.
     x = a if higher_is_better else -a
     s = jnp.arange(t)[:, None]
     j = jnp.arange(t)[None, :]
@@ -163,21 +219,27 @@ def mean_forgetting(acc: Any, t: int, *, higher_is_better: bool = True) -> jax.A
     return jnp.mean(peak - x[t, :t])
 
 
+def accuracy_forgetting(accuracy_matrix: Any, t: int) -> jax.Array:
+    return mean_forgetting(accuracy_matrix, t, higher_is_better=True)
+
+
 def training_step_time(
     step_fn: Callable[..., T], *args: Any, **kwargs: Any
 ) -> tuple[T, float]:
     start = time.perf_counter()
     out = step_fn(*args, **kwargs)
-    # JAX is async: wait for the outputs before stopping the timer.
     jax.block_until_ready(out)
     return out, time.perf_counter() - start
 
 
 __all__ = [
     "calibration_stats",
+    "classification_metrics",
+    "classification_predictions",
     "cross_entropy_loss",
     "ece_from_stats",
     "expected_calibration_error",
+    "accuracy_forgetting",
     "kl_to_base",
     "mean_forgetting",
     "mean_seen_accuracy",

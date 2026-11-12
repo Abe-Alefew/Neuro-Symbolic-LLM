@@ -10,13 +10,13 @@ import numpy as np
 import pytest
 
 from metrics.performance import (
+    accuracy_forgetting,
+    classification_metrics,
     mean_forgetting,
     mean_seen_accuracy,
     training_step_time,
 )
 
-# A[t, j]: accuracy on task j after training task t. The upper triangle
-# (j > t) is the zero-shot accuracy on tasks not yet trained.
 ACC = np.array(
     [
         [0.90, 0.20, 0.10],
@@ -33,14 +33,23 @@ def test_mean_seen_accuracy() -> None:
 
 
 def test_mean_forgetting_accuracy() -> None:
-    # t=1: task 0 dropped 0.90 -> 0.70.
     assert float(mean_forgetting(ACC, 1)) == pytest.approx(0.20)
-    # t=2: task 0 peak 0.90 -> 0.60, task 1 peak 0.80 -> 0.75.
     assert float(mean_forgetting(ACC, 2)) == pytest.approx((0.30 + 0.05) / 2)
+    assert float(accuracy_forgetting(ACC, 2)) == pytest.approx((0.30 + 0.05) / 2)
+
+
+def test_classification_metrics() -> None:
+    metrics = classification_metrics(["a", "a", "b", "b"], ["a", "b", "b", "b"])
+    assert metrics["accuracy"] == pytest.approx(0.75)
+    assert metrics["macro_f1"] == pytest.approx((2 / 3 + 4 / 5) / 2)
+
+
+def test_classification_metrics_rejects_mismatched_shapes() -> None:
+    with pytest.raises(ValueError, match="equal shapes"):
+        classification_metrics([0, 1], [0])
 
 
 def test_mean_forgetting_loss_matches_negated_accuracy() -> None:
-    # For a loss, lower is better; forgetting is the rise above the best loss.
     loss = -ACC
     for t in (1, 2):
         np.testing.assert_allclose(
@@ -51,8 +60,6 @@ def test_mean_forgetting_loss_matches_negated_accuracy() -> None:
 
 
 def test_mean_forgetting_ignores_rows_before_the_task_was_trained() -> None:
-    # Task 1 scores 0.99 zero-shot (row 0) but peaks at 0.50 once trained.
-    # The pre-training row is transfer, not a peak to forget from.
     acc = np.array(
         [
             [0.9, 0.99, 0.0],
@@ -75,7 +82,7 @@ def test_accepts_jax_arrays() -> None:
 @pytest.mark.parametrize("t", [-1, 3, 1.0])
 def test_invalid_t_raises(t: object) -> None:
     with pytest.raises(ValueError):
-        mean_seen_accuracy(ACC, t)  # type: ignore[arg-type]
+        mean_seen_accuracy(ACC, t)
 
 
 def test_forgetting_undefined_at_t0() -> None:

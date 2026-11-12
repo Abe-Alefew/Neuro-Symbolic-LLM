@@ -189,12 +189,10 @@ def _load_deployed_metrics(
     import jax
     import jax.numpy as jnp
 
-    from benchmark.external_eval import (
+    from benchmark.evaluation import (
         aggregate_lm_rows,
-        evaluate_long_range,
-    )
-    from benchmark.legal_eval import (
         evaluate_legal_tasks,
+        evaluate_long_range,
         extract_split_features,
     )
     from frozenllm.substrate import FrozenSubstrate, identity_modify
@@ -768,11 +766,8 @@ def _load_deployed_metrics(
                 "reason": f"{type(exc).__name__}: {exc}",
             }
 
-    long_range_path = evaluation_config.get("long_range_probes")
-    if long_range_path:
-        path = Path(long_range_path)
-        if not path.is_absolute():
-            path = ROOT / path
+    long_range_config = evaluation_config.get("long_range")
+    if isinstance(long_range_config, dict):
 
         def score_choice(prompt: str, choice: str) -> float:
             prompt_ids = substrate.tokenizer.encode(prompt, add_special_tokens=True)
@@ -794,8 +789,8 @@ def _load_deployed_metrics(
             return float(jnp.mean(jnp.stack(values)))
 
         try:
-            long_range = evaluate_long_range(path, score_choice)
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            long_range = evaluate_long_range(long_range_config, score_choice)
+        except (RuntimeError, TypeError, ValueError) as exc:
             long_range = {
                 "status": "failed",
                 "reason": f"{type(exc).__name__}: {exc}",

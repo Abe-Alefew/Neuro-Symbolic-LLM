@@ -12,6 +12,7 @@ from benchmark.provenance import (
     sha256_file,
     validate_complete_attempt,
 )
+from training.eval import evaluate_all_stages
 
 
 def _condition(**overrides):
@@ -96,3 +97,71 @@ def test_completion_validation_rejects_mutation(tmp_path: Path) -> None:
     )
     assert not valid
     assert "hash mismatch" in str(reason)
+
+
+def _manifest(tmp_path: Path, *, complete: bool = True) -> Path:
+    runs = []
+    for method in ("a1", "a2", "a3"):
+        result = tmp_path / method / "results.json"
+        if complete:
+            result.parent.mkdir()
+            result.write_text("{}\n", encoding="utf-8")
+        runs.append(
+            {
+                "run_id": method,
+                "method": method,
+                "status": "complete" if complete else "pending",
+                "results": str(result),
+            }
+        )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"runs": runs}), encoding="utf-8"
+    )
+    return tmp_path
+
+
+def test_global_eval_requires_manifest(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="manifest"):
+        evaluate_all_stages(tmp_path)
+
+
+def test_global_eval_rejects_incomplete_runs(tmp_path: Path) -> None:
+    root = _manifest(tmp_path, complete=False)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        evaluate_all_stages(root)
+
+
+def test_global_eval_delegates_to_common_evaluator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _manifest(tmp_path)
+    evaluation = {"completed_runs": 3, "planned_runs": 3, "records": []}
+    report = root / "REPORT.md"
+
+    monkeypatch.setattr("benchmark.core.evaluate_manifest", lambda path: evaluation)
+
+    def write_report(path, *, report_rank):
+        assert path == root
+        assert report_rank == 16
+        report.write_text("# Report\n", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr("benchmark.core.report_manifest", write_report)
+    result = evaluate_all_stages(root, report_rank=16)
+    assert result["global_evaluation"]["methods"] == ["a1", "a2", "a3"]
+    assert result["global_evaluation"]["report_path"] == str(report)
+
+
+def test_global_eval_can_report_partial_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _manifest(tmp_path, complete=False)
+    evaluation = {"completed_runs": 1, "planned_runs": 3, "records": []}
+    monkeypatch.setattr("benchmark.core.evaluate_manifest", lambda path: evaluation)
+    result = evaluate_all_stages(
+        root,
+        generate_report=False,
+        require_complete=False,
+    )
+    assert len(result["global_evaluation"]["incomplete_runs"]) == 3
+    assert result["global_evaluation"]["report_path"] is None

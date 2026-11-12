@@ -1,0 +1,50 @@
+schema: long-range/v1
+items:
+  - id: relation-near
+    family: relation_recall
+    distance: near
+    context: "Company A owns Company B. Company B owns Company C."
+    question: " Which company indirectly controls Company C?"
+    choices: [" Company A", " Company B", " Company C"]
+    answer: 0
+  - id: relation-far
+    family: relation_recall
+    distance: far
+    context: "Company A owns Company B. The filing discusses revenue, taxes, employees, offices, suppliers, customers, and annual reporting. Company B owns Company C."
+    filler: " The document also records routine schedules, notices, signatures, dates, addresses, and administrative provisions."
+    filler_repeat: 35
+    question: " Which company indirectly controls Company C?"
+    choices: [" Company A", " Company B", " Company C"]
+    answer: 0
+  - id: metaphor-near
+    family: metaphor_consistency
+    distance: near
+    context: "The agreement was a bridge between the two organizations."
+    question: " In this passage, the bridge represents"
+    choices: [" cooperation", " a physical road", " a courtroom"]
+    answer: 0
+  - id: metaphor-far
+    family: metaphor_consistency
+    distance: far
+    context: "The agreement was a bridge between the two organizations. Many clauses then define notice periods, payment schedules, audits, and governing law."
+    filler: " Additional sections list ordinary definitions, dates, addresses, reports, and procedural requirements."
+    filler_repeat: 35
+    question: " In this passage, the bridge represents"
+    choices: [" cooperation", " a physical road", " a courtroom"]
+    answer: 0
+  - id: idiom-near
+    family: idiom_preservation
+    distance: near
+    context: "The parties agreed to meet halfway during negotiation."
+    question: " They intended to"
+    choices: [" compromise", " measure a road", " end all talks"]
+    answer: 0
+  - id: idiom-far
+    family: idiom_preservation
+    distance: far
+    context: "The parties agreed to meet halfway during negotiation. The following pages describe warranties, indemnities, assignments, notices, and signatures."
+    filler: " The remaining text contains standard schedules, contact details, dates, notices, and filing instructions."
+    filler_repeat: 35
+    question: " Their negotiation strategy was to"
+    choices: [" compromise", " measure a road", " end all talks"]
+    answer: 0

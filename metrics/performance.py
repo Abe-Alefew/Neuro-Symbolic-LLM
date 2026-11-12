@@ -205,7 +205,14 @@ def _task_matrix(acc: Any, t: int) -> jax.Array:
 
 def mean_seen_accuracy(acc: Any, t: int) -> jax.Array:
     a = _task_matrix(acc, t)
-    return jnp.mean(a[t, : t + 1])
+    seen = a[t, : t + 1]
+    valid = jnp.isfinite(seen)
+    count = jnp.sum(valid)
+    return jnp.where(
+        count > 0,
+        jnp.sum(jnp.where(valid, seen, 0.0)) / jnp.maximum(count, 1),
+        jnp.nan,
+    )
 
 
 def mean_forgetting(acc: Any, t: int, *, higher_is_better: bool = True) -> jax.Array:
@@ -215,8 +222,16 @@ def mean_forgetting(acc: Any, t: int, *, higher_is_better: bool = True) -> jax.A
     x = a if higher_is_better else -a
     s = jnp.arange(t)[:, None]
     j = jnp.arange(t)[None, :]
-    peak = jnp.max(jnp.where(s >= j, x[:t, :t], -jnp.inf), axis=0)
-    return jnp.mean(peak - x[t, :t])
+    valid_history = (s >= j) & jnp.isfinite(x[:t, :t])
+    peak = jnp.max(jnp.where(valid_history, x[:t, :t], -jnp.inf), axis=0)
+    drop = peak - x[t, :t]
+    valid_drop = jnp.isfinite(peak) & jnp.isfinite(x[t, :t])
+    count = jnp.sum(valid_drop)
+    return jnp.where(
+        count > 0,
+        jnp.sum(jnp.where(valid_drop, drop, 0.0)) / jnp.maximum(count, 1),
+        jnp.nan,
+    )
 
 
 def accuracy_forgetting(accuracy_matrix: Any, t: int) -> jax.Array:

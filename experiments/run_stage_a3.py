@@ -213,11 +213,12 @@ def evaluate_task_deployment(
     model: A3Model,
     params: Any,
     domain: Any,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     task_examples = getattr(domain, "task_examples", ())
     label_token_ids = getattr(domain, "label_token_ids", ())
     if not task_examples or not label_token_ids:
-        return {}
+        reason = getattr(domain, "task_skip_reason", None)
+        return {"task_skip_reason": reason} if reason else {}
     targets = np.asarray([example[1] for example in task_examples])
     width = max(len(item) for item in label_token_ids)
     token_ids = jnp.asarray(
@@ -562,11 +563,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 task_examples, label_token_ids = load_task_examples(
                     substrate, d_cfg, d_cfg.eval_split, train_cfg.seq_len
                 )
+                skip_reason = None
+                if not task_examples:
+                    skip_reason = f"label field '{d_cfg.label_field}' not in dataset or no labeled examples"
                 updated_tasks.append(
                     replace(
                         task,
                         task_examples=task_examples,
                         label_token_ids=label_token_ids,
+                        task_skip_reason=skip_reason,
                     )
                 )
             else:

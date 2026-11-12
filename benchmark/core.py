@@ -845,13 +845,15 @@ def _result_record(raw: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         "task_accuracy": (
-            np.asarray(raw["task_accuracy"], dtype=float)[-1].mean()
+            float(np.nanmean(np.asarray(raw["task_accuracy"], dtype=float)[-1]))
             if raw.get("task_accuracy")
+            and np.isfinite(np.asarray(raw["task_accuracy"], dtype=float)[-1]).any()
             else None
         ),
         "task_f1": (
-            np.asarray(raw["task_f1"], dtype=float)[-1].mean()
+            float(np.nanmean(np.asarray(raw["task_f1"], dtype=float)[-1]))
             if raw.get("task_f1")
+            and np.isfinite(np.asarray(raw["task_f1"], dtype=float)[-1]).any()
             else None
         ),
         "steps": raw.get("steps"),

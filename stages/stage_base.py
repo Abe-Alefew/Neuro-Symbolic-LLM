@@ -241,6 +241,7 @@ class Domain:
     epochs: int
     task_examples: tuple[tuple[jax.Array, int, int], ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
+    task_skip_reason: str | None = None
 
 
 def load_token_blocks(
@@ -405,6 +406,11 @@ def prepare_domain(
     task_examples, label_token_ids = load_task_examples(
         substrate, domain, domain.eval_split, training.seq_len
     )
+    skip_reason = None
+    if not task_examples:
+        skip_reason = (
+            f"label field '{domain.label_field}' not in dataset or no labeled examples"
+        )
     return Domain(
         name=domain.name,
         train_blocks=train,
@@ -412,6 +418,7 @@ def prepare_domain(
         epochs=training.epochs if domain.epochs is None else domain.epochs,
         task_examples=task_examples,
         label_token_ids=label_token_ids,
+        task_skip_reason=skip_reason,
     )
 
 
@@ -594,17 +601,36 @@ def summarize(
     base_loss = [init[n]["base_loss"] for n in names]
     num_tasks = len(rows)
     has_task_metrics = bool(np.isfinite(task_accuracy).any())
-    accuracy_forgetting_values = [None]
+    accuracy_forgetting_values: list[float | None] | None = None
     if has_task_metrics:
-        if not np.isfinite(task_accuracy).all():
-            raise ValueError(
-                "task_accuracy must be available for every task and checkpoint "
-                "before accuracy-based forgetting can be computed"
+        accuracy_forgetting_values = [None]
+        for t in range(1, num_tasks):
+            val = float(accuracy_forgetting(task_accuracy, t))
+            accuracy_forgetting_values.append(
+                val if math.isfinite(val) else None
             )
-        accuracy_forgetting_values.extend(
-            float(accuracy_forgetting(task_accuracy, t))
-            for t in range(1, num_tasks)
-        )
+
+    skipped: dict[str, str] = {}
+    for j, n in enumerate(names):
+        col = task_accuracy[:, j]
+        if not np.isfinite(col).all():
+            reason = next(
+                (
+                    str(row[n][k])
+                    for row in rows
+                    if n in row
+                    for k in ("task_skip_reason", "skip_reason", "reason", "skipped")
+                    if k in row[n] and row[n][k]
+                ),
+                None,
+            )
+            if reason is None:
+                if not np.isfinite(col).any():
+                    reason = f"label field not configured or missing for domain '{n}'"
+                else:
+                    reason = f"incomplete task accuracy metrics for domain '{n}' across checkpoints"
+            skipped[n] = reason
+
     return {
         "domains": list(names),
         "base_loss": base_loss,
@@ -629,9 +655,9 @@ def summarize(
         ],
         "task_accuracy": task_accuracy.tolist() if has_task_metrics else None,
         "task_f1": task_f1.tolist() if np.isfinite(task_f1).any() else None,
-        "accuracy_forgetting": accuracy_forgetting_values
-        if has_task_metrics
-        else None,
+        "accuracy_forgetting": accuracy_forgetting_values,
+        "skipped": skipped,
+        "task_skipped": skipped,
     }
 
 
@@ -657,15 +683,16 @@ def run_sequential(
             row[d.name] = evaluate(
                 substrate, adapter, params, d.eval_set, jit=training.jit
             )
-            row[d.name].update(
-                evaluate_task(
-                    substrate,
-                    adapter,
-                    params,
-                    d.task_examples,
-                    d.label_token_ids,
-                )
+            task_metrics = evaluate_task(
+                substrate,
+                adapter,
+                params,
+                d.task_examples,
+                d.label_token_ids,
             )
+            row[d.name].update(task_metrics)
+            if not task_metrics and d.task_skip_reason:
+                row[d.name]["task_skip_reason"] = d.task_skip_reason
             writer.log("eval", after_task=after_task, domain=d.name, **row[d.name])
         if after_task < 0:
             log.info(

@@ -244,6 +244,45 @@ def test_summary_reports_task_accuracy_and_accuracy_forgetting() -> None:
     assert summary["accuracy_forgetting"] == [None, pytest.approx(0.2)]
 
 
+def test_summarize_mixed_task_availability_nan_aware() -> None:
+    names = ["eurlex", "ledgar", "scotus"]
+    init = {
+        "eurlex": {"base_loss": 3.0},
+        "ledgar": {"base_loss": 3.0},
+        "scotus": {"base_loss": 3.0},
+    }
+    rows = [
+        {
+            "eurlex": {
+                "loss": 2.5,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_skip_reason": "label field 'label' not in dataset columns ['text', 'labels']",
+            },
+            "ledgar": {"loss": 2.4, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.20, "task_f1": 0.15},
+            "scotus": {"loss": 2.6, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.10, "task_f1": 0.08},
+        },
+        {
+            "eurlex": {"loss": 2.6, "ppl": 1.0, "kl": 0.0},
+            "ledgar": {"loss": 1.8, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.80, "task_f1": 0.75},
+            "scotus": {"loss": 2.5, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.15, "task_f1": 0.12},
+        },
+        {
+            "eurlex": {"loss": 2.7, "ppl": 1.0, "kl": 0.0},
+            "ledgar": {"loss": 1.9, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.75, "task_f1": 0.70},
+            "scotus": {"loss": 1.7, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.90, "task_f1": 0.85},
+        },
+    ]
+    summary = summarize(names, init, rows)
+    assert "eurlex" in summary["skipped"]
+    assert "label" in summary["skipped"]["eurlex"]
+    assert "ledgar" not in summary["skipped"]
+    assert "scotus" not in summary["skipped"]
+    assert summary["accuracy_forgetting"][0] is None
+    assert summary["accuracy_forgetting"][1] is None
+    assert summary["accuracy_forgetting"][2] == pytest.approx(0.05)
+
+
 def test_nan_and_inf_sanitized_to_valid_json(tmp_path: Path) -> None:
     bad_data = {
         "metric_nan": float("nan"),

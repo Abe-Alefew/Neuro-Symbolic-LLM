@@ -30,6 +30,7 @@ except (ImportError, RuntimeError):
     load_dataset = None
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
+from losses.shared import model_loss_terms
 from metrics.performance import (
     accuracy_forgetting,
     classification_metrics,
@@ -43,7 +44,7 @@ from metrics.representation import loss_improvement
 from residual import AdapterParams, ResidualAdapter, ResidualConfig
 from stages.results import RunWriter, load_params
 
-SECTIONS = ("adapter", "objective", "training", "domains")
+SECTIONS = ("adapter", "objective", "training", "domains", "a3_hybrid")
 # Domain names become file names (params/task_<t>_<name>.npz).
 DOMAIN_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -148,7 +149,7 @@ class RunConfig:
     # Stage objective config: any frozen dataclass with ``from_dict``.
     objective: Any
     training: TrainingConfig
-    domains: tuple[DomainConfig, ...]
+    domains: tuple[DomainConfig, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -159,21 +160,36 @@ class RunConfig:
         }
 
 
-def load_configs(path: Path, objective_cls: type[Any]) -> RunConfig:
+def load_configs(
+    path: Path,
+    objective_cls: type[Any],
+    objective_section: str = "objective",
+) -> RunConfig:
+    if objective_section not in {"objective", "a3_hybrid"}:
+        raise ValueError(f"Unsupported objective section: {objective_section}")
+
     raw = yaml.safe_load(path.read_text()) or {}
+
     unknown = sorted(set(raw) - set(SECTIONS))
     if unknown:
         raise ValueError(f"Unknown config sections in {path}: {unknown}.")
-    domains_raw = raw.get("domains")
-    if not isinstance(domains_raw, list) or not domains_raw:
-        raise ValueError(f"{path}: 'domains' must be a non-empty list of domains.")
-    domains = tuple(DomainConfig.from_dict(d) for d in domains_raw)
-    names = [d.name for d in domains]
+
+    # Runtime datasets are now managed centrally by runtime/data_loader.py.
+    # Keep optional domains temporarily for backward compatibility.
+    domains_raw = raw.get("domains", [])
+
+    if not isinstance(domains_raw, list):
+        raise ValueError(f"{path}: 'domains' must be a list when provided.")
+
+    domains = tuple(DomainConfig.from_dict(domain) for domain in domains_raw)
+
+    names = [domain.name for domain in domains]
     if len(set(names)) != len(names):
         raise ValueError(f"{path}: domain names must be unique, got {names}.")
+
     return RunConfig(
         adapter=ResidualConfig.from_dict(raw.get("adapter") or {}),
-        objective=objective_cls.from_dict(raw.get("objective") or {}),
+        objective=objective_cls.from_dict(raw.get(objective_section) or {}),
         training=TrainingConfig.from_dict(raw.get("training") or {}),
         domains=domains,
     )
@@ -204,6 +220,17 @@ def apply_run_overrides(cfg: RunConfig, args: Any) -> RunConfig:
     if args.eval_batches is not None:
         training = replace(training, eval_batches=args.eval_batches)
     return replace(cfg, adapter=adapter, training=training, domains=domains)
+
+
+def format_params(count: int) -> str:
+    """Format parameter counts using K, M or B."""
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.2f}B"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.2f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.2f}K"
+    return str(count)
 
 
 @dataclass(frozen=True)
@@ -339,28 +366,6 @@ def base_logits(substrate: FrozenSubstrate, input_ids: jax.Array) -> jax.Array:
         input_ids, modify_fn=identity_modify, intercept_layers=()
     )
     return jax.lax.stop_gradient(result.logits)
-
-
-def model_loss_terms(
-    substrate: FrozenSubstrate,
-    adapted: jax.Array,
-    labels: jax.Array,
-    lambda_kl: float,
-    base: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-    """Shared A1/A2 task and KL calculation; only the augmented branch is live."""
-    if base is None:
-        task = substrate.compute_loss(adapted, labels, losses=("CE",))
-        return task, task, None
-    total, parts = substrate.compute_loss(
-        adapted,
-        labels,
-        losses=("CE", "KL"),
-        base_logits=jax.lax.stop_gradient(base),
-        weights={"KL": lambda_kl},
-        return_components=True,
-    )
-    return total, parts["ce"], parts["kl"]
 
 
 def make_optimizer(
@@ -987,52 +992,48 @@ def log_experiment_header(
     run_dir: Any,
     domains: Sequence[Domain],
     start_time: str | None = None,
+    stage: str = "A1",
 ) -> None:
-    """Log structured initialization banner and experiment hyperparameters."""
+    """Log a compact experiment header for A1, A2 and A3."""
+
     train_cfg = cfg.training
-    ratio = (n_trainable / n_frozen * 100.0) if n_frozen > 0 else 0.0
-    ts = start_time or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    total_params = n_trainable + n_frozen
+    ratio = n_trainable / total_params * 100.0 if total_params > 0 else 0.0
 
     logger.info("=" * 78)
-    logger.info("STAGE A1: SEQUENTIAL RESIDUAL ADAPTER TRAINING")
+    logger.info(
+        "STAGE %s: SEQUENTIAL RESIDUAL ADAPTER TRAINING",
+        stage.upper(),
+    )
     logger.info("=" * 78)
-    logger.info("Started At         : %s", ts)
+
     logger.info(
         "Model Architecture : %s (%d layers, hidden_dim=%d)",
         train_cfg.model,
         arch.num_layers,
         arch.hidden_size,
     )
+
     logger.info(
         "Residual Adapter   : target_layers=%s | rank=%d | alpha=%s",
         list(adapter.layers),
         cfg.adapter.rank,
         cfg.adapter.alpha,
     )
+
     logger.info(
         "Parameters         : %s trainable | %s frozen (%.3f%% trainable)",
-        f"{n_trainable:,}",
-        f"{n_frozen:,}",
+        format_params(n_trainable),
+        format_params(n_frozen),
         ratio,
     )
+
     logger.info(
-        "Hyperparameters    : batch_size=%d | seq_len=%d | lr=%.2e | jit=%s",
-        train_cfg.batch_size,
-        train_cfg.seq_len,
-        train_cfg.learning_rate,
-        train_cfg.jit,
+        "Tasks              : %d sequential task(s)",
+        len(domains),
     )
-    logger.info("Run Directory      : %s", run_dir)
-    logger.info("Curriculum (%d domain(s)):", len(domains))
-    for i, d in enumerate(domains, 1):
-        logger.info(
-            "  [%d] %-10s -> %d blocks | %d eval batches | %d epoch(s)",
-            i,
-            d.name,
-            len(d.train_blocks),
-            len(d.eval_set),
-            d.epochs,
-        )
+
     logger.info("-" * 78)
 
 
@@ -1095,13 +1096,13 @@ def log_final_summary(
         final_forg = "None" if forgetting[-1] is None else f"{forgetting[-1]:+.4f}"
         logger.info("  • Mean Forgetting: [%s] (Final: %s)", forg_str, final_forg)
 
-    status_str = (
-        "PASSED (Base model parameters 100% frozen)"
-        if frozen.get("params_unchanged")
-        else "FAILED (Base model parameters modified!)"
-    )
-    logger.info("Substrate Integrity: %s", status_str)
-    logger.info("=" * 78)
+    if frozen.get("params_unchanged"):
+        logger.info("=" * 78)
+    else:
+        logger.info(
+            "Substrate Integrity: %s", "FAILED (Base model parameters modified!)"
+        )
+        logger.info("=" * 78)
 
 
 __all__ = [

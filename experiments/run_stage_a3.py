@@ -22,17 +22,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import optax  # noqa: E402
 
 from frozenllm.substrate import FrozenSubstrate  # noqa: E402
-from metrics.performance import (  # noqa: E402
-    classification_metrics,
-    classification_predictions,
-    perplexity,
-    training_step_time,
-)
 from residual import ResidualAdapter  # noqa: E402
 from runtime.data_loader import load_runtime_data  # noqa: E402
 from stages.results import (  # noqa: E402
@@ -47,8 +40,6 @@ from stages.stage_base import (  # noqa: E402
     configure_logging,
     format_params,
     load_configs,
-    load_task_examples,
-    load_token_blocks,
     log_experiment_header,
     log_final_summary,
     make_eval_set,
@@ -210,75 +201,23 @@ def evaluate_deployment(
     }
 
 
-def evaluate_task_deployment(substrate, model, params, domain):
-    if not domain.task_examples or not domain.label_token_ids:
-        return {}
-    targets = np.asarray([example[1] for example in domain.task_examples])
-    width = max(len(item) for item in domain.label_token_ids)
-    token_ids = jnp.asarray(
-        [list(item) + [item[-1]] * (width - len(item)) for item in domain.label_token_ids]
-    )
-    prediction_batches = []
-    for start in range(0, len(domain.task_examples), 32):
-        batch = domain.task_examples[start : start + 32]
-        ids = jnp.stack([example[0] for example in batch])
-        positions = jnp.asarray([example[2] for example in batch])
-        logits, _ = model.deploy_logits(params, ids)
-        prediction_batches.append(
-            np.asarray(classification_predictions(logits, positions, token_ids))
+# ---------------------------------------------------------------------
+# A3 PC gradient adapter
+# ---------------------------------------------------------------------
+
+
+def make_a3_gradient_fn(model: A3Model):
+    """Adapt A3's custom PC gradients to the shared training interface."""
+
+    def a3_gradient_fn(params, batch, key):
+        grads, aux = model.train_grads(
+            params,
+            batch,
+            key,
         )
-    predictions = np.concatenate(prediction_batches)
-    values = classification_metrics(targets, predictions)
-    return {"task_accuracy": values["accuracy"], "task_f1": values["macro_f1"]}
 
-
-def train_sequential(
-    substrate,
-    model: A3Model,
-    params,
-    domains,
-    training: TrainingConfig,
-    writer: RunWriter,
-    *,
-    energy_curve: bool = False,
-):
-    """Sequential-domain loop with A1's schedule, logging and artifacts. The gradient is the
-    local predictive-coding gradient from ``model.train_grads``, not ``jax.grad``."""
-    names = [d.name for d in domains]
-
-    def eval_all(after_task: int):
-        row = {}
-        for d in domains:
-            row[d.name] = evaluate_deployment(
-                substrate, model, params, d.eval_set, jit=training.jit
-            )
-            row[d.name].update(evaluate_task_deployment(substrate, model, params, d))
-            writer.log("eval", after_task=after_task, domain=d.name, **row[d.name])
-        if after_task < 0:
-            log.info(
-                "[Validation] Baseline zero-shot eval after_task=%d: %s",
-                after_task,
-                _fmt_losses(row),
-            )
-        else:
-            log.info(
-                "[Validation] eval after_task=%d (%s): %s",
-                after_task,
-                domains[after_task].name,
-                _fmt_losses(row),
-            )
-        return row
-
-    init = eval_all(-1)
-
-    optimizer = optax.adam(training.learning_rate)
-    base_key = jax.random.PRNGKey(training.seed + 100)
-
-    def train_step(params, opt_state, ids, key):
-        grads, aux = model.train_grads(params, ids, key)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        terms = {
-            "total": aux["energy_after"],
+        metrics = {
+            "total": aux["energy_after_exact"],
             "task": aux["task"],
             "pc_energy": aux["spring"],
         }
@@ -550,29 +489,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     frozen = substrate.verify_frozen()
 
     if not frozen["params_unchanged"]:
-        log.error("Substrate not frozen before training: %s", frozen)
-        return 1
+        raise RuntimeError(f"Frozen substrate verification failed: {frozen}")
 
-    log.info("Preparing datasets across %d domain(s)...", len(cfg.domains))
-    domains = []
-    for d in cfg.domains:
-        train_blocks = load_token_blocks(substrate, d, d.train_split, train_cfg.seq_len)
-        eval_blocks = load_token_blocks(substrate, d, d.eval_split, train_cfg.seq_len)
-        task_examples, label_token_ids = load_task_examples(
-            substrate, d, d.eval_split, train_cfg.seq_len
+    # -------------------------------------------------------------
+    # Shared runtime datasets
+    # -------------------------------------------------------------
+
+    eval_batches = train_cfg.eval_batches
+
+    runtime_data = load_runtime_data(
+        config_path=DEFAULT_RUNTIME_CONFIG,
+        tokenizer=substrate.tokenizer,
+        sequence_length=train_cfg.seq_len,
+        batch_size=train_cfg.batch_size,
+        eval_batches=eval_batches,
+        default_epochs=train_cfg.epochs,
+    )
+
+    domains = runtime_data.tasks
+
+    # Select the final evaluation split.
+    if args.split == "test":
+        test_sets = runtime_data.get_test_sets(
+            train_cfg.batch_size,
+            eval_batches,
         )
-        domains.append(
-            Domain(
-                name=d.name,
-                train_blocks=train_blocks,
-                eval_set=make_eval_set(
-                    eval_blocks, train_cfg.batch_size, train_cfg.eval_batches
-                ),
-                epochs=train_cfg.epochs if d.epochs is None else d.epochs,
-                task_examples=task_examples,
-                label_token_ids=label_token_ids,
+
+    elif args.split in ("eval", "validation"):
+        test_sets = {task.name: task.eval_set for task in domains}
+
+    elif args.split == "train":
+        test_sets = {
+            task.name: make_eval_set(
+                task.train_blocks,
+                train_cfg.batch_size,
+                eval_batches,
             )
-        )
+            for task in domains
+        }
+
+    else:
+        raise ValueError("split must be 'test', 'validation', 'eval', or 'train'.")
+
+    # -------------------------------------------------------------
+    # Multiple inference-step experiments
+    # -------------------------------------------------------------
 
     base_name = args.run_name or default_run_name("a3hybrid")
 

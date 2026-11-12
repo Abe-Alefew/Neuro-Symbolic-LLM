@@ -22,10 +22,15 @@ from frozenllm.substrate.architecture import Architecture
 from residual import ResidualAdapter, ResidualConfig
 from stages.results import (
     RunWriter,
+    artifact_index,
+    checkpoint_hash_path,
     default_run_name,
+    file_sha256,
     load_checkpoint,
     load_params,
     run_metadata,
+    verify_artifact_index,
+    verify_checkpoint_hash,
 )
 from stages.stage_base import evaluate_checkpoint, validate_checkpoint_params
 
@@ -61,15 +66,49 @@ def test_writes_all_artifacts(tmp_path: Path) -> None:
     np.testing.assert_array_equal(loaded["layer_7"]["B"], np.zeros((2, 4)))
     # Atomic writes leave no temp files behind.
     assert not [p for p in run.iterdir() if p.name.startswith(".")]
+    assert (run / "COMPLETE").is_file()
+    assert not (run / "FAILED").exists()
+    assert verify_artifact_index(run)
+    assert (
+        artifact_index(run)
+        == json.loads((run / "artifacts.json").read_text())["artifacts"]
+    )
+    (run / "results.json").write_text("{}\n")
+    assert not verify_artifact_index(run)
 
 
-def test_refuses_existing_run_dir(tmp_path: Path) -> None:
-    RunWriter(tmp_path, "run").close()
+def test_existing_run_gets_unique_name_without_deletion(tmp_path: Path) -> None:
+    existing = tmp_path / "run"
+    (existing / "checkpoints").mkdir(parents=True)
+    sentinel = existing / "checkpoints" / "old.npz"
+    sentinel.write_bytes(b"old checkpoint")
+
+    with RunWriter(tmp_path, "run") as second:
+        assert second.dir == tmp_path / "run-1"
+        second.write_json("results.json", {"run": 2})
+
+    with RunWriter(tmp_path, "run") as third:
+        assert third.dir == tmp_path / "run-2"
+
+    assert sentinel.read_bytes() == b"old checkpoint"
+    assert json.loads((second.dir / "results.json").read_text()) == {"run": 2}
+    assert (second.dir / "COMPLETE").is_file()
+    assert (third.dir / "COMPLETE").is_file()
+
+
+def test_exact_run_directory_fails_safely_if_occupied(tmp_path: Path) -> None:
+    exact = tmp_path / "exact"
+    with RunWriter.for_directory(exact) as writer:
+        writer.write_json("results.json", {"kept": True})
+
     with pytest.raises(FileExistsError):
-        RunWriter(tmp_path, "run")
+        RunWriter(tmp_path, "exact", exact=True)
+
+    assert json.loads((exact / "results.json").read_text()) == {"kept": True}
+    assert (exact / "COMPLETE").is_file()
 
 
-@pytest.mark.parametrize("name", ["", "a/b", "../x"])
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "a\\b", "../x"])
 def test_rejects_non_plain_run_names(tmp_path: Path, name: str) -> None:
     with pytest.raises(ValueError, match="plain directory name"):
         RunWriter(tmp_path, name)
@@ -80,6 +119,62 @@ def test_log_after_close_raises(tmp_path: Path) -> None:
     writer.close()
     with pytest.raises(RuntimeError, match="closed"):
         writer.log("train")
+
+
+def test_exception_writes_failed_marker_and_partial_index(tmp_path: Path) -> None:
+    with (
+        pytest.raises(RuntimeError, match="training failed"),
+        RunWriter(tmp_path, "run") as writer,
+    ):
+        writer.write_config({"steps": 1})
+        writer.log("train", step=1)
+        raise RuntimeError("training failed")
+
+    marker = json.loads((writer.dir / "FAILED").read_text())
+    assert marker["status"] == "FAILED"
+    assert marker["error"] == {
+        "type": "RuntimeError",
+        "message": "training failed",
+    }
+    assert not (writer.dir / "COMPLETE").exists()
+    assert verify_artifact_index(writer.dir)
+
+
+def test_strict_json_sanitizes_nonfinite_values(tmp_path: Path) -> None:
+    params = {"layer_7": {"A": jnp.ones((1, 1)), "B": jnp.zeros((1, 1))}}
+    nonfinite = np.array([np.nan, np.inf, -np.inf, 1.5])
+
+    with RunWriter(tmp_path, "run") as writer:
+        writer.write_config({"values": nonfinite})
+        writer.write_json("results.json", {"values": nonfinite})
+        writer.log("train", loss=jnp.float32(np.nan), values=nonfinite)
+        checkpoint = writer.save_checkpoint(
+            "final",
+            params,
+            loss=float("inf"),
+            values=nonfinite,
+        )
+
+    assert yaml.safe_load((writer.dir / "config.yaml").read_text()) == {
+        "values": [None, None, None, 1.5]
+    }
+    assert json.loads((writer.dir / "results.json").read_text()) == {
+        "values": [None, None, None, 1.5]
+    }
+    assert json.loads((writer.dir / "metrics.jsonl").read_text()) == {
+        "event": "train",
+        "loss": None,
+        "values": [None, None, None, 1.5],
+    }
+    _, _, metadata = load_checkpoint(checkpoint)
+    assert metadata == {
+        "loss": None,
+        "values": [None, None, None, 1.5],
+    }
+    for path in (writer.dir / "results.json", writer.dir / "metrics.jsonl"):
+        raw = path.read_text()
+        assert "NaN" not in raw
+        assert "Infinity" not in raw
 
 
 def test_metadata_and_run_name() -> None:
@@ -101,6 +196,13 @@ def test_checkpoint_round_trip(tmp_path: Path) -> None:
             global_step=42,
             domain="eurlex",
         )
+
+    hash_path = checkpoint_hash_path(ckpt_path)
+    assert hash_path.read_text().strip() == file_sha256(ckpt_path)
+    assert verify_checkpoint_hash(ckpt_path)
+    index = artifact_index(writer.dir)
+    assert index["checkpoints/task_0_eurlex.npz"]["sha256"] == file_sha256(ckpt_path)
+    assert "checkpoints/task_0_eurlex.npz.sha256" in index
 
     # 1. Untrusted loading refuses to unpickle __opt_treedef__ and raises ValueError
     with pytest.raises(

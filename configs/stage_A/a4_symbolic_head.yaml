@@ -1,0 +1,4 @@
+symbolic_evaluation:
+  mode: rankings_jsonl
+  cutoffs: [1, 4, 8, 16]
+  require_unique_ids: true

@@ -18,7 +18,6 @@ from benchmark.core import (
     _command,
     _filter_adapter_params,
     _materialize,
-    _read_json,
     _spearman_corr,
     _write_json,
     compute_domain_overlap,
@@ -27,8 +26,8 @@ from benchmark.core import (
     expand_specs,
     make_manifest,
     report_manifest,
-    train_manifest,
 )
+from benchmark.provenance import validate_complete_attempt
 from metrics.performance import (
     calibration_stats,
     ece_from_stats,
@@ -172,7 +171,7 @@ def test_a3_k_sweep_curves_do_not_overwrite(tmp_path: Path) -> None:
     )
 
 
-def test_cr_reports_na_when_target_rank_absent(tmp_path: Path) -> None:
+def test_report_requires_a_matched_three_stage_cohort(tmp_path: Path) -> None:
     evaluation = {
         "completed_runs": 2,
         "planned_runs": 2,
@@ -180,11 +179,21 @@ def test_cr_reports_na_when_target_rank_absent(tmp_path: Path) -> None:
         "records": [
             {
                 "method": "a1",
+                "run_id": "a1-0",
+                "seed": 0,
+                "rank": 16,
+                "protocol": "sequential",
+                "task_order": ["eurlex", "ledgar", "scotus"],
                 "final_mean_loss": 2.0,
                 "residual_compressibility": {"8": 0.8, "16": 1.0},
             },
             {
                 "method": "a1",
+                "run_id": "a1-1",
+                "seed": 1,
+                "rank": 16,
+                "protocol": "sequential",
+                "task_order": ["eurlex", "ledgar", "scotus"],
                 "final_mean_loss": 2.0,
                 "residual_compressibility": {"8": 0.8, "16": 1.0},
             },
@@ -192,41 +201,34 @@ def test_cr_reports_na_when_target_rank_absent(tmp_path: Path) -> None:
     }
     _write_json(tmp_path / "evaluation.json", evaluation)
     report_path = report_manifest(tmp_path, report_rank=4)
-
-    def c_r_cell(path: Path) -> str:
-        row = next(
-            line
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.startswith("| a1 |")
-        )
-        cells = [c.strip() for c in row.strip("|").split("|")]
-        return cells[5]
-
-    assert c_r_cell(report_path) == "N/A"
-    assert c_r_cell(report_manifest(tmp_path, report_rank=8)) == "0.8"
     report = report_path.read_text(encoding="utf-8")
-    assert "| Metric | A1 | A2 | A3 | Coverage |" in report
+    assert (
+        "| Metric | A1 | A2 | A3 | A2-A1 paired delta | A3-A1 paired delta |" in report
+    )
+    assert "No complete matched A1/A2/A3 cohort is available" in report
     for metric in (
         "Residual compressibility",
-        "Representation fracture index",
-        "Factor overlap and entanglement",
-        "Gradient conflict",
-        "Mixed curvature coupling",
-        "Causal modularity and off-support leakage",
-        "Update commutator proxy",
+        "Semantic-factor fracture",
+        "Semantic-factor overlap",
+        "Semantic-factor gradient conflict",
+        "Mixed curvature coupling proxy",
+        "Off-support leakage",
+        "Update commutator",
         "Causal fingerprint separability",
-        "Category alignment and naturality",
-        "Interpretability and ablation fidelity",
+        "Lowercase category naturality proxy",
+        "Quadratic ablation fidelity Spearman",
         "Validation loss",
         "Perplexity",
-        "Task accuracy / F1",
-        "Calibration error",
-        "Forgetting",
+        "Task accuracy",
+        "Task primary score",
+        "Task macro-F1",
+        "Token calibration ECE",
+        "Validation-loss forgetting",
         "Held-out transfer",
-        "Sequential versus joint",
+        "Sequential versus joint gap",
         "Anchor KL drift",
-        "Symbolic retrieval precision / recall",
-        "Long-range coherence",
+        "Symbolic retrieval F1@4",
+        "Long-range coherence accuracy",
     ):
         assert f"| {metric} |" in report
 
@@ -239,30 +241,59 @@ def test_report_groups_by_configuration_and_shows_na_for_unimplemented(
         "planned_runs": 4,
         "domains": ["d1"],
         "records": [
-            {"method": "a1", "rank": 16, "final_mean_loss": 2.0},
-            {"method": "a2", "rank": 16, "final_mean_loss": 1.9},
-            {"method": "a3", "rank": 16, "k": 1, "final_mean_loss": 1.8},
-            {"method": "a3", "rank": 16, "k": 4, "final_mean_loss": 1.7},
+            {
+                "run_id": "a1",
+                "method": "a1",
+                "seed": 0,
+                "protocol": "sequential",
+                "task_order": ["eurlex", "ledgar", "scotus"],
+                "rank": 16,
+                "final_mean_loss": 2.0,
+            },
+            {
+                "run_id": "a2",
+                "method": "a2",
+                "seed": 0,
+                "protocol": "sequential",
+                "task_order": ["eurlex", "ledgar", "scotus"],
+                "rank": 16,
+                "final_mean_loss": 1.9,
+            },
+            {
+                "run_id": "a3-k1",
+                "method": "a3",
+                "seed": 0,
+                "protocol": "sequential",
+                "task_order": ["eurlex", "ledgar", "scotus"],
+                "rank": 16,
+                "k": 1,
+                "final_mean_loss": 1.8,
+            },
+            {
+                "run_id": "a3-k4",
+                "method": "a3",
+                "seed": 0,
+                "protocol": "sequential",
+                "task_order": ["eurlex", "ledgar", "scotus"],
+                "rank": 16,
+                "k": 4,
+                "final_mean_loss": 1.7,
+            },
         ],
     }
     _write_json(tmp_path / "evaluation.json", evaluation)
     report_path = report_manifest(tmp_path, report_rank=16)
     report = report_path.read_text(encoding="utf-8")
+    assert "A3 K=1" in report
+    assert "A3 K=4" in report
     assert (
-        "| Metric | A1 (r=16) | A2 (r=16) | A3 (r=16, K=1) | A3 (r=16, K=4) | Coverage |"
-        in report
-    )
-    # Rows not implemented must show N/A and not measured
-    assert (
-        "| Mixed curvature coupling | N/A | N/A | N/A | N/A | not measured |"
-        in report
+        "| Metric | A1 | A2 | A3 | A2-A1 paired delta | A3-A1 paired delta |" in report
     )
     assert (
-        "| Interpretability and ablation fidelity | N/A | N/A | N/A | N/A | not measured |"
+        "| Mixed curvature coupling proxy | N/A | N/A | N/A | N/A | N/A | lower | 0 |"
         in report
     )
-    # Validation loss should show the values
-    assert "| Validation loss | 2 | 1.9 | 1.8 | 1.7 | measured |" in report
+    assert "| Validation loss | 2 (n=1) | 1.9 (n=1) | 1.8 (n=1)" in report
 
 
 def test_summarize_mixed_task_availability_nan_aware() -> None:
@@ -280,18 +311,54 @@ def test_summarize_mixed_task_availability_nan_aware() -> None:
                 "kl": 0.0,
                 "task_skip_reason": "label field 'label' not in dataset columns ['text', 'labels']",
             },
-            "ledgar": {"loss": 2.4, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.20, "task_f1": 0.15},
-            "scotus": {"loss": 2.6, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.10, "task_f1": 0.08},
+            "ledgar": {
+                "loss": 2.4,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_accuracy": 0.20,
+                "task_f1": 0.15,
+            },
+            "scotus": {
+                "loss": 2.6,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_accuracy": 0.10,
+                "task_f1": 0.08,
+            },
         },
         {
             "eurlex": {"loss": 2.6, "ppl": 1.0, "kl": 0.0},
-            "ledgar": {"loss": 1.8, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.80, "task_f1": 0.75},
-            "scotus": {"loss": 2.5, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.15, "task_f1": 0.12},
+            "ledgar": {
+                "loss": 1.8,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_accuracy": 0.80,
+                "task_f1": 0.75,
+            },
+            "scotus": {
+                "loss": 2.5,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_accuracy": 0.15,
+                "task_f1": 0.12,
+            },
         },
         {
             "eurlex": {"loss": 2.7, "ppl": 1.0, "kl": 0.0},
-            "ledgar": {"loss": 1.9, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.75, "task_f1": 0.70},
-            "scotus": {"loss": 1.7, "ppl": 1.0, "kl": 0.0, "task_accuracy": 0.90, "task_f1": 0.85},
+            "ledgar": {
+                "loss": 1.9,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_accuracy": 0.75,
+                "task_f1": 0.70,
+            },
+            "scotus": {
+                "loss": 1.7,
+                "ppl": 1.0,
+                "kl": 0.0,
+                "task_accuracy": 0.90,
+                "task_f1": 0.85,
+            },
         },
     ]
     summary = summarize(names, init, rows)
@@ -327,45 +394,18 @@ def test_nan_and_inf_sanitized_to_valid_json(tmp_path: Path) -> None:
     assert loaded["list"] == [1.0, None, 3.0]
 
 
-def test_resume_preserves_materialized_config_and_sha(tmp_path: Path) -> None:
+def test_resume_rejects_unverified_result_files(tmp_path: Path) -> None:
     run_dir = tmp_path / "runs" / "test-run"
     run_dir.mkdir(parents=True)
     _write_json(run_dir / "results.json", {"test": {}})
 
-    dummy_cfg = tmp_path / "base_cfg.yaml"
-    dummy_cfg.write_text(
-        "adapter:\n  rank: 16\ntraining:\n  model: gpt2\ndomains:\n  - name: eurlex\n  - name: ledgar\n  - name: scotus\n",
-        encoding="utf-8",
+    valid, reason = validate_complete_attempt(
+        run_dir,
+        condition_sha256="missing",
+        config_sha256="missing",
     )
-
-    manifest = {
-        "schema": 1,
-        "epochs": 1,
-        "runs": [
-            {
-                "run_id": "test-run",
-                "method": "a1",
-                "seed": 0,
-                "protocol": "sequential",
-                "config": str(dummy_cfg),
-                "output_dir": str(tmp_path / "runs"),
-                "run_name": "test-run",
-                "status": "pending",
-            }
-        ],
-    }
-    _write_json(tmp_path / "manifest.json", manifest)
-
-    train_manifest(tmp_path, resume=True)
-
-    updated = _read_json(tmp_path / "manifest.json")
-    run_entry = updated["runs"][0]
-    assert run_entry["status"] == "complete"
-    assert "materialized_config" in run_entry
-    assert Path(run_entry["materialized_config"]).is_file()
-    assert "config_sha" in run_entry
-    assert isinstance(run_entry["config_sha"], str)
-    assert len(run_entry["config_sha"]) == 64
+    assert not valid
+    assert "missing artifacts" in str(reason)
 
 
 def test_domain_overlap_within_layer() -> None:

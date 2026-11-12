@@ -1,8 +1,4 @@
-"""Small, artifact-driven A1/A2/A3 benchmark harness.
-
-The stage runners remain the source of truth for training. This module only
-coordinates isolated runs and aggregates their existing JSON artifacts.
-"""
+"""Small, artifact-driven A1/A2/A3 benchmark harness."""
 
 from __future__ import annotations
 
@@ -19,7 +15,35 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import yaml
+
+from frozenllm.substrate import FrozenSubstrate, identity_modify
+from metrics.performance import (
+    calibration_stats,
+    ece_from_stats,
+    kl_to_base,
+    token_accuracy,
+)
+from metrics.representation import (
+    effective_rank,
+    fracture_index,
+    invariant_redundancy,
+    overlap,
+    pairwise_ablation_interaction,
+    synergy_proxy,
+    taylor_delta,
+)
+from residual import ResidualAdapter, ResidualConfig
+from stages.results import load_params
+from stages.stage_base import (
+    DomainConfig,
+    TrainingConfig,
+    load_token_blocks,
+    make_eval_set,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIGS = {
@@ -50,6 +74,9 @@ MEASURED_METRICS = (
     "taylor_delta",
     "synergy",
     "token_accuracy",
+    "task_accuracy",
+    "task_f1",
+    "accuracy_forgetting",
     "expected_calibration_error",
     "paired_seed_delta",
 )
@@ -101,8 +128,6 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _spearman_corr(x: list[float] | Any, y: list[float] | Any) -> float:
     """Compute Spearman rank correlation between two vectors without external dependencies."""
-    import numpy as np
-
     xa = np.asarray(x, dtype=float)
     ya = np.asarray(y, dtype=float)
     if len(xa) < 2 or np.all(xa == xa[0]) or np.all(ya == ya[0]):
@@ -121,17 +146,6 @@ def compute_domain_overlap(
     domain_atom_effects: dict[str, list[float] | Any],
     eps: float = 1e-8,
 ) -> dict[str, float]:
-    """Calculate overlap between domains within a layer using normalized contributions.
-
-    1. Same residual component definitions across all domains (the atoms).
-    2. Normalize contributions separately for each domain.
-    3. Retain per-domain overlap matrix entries {f'{d1}:{d2}': overlap_val}.
-    """
-    import jax
-    import jax.numpy as jnp
-
-    from metrics.representation import overlap
-
     domain_names = sorted(domain_atom_effects)
     normalized: dict[str, jax.Array] = {}
     for name in domain_names:
@@ -161,39 +175,6 @@ def compute_semantic_overlap(
 def _load_deployed_metrics(
     run: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
-    """Evaluate the final checkpoint with the common deployed function.
-
-    Heavy JAX/model imports are intentionally local so ``plan`` remains usable
-    in lightweight environments.
-    """
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-
-    from frozenllm.substrate import FrozenSubstrate, identity_modify
-    from metrics.performance import (
-        calibration_stats,
-        ece_from_stats,
-        kl_to_base,
-        token_accuracy,
-    )
-    from metrics.representation import (
-        effective_rank,
-        fracture_index,
-        invariant_redundancy,
-        pairwise_ablation_interaction,
-        synergy_proxy,
-        taylor_delta,
-    )
-    from residual import ResidualAdapter, ResidualConfig
-    from stages.results import load_params
-    from stages.stage_base import (
-        DomainConfig,
-        TrainingConfig,
-        load_token_blocks,
-        make_eval_set,
-    )
-
     config_path = Path(run.get("materialized_config", run["config"]))
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     training = TrainingConfig.from_dict(config["training"])
@@ -357,8 +338,6 @@ def _load_deployed_metrics(
         representation["invariant_redundancy"][layer_name] = float(
             invariant_redundancy(a, b)
         )
-        # 1. Compute per-domain atom ablation effects
-        # Same residual component definitions across all domains (atoms 0..num_atoms-1)
         layer_domain_effects: dict[str, list[float]] = {d.name: [] for d in domains}
         for atom in range(num_atoms):
             ablated = {key: dict(value_map) for key, value_map in params.items()}
@@ -373,9 +352,6 @@ def _load_deployed_metrics(
                     layer_domain_effects[domain.name].append(0.0)
 
         ablation_by_domain[layer_name] = layer_domain_effects
-
-        # 2. Fracture index per domain and mean across domains
-        # Normalize contributions separately for each domain
         domain_fractures = [
             float(fracture_index(jnp.asarray([abs(e) for e in effects])))
             for effects in layer_domain_effects.values()
@@ -384,14 +360,10 @@ def _load_deployed_metrics(
         representation["fracture_index"][layer_name] = (
             float(np.mean(domain_fractures)) if domain_fractures else 0.0
         )
-
-        # 3. Calculate overlap between domains within each layer
-        # Retain per-domain overlap matrices
         layer_overlap = compute_domain_overlap(layer_domain_effects)
         representation["overlap"][layer_name] = layer_overlap
         representation["overlap_matrices"][layer_name] = layer_overlap
 
-        # 4. Semantic / category label overlap when available
         semantic_cats = config.get("semantic_categories")
         if semantic_cats and isinstance(semantic_cats, dict):
             cat_effects: dict[str, list[float]] = {}
@@ -418,7 +390,6 @@ def _load_deployed_metrics(
                 "reason": "no category labels provided",
             }
 
-        # 5. Taylor delta and Fisher
         layer_gradients = [
             gradients[name][layer_name]["B"]
             for name in names
@@ -441,7 +412,6 @@ def _load_deployed_metrics(
             jnp.sum(jnp.asarray(atom_taylor))
         )
 
-        # 6. Metric-weighted interaction proxy: Syn_proxy(i, j) = delta_h_i^T G delta_h_j
         proxy_pairs: dict[str, float] = {}
         for i in range(num_atoms):
             for j in range(i + 1, num_atoms):
@@ -451,7 +421,6 @@ def _load_deployed_metrics(
                     synergy_proxy(delta_i, delta_j, metric_g)
                 )
 
-        # 7. Measured pairwise ablation on top atoms (up to 8 atoms -> up to 28 pairs)
         top_atoms = sorted(
             range(num_atoms),
             key=lambda a: float(
@@ -484,7 +453,6 @@ def _load_deployed_metrics(
                     )
                     measured_pairs[f"{atom_i}:{atom_j}"] = s_meas
 
-        # 8. Validate proxy against measured pairwise ablations
         common_pairs = [k for k in measured_pairs if k in proxy_pairs]
         if len(common_pairs) >= 3:
             p_vals = [proxy_pairs[k] for k in common_pairs]
@@ -553,8 +521,14 @@ def _config_fingerprint(config: dict[str, Any]) -> str:
 
 
 def _compressibility_curve(deltas: dict[int, float]) -> dict[int, float]:
-    reference = deltas[max(deltas)]
-    return {rank: value / (reference + 1e-8) for rank, value in deltas.items()}
+
+    return _compressibility_detail(deltas)["curve"] or {}
+
+
+def _compressibility_detail(deltas: dict[int, float]) -> dict[str, Any]:
+    from metrics.representation import guarded_compressibility
+
+    return guarded_compressibility(deltas)
 
 
 def _set_seed(config: dict[str, Any], method: str, seed: int) -> None:
@@ -842,6 +816,16 @@ def _result_record(raw: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
         "rank": run.get("rank", 16),
         "domains": domains,
         "final_mean_loss": final_mean_loss,
+        "domain_loss_improvement": (
+            {
+                str(name): float(b) - float(f)
+                for name, b, f in zip(
+                    domains, base_losses, final_losses, strict=False
+                )
+            }
+            if domains and len(base_losses) == len(final_losses) == len(domains)
+            else None
+        ),
         "loss_improvement": (
             base_mean_loss - final_mean_loss
             if base_mean_loss is not None and final_mean_loss is not None
@@ -854,6 +838,21 @@ def _result_record(raw: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
         ),
         "mean_forgetting": (
             raw.get("mean_forgetting", [])[-1] if raw.get("mean_forgetting") else None
+        ),
+        "accuracy_forgetting": (
+            raw.get("accuracy_forgetting", [])[-1]
+            if raw.get("accuracy_forgetting")
+            else None
+        ),
+        "task_accuracy": (
+            np.asarray(raw["task_accuracy"], dtype=float)[-1].mean()
+            if raw.get("task_accuracy")
+            else None
+        ),
+        "task_f1": (
+            np.asarray(raw["task_f1"], dtype=float)[-1].mean()
+            if raw.get("task_f1")
+            else None
         ),
         "steps": raw.get("steps"),
         "tokens": raw.get("tokens"),
@@ -885,21 +884,43 @@ def evaluate_manifest(output_dir: Path) -> dict[str, Any]:
             }
         records.append(record)
     by_group: dict[tuple[str, int, int | None], dict[int, float]] = {}
-    for record in records:
-        loss = record.get("loss_improvement")
-        if loss is not None:
-            group_key = (record["method"], record["seed"], record.get("k"))
-            by_group.setdefault(group_key, {})[record["rank"]] = loss
+    by_group_domain: dict[
+        tuple[str, int, int | None], dict[str, dict[int, float]]
+    ] = {}
     for record in records:
         group_key = (record["method"], record["seed"], record.get("k"))
-        curve_data = by_group.get(group_key, {})
-        if len(curve_data) >= 2:
-            record["residual_compressibility"] = {
-                str(rank): float(value)
-                for rank, value in _compressibility_curve(curve_data).items()
+        loss = record.get("loss_improvement")
+        if loss is not None:
+            by_group.setdefault(group_key, {})[record["rank"]] = loss
+        for name, value in (record.get("domain_loss_improvement") or {}).items():
+            by_group_domain.setdefault(group_key, {}).setdefault(name, {})[
+                record["rank"]
+            ] = value
+    for record in records:
+        group_key = (record["method"], record["seed"], record.get("k"))
+        detail = _compressibility_detail(by_group.get(group_key, {}))
+        record["compressibility_status"] = detail["status"]
+        record["compressibility_detail"] = {
+            k: v for k, v in detail.items() if k != "curve"
+        }
+        record["residual_compressibility"] = (
+            {str(rank): float(v) for rank, v in detail["curve"].items()}
+            if detail["curve"]
+            else None
+        )
+        per_domain = {}
+        for name, deltas in by_group_domain.get(group_key, {}).items():
+            d = _compressibility_detail(deltas)
+            per_domain[name] = {
+                "status": d["status"],
+                "reference_improvement": d["reference_improvement"],
+                "curve": (
+                    {str(r): float(v) for r, v in d["curve"].items()}
+                    if d["curve"]
+                    else None
+                ),
             }
-        else:
-            record["residual_compressibility"] = None
+        record["residual_compressibility_by_domain"] = per_domain or None
     reference = {
         (record["seed"], record["rank"]): record["final_mean_loss"]
         for record in records
@@ -926,6 +947,99 @@ def evaluate_manifest(output_dir: Path) -> dict[str, Any]:
     return evaluation
 
 
+def _numeric_values(value: Any) -> list[float]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return [float(value)]
+    if isinstance(value, dict):
+        values: list[float] = []
+        for item in value.values():
+            values.extend(_numeric_values(item))
+        return values
+    if isinstance(value, list | tuple):
+        values = []
+        for item in value:
+            values.extend(_numeric_values(item))
+        return values
+    return []
+
+
+def _report_metric_value(record: dict[str, Any], metric: str, rank: int) -> list[float]:
+    deployed = record.get("deployed_evaluation", {})
+    representation = deployed.get("representation", {})
+    if metric == "residual_compressibility":
+        curve = record.get("residual_compressibility") or {}
+        value = curve.get(str(rank))
+    elif metric == "validation_loss":
+        value = record.get("final_mean_loss")
+    elif metric == "perplexity":
+        value = record.get("final_mean_ppl")
+    elif metric == "forgetting":
+        value = record.get("mean_forgetting")
+    elif metric == "accuracy_forgetting":
+        value = record.get("accuracy_forgetting")
+    elif metric == "task_accuracy":
+        value = record.get("task_accuracy")
+    elif metric == "task_f1":
+        value = record.get("task_f1")
+    elif metric == "calibration":
+        value = {
+            domain: values.get("ece")
+            for domain, values in deployed.get("domains", {}).items()
+            if isinstance(values, dict)
+        }
+    elif metric == "gradient_conflict":
+        value = representation.get("cross_domain_conflict")
+    elif metric == "factor_overlap":
+        value = representation.get("overlap")
+    elif metric == "fracture":
+        value = representation.get("fracture_index")
+    elif metric == "mixed_curvature":
+        value = representation.get("taylor_delta")
+    elif metric == "category_alignment":
+        value = representation.get("semantic_overlap")
+    elif metric == "ablation_fidelity":
+        value = representation.get("synergy_validation")
+    else:
+        value = None
+    return _numeric_values(value)
+
+
+def _append_metric_table(
+    lines: list[str],
+    title: str,
+    metric_specs: list[tuple[str, str]],
+    by_method: dict[str, list[dict[str, Any]]],
+    report_rank: int,
+) -> None:
+    lines.extend(
+        [
+            "",
+            f"## {title}",
+            "",
+            "| Metric | A1 | A2 | A3 | Coverage |",
+            "|---|---:|---:|---:|---|",
+        ]
+    )
+    for label, key in metric_specs:
+        cells: list[str] = []
+        measured = False
+        for method in ("a1", "a2", "a3"):
+            values = [
+                value
+                for record in by_method.get(method, [])
+                for value in _report_metric_value(record, key, report_rank)
+            ]
+            if values:
+                measured = True
+                cells.append(f"{sum(values) / len(values):.6g}")
+            else:
+                cells.append("N/A")
+        coverage = "measured" if measured else "not measured"
+        lines.append(f"| {label} | {' | '.join(cells)} | {coverage} |")
+
+
 def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
     evaluation = _read_json(output_dir / "evaluation.json")
     by_method: dict[str, list[dict[str, Any]]] = {}
@@ -942,10 +1056,14 @@ def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
     ]
     for method, records in sorted(by_method.items()):
         losses = [
-            r["final_mean_loss"] for r in records if r["final_mean_loss"] is not None
+            r["final_mean_loss"]
+            for r in records
+            if r.get("final_mean_loss") is not None
         ]
         forgetting = [
-            r["mean_forgetting"] for r in records if r["mean_forgetting"] is not None
+            r["mean_forgetting"]
+            for r in records
+            if r.get("mean_forgetting") is not None
         ]
         rates = [
             r["tokens"] / (r["steps"] * r["mean_step_time"])
@@ -981,6 +1099,44 @@ def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
             f"{sum(rates) / len(rates) if rates else 'N/A'} | "
             f"{'measured' if deployed else 'unavailable'} |"
         )
+    _append_metric_table(
+        lines,
+        "Internal metrics",
+        [
+            ("Residual compressibility", "residual_compressibility"),
+            ("Representation fracture index", "fracture"),
+            ("Factor overlap and entanglement", "factor_overlap"),
+            ("Gradient conflict", "gradient_conflict"),
+            ("Mixed curvature coupling", "mixed_curvature"),
+            ("Causal modularity and off-support leakage", "unavailable"),
+            ("Update commutator proxy", "unavailable"),
+            ("Causal fingerprint separability", "unavailable"),
+            ("Category alignment and naturality", "category_alignment"),
+            ("Interpretability and ablation fidelity", "ablation_fidelity"),
+        ],
+        by_method,
+        report_rank,
+    )
+    _append_metric_table(
+        lines,
+        "External metrics",
+        [
+            ("Validation loss", "validation_loss"),
+            ("Perplexity", "perplexity"),
+            ("Task accuracy", "task_accuracy"),
+            ("Task macro-F1", "task_f1"),
+            ("Calibration error", "calibration"),
+            ("Forgetting", "forgetting"),
+            ("Accuracy-based forgetting", "accuracy_forgetting"),
+            ("Held-out transfer", "unavailable"),
+            ("Sequential versus joint", "unavailable"),
+            ("Anchor KL drift", "unavailable"),
+            ("Symbolic retrieval precision / recall", "unavailable"),
+            ("Long-range coherence", "unavailable"),
+        ],
+        by_method,
+        report_rank,
+    )
     lines.extend(
         [
             "",
@@ -992,9 +1148,17 @@ def report_manifest(output_dir: Path, report_rank: int = 4) -> Path:
             "based accuracy, ECE, domain KL, cross-domain conflict, ablation-based "
             "fracture/overlap, Taylor/synergy, inference latency, and memory metrics.",
             "",
+            "The internal and external tables include every metric required by "
+            "metrics.md. N/A means the protocol or implementation does not measure "
+            "that metric; it is not a zero result. Token accuracy and domain KL are "
+            "available as diagnostics, but are not substituted for task accuracy or "
+            "dedicated anchor KL.",
+            "",
             "This compact implementation reuses the stage runners and reports their "
-            "existing artifacts. Anchor/held-out evaluation, joint training, and A4 "
-            "symbolic retrieval remain explicitly unavailable.",
+            "existing artifacts. Accuracy-based task metrics require labeled domain "
+            "examples and are measured through the configured label-token protocol. "
+            "Anchor/held-out evaluation, joint training, A4 symbolic retrieval, "
+            "and long-range coherence remain explicitly unavailable.",
             "A3 `K` is a training-time settling parameter; deployment uses the "
             "label-free predictor path.",
         ]

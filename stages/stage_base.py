@@ -31,6 +31,9 @@ except (ImportError, RuntimeError):
 
 from frozenllm.substrate import FrozenSubstrate, identity_modify
 from metrics.performance import (
+    accuracy_forgetting,
+    classification_metrics,
+    classification_predictions,
     mean_forgetting,
     mean_seen_accuracy,
     perplexity,
@@ -121,6 +124,8 @@ class DomainConfig:
     # Joins rows into one stream; use "\n\n" for one-document-per-row datasets.
     separator: str = ""
     epochs: int | None = None
+    label_field: str = "label"
+    label_tokens: tuple[str, ...] | list[str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not DOMAIN_NAME.match(self.name):
@@ -207,6 +212,8 @@ class Domain:
     train_blocks: np.ndarray
     eval_set: tuple[jax.Array, ...]
     epochs: int
+    task_examples: tuple[tuple[jax.Array, int, int], ...] = ()
+    label_token_ids: tuple[tuple[int, ...], ...] = ()
 
 
 def load_token_blocks(
@@ -235,6 +242,71 @@ def load_token_blocks(
     # Annotated: numpy is opaque to mypy (follow_imports = "skip").
     blocks: np.ndarray = np.asarray(ids[: n * seq_len], dtype=np.int32)
     return blocks.reshape(n, seq_len)
+
+
+def load_task_examples(
+    substrate: FrozenSubstrate,
+    domain: DomainConfig,
+    split: str,
+    seq_len: int,
+) -> tuple[tuple[tuple[jax.Array, int, int], ...], tuple[tuple[int, ...], ...]]:
+    if load_dataset is None or substrate.tokenizer is None:
+        return (), ()
+    try:
+        raw_ds = load_dataset(
+            domain.dataset, domain.dataset_config, split=split, trust_remote_code=True
+        )
+    except TypeError:
+        raw_ds = load_dataset(domain.dataset, domain.dataset_config, split=split)
+    if domain.label_field not in raw_ds.column_names:
+        return (), ()
+    labels = list(raw_ds[domain.label_field])
+    unique_labels = list(dict.fromkeys(labels))
+    verbalizers = (
+        [str(label) for label in unique_labels]
+        if domain.label_tokens is None
+        else list(domain.label_tokens)
+    )
+    if len(verbalizers) != len(unique_labels):
+        raise ValueError(
+            f"{domain.name}: label_tokens must have one entry per class "
+            f"({len(unique_labels)}), got {len(verbalizers)}"
+        )
+    label_token_ids = []
+    for verbalizer in verbalizers:
+        ids = substrate.tokenizer.encode(
+            f" {verbalizer}", add_special_tokens=False
+        )
+        if not ids:
+            raise ValueError(f"{domain.name}: label token {verbalizer!r} is empty")
+        label_token_ids.append(tuple(int(token_id) for token_id in ids))
+    label_index = {label: index for index, label in enumerate(unique_labels)}
+    pad_id = (
+        substrate.tokenizer.pad_token_id
+        if substrate.tokenizer.pad_token_id is not None
+        else substrate.tokenizer.eos_token_id
+    )
+    if pad_id is None:
+        raise ValueError(f"{domain.name}: tokenizer needs a pad or EOS token")
+    examples = []
+    for row, label in zip(raw_ds, labels, strict=True):
+        text = row.get(domain.text_field)
+        if not isinstance(text, str):
+            text = next(
+                (value for value in row.values() if isinstance(value, str) and value),
+                "",
+            )
+        ids = substrate.tokenizer.encode(
+            text, add_special_tokens=False, truncation=True, max_length=seq_len
+        )
+        if not ids:
+            continue
+        position = len(ids) - 1
+        padded = ids + [pad_id] * (seq_len - len(ids))
+        examples.append(
+            (jnp.asarray(padded, dtype=jnp.int32), label_index[label], position)
+        )
+    return tuple(examples), tuple(label_token_ids)
 
 
 def make_eval_set(
@@ -325,11 +397,16 @@ def prepare_domain(
     validation = load_token_blocks(
         substrate, domain, domain.eval_split, training.seq_len
     )
+    task_examples, label_token_ids = load_task_examples(
+        substrate, domain, domain.eval_split, training.seq_len
+    )
     return Domain(
         name=domain.name,
         train_blocks=train,
         eval_set=make_eval_set(validation, training.batch_size, training.eval_batches),
         epochs=training.epochs if domain.epochs is None else domain.epochs,
+        task_examples=task_examples,
+        label_token_ids=label_token_ids,
     )
 
 
@@ -415,6 +492,40 @@ def evaluate(
     }
 
 
+def evaluate_task(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    params: AdapterParams,
+    examples: Sequence[tuple[jax.Array, int, int]],
+    label_token_ids: Sequence[Sequence[int]],
+) -> dict[str, float]:
+    if not examples or not label_token_ids:
+        return {}
+    width = max(len(item) for item in label_token_ids)
+    token_matrix = jnp.asarray(
+        [list(item) + [item[-1]] * (width - len(item)) for item in label_token_ids],
+        dtype=jnp.int32,
+    )
+    targets = np.asarray([example[1] for example in examples], dtype=np.int32)
+    prediction_batches = []
+    for start in range(0, len(examples), 32):
+        batch = examples[start : start + 32]
+        ids = jnp.stack([example[0] for example in batch])
+        positions = jnp.asarray([example[2] for example in batch], dtype=jnp.int32)
+        logits = substrate.run_with_interception(
+            ids, modify_fn=adapter.modify_fn(params), intercept_layers=adapter.layers
+        ).logits
+        prediction_batches.append(
+            np.asarray(classification_predictions(logits, positions, token_matrix))
+        )
+    predictions = np.concatenate(prediction_batches)
+    metrics = classification_metrics(targets, predictions)
+    return {
+        "task_accuracy": metrics["accuracy"],
+        "task_f1": metrics["macro_f1"],
+    }
+
+
 def resolve_split(domain: DomainConfig, split: str) -> str:
     """Map symbolic split name (test, eval/validation, train) to domain split string."""
     if split == "test":
@@ -469,8 +580,26 @@ def summarize(
     rows: Sequence[Mapping[str, Mapping[str, float]]],
 ) -> dict[str, Any]:
     loss = np.array([[row[n]["loss"] for n in names] for row in rows])
+    task_accuracy = np.array(
+        [[row[n].get("task_accuracy", np.nan) for n in names] for row in rows]
+    )
+    task_f1 = np.array(
+        [[row[n].get("task_f1", np.nan) for n in names] for row in rows]
+    )
     base_loss = [init[n]["base_loss"] for n in names]
     num_tasks = len(rows)
+    has_task_metrics = bool(np.isfinite(task_accuracy).any())
+    accuracy_forgetting_values = [None]
+    if has_task_metrics:
+        if not np.isfinite(task_accuracy).all():
+            raise ValueError(
+                "task_accuracy must be available for every task and checkpoint "
+                "before accuracy-based forgetting can be computed"
+            )
+        accuracy_forgetting_values.extend(
+            float(accuracy_forgetting(task_accuracy, t))
+            for t in range(1, num_tasks)
+        )
     return {
         "domains": list(names),
         "base_loss": base_loss,
@@ -493,6 +622,11 @@ def summarize(
             float(mean_forgetting(loss, t, higher_is_better=False))
             for t in range(1, num_tasks)
         ],
+        "task_accuracy": task_accuracy.tolist() if has_task_metrics else None,
+        "task_f1": task_f1.tolist() if np.isfinite(task_f1).any() else None,
+        "accuracy_forgetting": accuracy_forgetting_values
+        if has_task_metrics
+        else None,
     }
 
 
@@ -517,6 +651,15 @@ def run_sequential(
         for d in domains:
             row[d.name] = evaluate(
                 substrate, adapter, params, d.eval_set, jit=training.jit
+            )
+            row[d.name].update(
+                evaluate_task(
+                    substrate,
+                    adapter,
+                    params,
+                    d.task_examples,
+                    d.label_token_ids,
+                )
             )
             writer.log("eval", after_task=after_task, domain=d.name, **row[d.name])
         if after_task < 0:

@@ -29,11 +29,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import optax  # noqa: E402
 
 from frozenllm.substrate import FrozenSubstrate  # noqa: E402
-from metrics.performance import perplexity, training_step_time  # noqa: E402
+from metrics.performance import (  # noqa: E402
+    classification_metrics,
+    classification_predictions,
+    perplexity,
+    training_step_time,
+)
 from residual import ResidualAdapter  # noqa: E402
 from stages.results import RunWriter, default_run_name, run_metadata  # noqa: E402
 from stages.stage_A.A3_model import A3Config, A3Model  # noqa: E402
@@ -46,6 +52,7 @@ from stages.stage_base import (  # noqa: E402
     batches,
     configure_logging,
     load_configs,
+    load_task_examples,
     load_token_blocks,
     log_experiment_header,
     log_final_summary,
@@ -168,6 +175,28 @@ def evaluate_deployment(
     }
 
 
+def evaluate_task_deployment(substrate, model, params, domain):
+    if not domain.task_examples or not domain.label_token_ids:
+        return {}
+    targets = np.asarray([example[1] for example in domain.task_examples])
+    width = max(len(item) for item in domain.label_token_ids)
+    token_ids = jnp.asarray(
+        [list(item) + [item[-1]] * (width - len(item)) for item in domain.label_token_ids]
+    )
+    prediction_batches = []
+    for start in range(0, len(domain.task_examples), 32):
+        batch = domain.task_examples[start : start + 32]
+        ids = jnp.stack([example[0] for example in batch])
+        positions = jnp.asarray([example[2] for example in batch])
+        logits, _ = model.deploy_logits(params, ids)
+        prediction_batches.append(
+            np.asarray(classification_predictions(logits, positions, token_ids))
+        )
+    predictions = np.concatenate(prediction_batches)
+    values = classification_metrics(targets, predictions)
+    return {"task_accuracy": values["accuracy"], "task_f1": values["macro_f1"]}
+
+
 def train_sequential(
     substrate,
     model: A3Model,
@@ -188,6 +217,7 @@ def train_sequential(
             row[d.name] = evaluate_deployment(
                 substrate, model, params, d.eval_set, jit=training.jit
             )
+            row[d.name].update(evaluate_task_deployment(substrate, model, params, d))
             writer.log("eval", after_task=after_task, domain=d.name, **row[d.name])
         if after_task < 0:
             log.info(
@@ -508,6 +538,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for d in cfg.domains:
         train_blocks = load_token_blocks(substrate, d, d.train_split, train_cfg.seq_len)
         eval_blocks = load_token_blocks(substrate, d, d.eval_split, train_cfg.seq_len)
+        task_examples, label_token_ids = load_task_examples(
+            substrate, d, d.eval_split, train_cfg.seq_len
+        )
         domains.append(
             Domain(
                 name=d.name,
@@ -516,6 +549,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     eval_blocks, train_cfg.batch_size, train_cfg.eval_batches
                 ),
                 epochs=train_cfg.epochs if d.epochs is None else d.epochs,
+                task_examples=task_examples,
+                label_token_ids=label_token_ids,
             )
         )
 
